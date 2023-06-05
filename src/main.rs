@@ -1,25 +1,23 @@
 mod ingest;
 mod bracket;
 mod pool;
+use rand::Rng;
 fn main() {
     
     let tournamentinfo = ingest::TournamentInfo::initialize();
 
     let ref_bracket = bracket::Bracket::new(&tournamentinfo);
-    let mut score: f64 = 0.0;
 
-    let num_sims = 10000;
-
-
-    for i in 0..num_sims {
-        let bracket = bracket::Bracket::new(&tournamentinfo);
-        score += bracket.score(&ref_bracket);
-        if i % 100 == 0 {
-            println!("{} {}", i, score / (i as f64));
-        }
-
-        //bracket.winner.print();
+    let mut random_63_bool: Vec<bool> = Vec::new();
+    for _i in 0..63 {
+        let mut rng = rand::thread_rng();
+        let rand_bool: bool = rng.gen(); // generates a float between 0 and 1
+        random_63_bool.push(rand_bool);
     }
-    println!("{}", ref_bracket.expected_value * num_sims as f64);
+    println!("{:?}", random_63_bool);
+
+    let generated_bracket = bracket::Bracket::new_from_binary(&tournamentinfo, random_63_bool);
+    
+    println!("{:?}", generated_bracket);
 
 }

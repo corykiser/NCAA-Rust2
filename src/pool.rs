@@ -5,6 +5,13 @@
 //It seems like a bracket's expected score when compared against monte carlo simulations converges at around 500-1000 simulations, maybe even less.
 //You probably don't even need to generate 500-1000 simulations each time if you are using an evolutionary algorithm.
 
+//The standard deviation of how an individual bracket performs against monte carlo simulations is an interesting topic to explore.
+// Finding the average score and standard deviation of a random bracket scored against monte carlo simulations could be useful for bayesian inference.
+// You would want to compare that number against the average maximum score of a batch and the standard deviation of the maximum score of a batch.
+
+//Hamming Distance between two brackets is a good metric to use to determine how similar two brackets are to each other.
+//It could come in handy for maximizing diversity in a batch of brackets or for evolutionary algorithms.
+
 use crate::bracket::{Bracket, self};
 use crate::ingest::TournamentInfo;
 
