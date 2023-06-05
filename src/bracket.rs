@@ -69,7 +69,7 @@ pub struct Bracket {
     pub score: f64, //score if bracket were perfectly picked
     pub sim_score: f64, //score from simulations
     pub expected_value: f64, //expected value of bracket
-    //binary: [bool; 63],
+    binary: Vec<bool>,
 }
 
 impl Bracket{
@@ -93,8 +93,7 @@ impl Bracket{
 
         //TODO USE A VECTOR INSTEAD OF ARRAY?
         //array of bools to represent the bracket
-        //let mut binary: [bool; 63] = [false; 63];
-        //let mut binary_counter: usize = 0;
+        let mut binary: Vec<bool> = Vec::with_capacity(63);
 
         //Use the following for quick cycling through the 4 regions
         let region_names: Vec<String> = vec!["East".to_string(), "West".to_string(), "South".to_string(), "Midwest".to_string()];
@@ -110,8 +109,7 @@ impl Bracket{
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
 
-                //binary[binary_counter] = game.hilo;
-                //binary_counter += 1;
+                binary.push(game.hilo);
             }
         }
         assert!(games1winners.len() == 32);
@@ -127,8 +125,7 @@ impl Bracket{
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
 
-                //binary[binary_counter] = game.hilo;
-                //binary_counter += 1;
+                binary.push(game.hilo);
             }
         }
         assert!(games2winners.len() == 16);
@@ -144,8 +141,7 @@ impl Bracket{
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
 
-                //binary[binary_counter] = game.hilo;
-                //binary_counter += 1;
+                binary.push(game.hilo);
             }
         }
         assert!(games3winners.len() == 8);
@@ -161,8 +157,7 @@ impl Bracket{
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
 
-                //binary[binary_counter] = game.hilo;
-                //binary_counter += 1;
+                binary.push(game.hilo);
             }
         }
         assert!(games4winners.len() == 4);
@@ -176,8 +171,7 @@ impl Bracket{
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
 
-        //binary[binary_counter] = game.hilo;
-        //binary_counter += 1;
+        binary.push(game.hilo);
 
         //Match East with West
         let matchingteams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "East" || x.region == "West").cloned().collect();
@@ -189,8 +183,7 @@ impl Bracket{
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
 
-        //binary[binary_counter] = game.hilo;
-        //binary_counter += 1;
+        binary.push(game.hilo);
         
         //championship game
         let game = Game::new(&games5winners[0].clone(), &games5winners[1].clone());
@@ -201,9 +194,9 @@ impl Bracket{
         score += 32.0 * game.winner.seed as f64;
         let expected_value = prob * score; //finally expected value of bracket
 
-        //binary[binary_counter] = game.hilo;
-        //binary_counter += 1;
+        binary.push(game.hilo);
         assert!(games6winners.len() == 1);
+        assert!(binary.len() == 63);
 
         Bracket{
             round1: games1,
@@ -217,7 +210,7 @@ impl Bracket{
             score,
             sim_score: 0.0,
             expected_value: expected_value,
-            //binary,
+            binary,
         }
     }
     pub fn score(&self, referencebracket: &Bracket) -> f64{

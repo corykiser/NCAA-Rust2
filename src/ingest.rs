@@ -5,7 +5,7 @@ use csv;
 
 use csv::StringRecord;
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Team {
     pub name: String,
     pub seed: i32,
@@ -24,6 +24,12 @@ impl Team {
     }
     pub fn print(&self) {
         println!("{:?}", self);
+    }
+
+}
+impl PartialEq for Team {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
     }
 }
 

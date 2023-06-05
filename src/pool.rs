@@ -1,6 +1,9 @@
 //This file is intended to help with the creation of a pool of brackets to be used in the program.
 //The idea is that we can create a pool of bracket entries and run Monte Carlo Simulations against them to test their fitness.
+//Fitness of a batch should be the highest MAXIMUM score of any one bracket in the batch.
+
 //It seems like a bracket's expected score when compared against monte carlo simulations converges at around 500-1000 simulations, maybe even less.
+//You probably don't even need to generate 500-1000 simulations each time if you are using an evolutionary algorithm.
 
 use crate::bracket::{Bracket, self};
 use crate::ingest::TournamentInfo;
@@ -23,7 +26,7 @@ impl Batch{
         }
     }
     // This function will score each bracket in the batch against random sims and then return the average score
-    pub fn simulate_and_score(&mut self,tournamentinfo: &TournamentInfo, num_sims: i32){
+    pub fn score_against_simulations(&mut self,tournamentinfo: &TournamentInfo, num_sims: i32){
         //start sims
         for i in 0..num_sims{
             let sim_bracket = Bracket::new(&tournamentinfo);
@@ -44,6 +47,7 @@ impl Batch{
         }
         self.batch_score /= self.brackets.len() as f64;
     }
+    //This function will score each bracket in the batch against a reference bracket and then return the average score
     pub fn score_against_ref(&mut self, ref_bracket: &Bracket){
         self.batch_score = 0.0;
         for bracket in &mut self.brackets{

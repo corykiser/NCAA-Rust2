@@ -8,7 +8,7 @@ fn main() {
     let ref_bracket = bracket::Bracket::new(&tournamentinfo);
     let mut score: f64 = 0.0;
 
-    let num_sims = 1000;
+    let num_sims = 10000;
 
 
     for i in 0..num_sims {
