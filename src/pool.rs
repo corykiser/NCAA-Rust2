@@ -1,3 +1,5 @@
+//This file is intended to help with the creation of a pool of brackets to be used in the program.
+//The idea is that we can create a pool of bracket entries and run Monte Carlo Simulations against them to test their fitness.
 //It seems like a bracket's expected score when compared against monte carlo simulations converges at around 500-1000 simulations, maybe even less.
 
 use crate::bracket::{Bracket, self};

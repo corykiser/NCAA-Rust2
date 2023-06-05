@@ -1,4 +1,4 @@
-// This file is used to ingest the data from the csv file and store it in a struct to be used later in other parts of the program
+// This file is used to ingest the data from the csv file that contains the 538 ratings and store it in a struct to be used later in other parts of the program
 
 use serde::{Serialize, Deserialize};
 use csv;
