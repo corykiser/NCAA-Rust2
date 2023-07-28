@@ -45,7 +45,7 @@ pub struct TournamentInfo {
 
 impl TournamentInfo {
     // Inititialize the vector of teams to be hold 64 teams
-    pub fn initialize() -> TournamentInfo {
+    pub fn initialize(file_path: &str) -> TournamentInfo {
         //structure of tournament: What seed plays the other seeds in each round?
         let round1: [[i32; 2]; 8] = [
             [1, 16],
@@ -69,7 +69,7 @@ impl TournamentInfo {
         let mut teams: Vec<Team> = Vec::with_capacity(64);
 
         //TODO check if file exists and download if it doesn't exist OR specify file path as an argument
-        let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";
+        //let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";
         let mut rdr = csv::Reader::from_path(file_path).expect("file access error");
         let mut mensrecords: Vec<StringRecord> = Vec::new(); //holds the csv records
 

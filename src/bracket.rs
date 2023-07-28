@@ -1,6 +1,18 @@
+//This contains all of the simulations using ELO (modified per 538) calculations
+//The Game struct is used to simulate a game between two teams and store the results.
+//The Bracket struct is used to simulate a whole tournament of 63 games and store the results.
+//Both structs also provide a way to create a game from binary data or to extract a binary representation of each.
+// the Bracket struct also provides a way to score a bracket against a reference bracket.
+
+
+
+
+//It would be nice to have a function that fills in the the rest of a bracket if you have decided to pick a certain team(s) to win.
+
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use crate::ingest::{Team, TournamentInfo};
+use rayon::prelude::*;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Game {
@@ -53,6 +65,9 @@ impl Game {
             hilo,
         }
     }
+    //TODO create a new_from_partial_binary() version of this that takes in a partial bracket and fills in the rest of the bracket
+    //You can use Some(hilo) and None in Vec<Option<bool>> to indicate if what parts need to be filled in
+    //This would be useful for filling in the first round.
     pub fn new_from_binary(team1: &Team, team2: &Team, hilo: bool) -> Game {
         //find the lower seed team
         let low_seed_team: Team = if team1.seed < team2.seed {
@@ -89,23 +104,6 @@ impl Game {
             
         };
 
-        // //establish winner from binary input
-        // let winner: Team = if hilo {
-        //     low_seed_team.clone()
-        // } else {
-        //     high_seed_team.clone()
-        // };
-
-        // //override if the teams aren't in the same region
-        // //find the which region is first alphabetically
-
-        // //establish winner from binary input
-        // let winner: Team = if hilo {
-        //     low_alpha_team.clone()
-        // } else {
-        //     high_alpha_team.clone()
-        // };
-
         let rating_diff = team1.rating as f64 - team2.rating as f64;
         let team1prob: f64 = 1.0 / (1.0 + 10.0f64.powf(-1.0 * rating_diff * 30.464 / 400.0));
         let team2prob: f64 = 1.0 - team1prob;
@@ -131,6 +129,8 @@ impl Game {
     }
 }
 
+//todo smart mutate function that only mutates the parts of the bracket that are uncertain (i.e. win probability is between 0.4 and 0.6ç)
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Bracket {
     pub round1: Vec<Game>, //round of 64
@@ -144,11 +144,18 @@ pub struct Bracket {
     pub score: f64, //score if bracket were perfectly picked
     pub sim_score: f64, //score from simulations
     pub expected_value: f64, //expected value of bracket
-    binary: Vec<bool>,
+    pub binary: Vec<bool>,
+}
+
+impl PartialEq for Bracket {
+    fn eq(&self, other: &Self) -> bool {
+        self.binary == other.binary
+    }
 }
 
 impl Bracket{
     pub fn new(tournamentinfo: &TournamentInfo) -> Bracket{
+        //preallocating makes this faster... supposedly
         let mut games1: Vec<Game> = Vec::with_capacity(32);
         let mut games2: Vec<Game> = Vec::with_capacity(16);
         let mut games3: Vec<Game> = Vec::with_capacity(8);
@@ -165,6 +172,7 @@ impl Bracket{
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
+        let mut expected_value = 0.0;
 
         //TODO USE A VECTOR INSTEAD OF ARRAY?
         //array of bools to represent the bracket
@@ -183,6 +191,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
+                expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
 
                 binary.push(game.hilo);
             }
@@ -199,6 +208,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
+                expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
 
                 binary.push(game.hilo);
             }
@@ -215,6 +225,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
+                expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
 
                 binary.push(game.hilo);
             }
@@ -231,6 +242,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
+                expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
 
                 binary.push(game.hilo);
             }
@@ -245,6 +257,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
+        expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
 
         binary.push(game.hilo);
 
@@ -257,6 +270,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
+        expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
 
         binary.push(game.hilo);
         
@@ -267,7 +281,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
-        let expected_value = prob * score; //finally expected value of bracket
+        expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
 
         binary.push(game.hilo);
         assert!(games6winners.len() == 1);
@@ -284,7 +298,7 @@ impl Bracket{
             prob,
             score,
             sim_score: 0.0,
-            expected_value: expected_value,
+            expected_value,
             binary,
         }
     }
@@ -343,6 +357,7 @@ impl Bracket{
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
+        let mut expected_value = 0.0;
 
         assert!(binary_string.len() == 63, "Binary string must be 63 characters long");
         let mut binary: Vec<bool> = binary_string.clone(); //reuse the input string for the output binary string
@@ -361,6 +376,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
+                expected_value += (1.0 + game.winner.seed as f64) * game.winnerprob;
             }
         }
         assert!(games1winners.len() == 32);
@@ -375,6 +391,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
+                expected_value += (2.0 + game.winner.seed as f64) * game.winnerprob;
             }
         }
         assert!(games2winners.len() == 16);
@@ -389,6 +406,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
+                expected_value += (4.0 + game.winner.seed as f64) * game.winnerprob;
             }
         }
         assert!(games3winners.len() == 8);
@@ -403,6 +421,7 @@ impl Bracket{
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
+                expected_value += (8.0 * game.winner.seed as f64) * game.winnerprob;
             }
         }
         assert!(games4winners.len() == 4);
@@ -415,6 +434,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
+        expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
 
         //Match East with West
         let matching_teams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "East" || x.region == "West").cloned().collect();
@@ -425,6 +445,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
+        expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
         
         //championship game
         let game = Game::new_from_binary(&games5winners[0], &games5winners[1], binary_string.remove(0));
@@ -433,7 +454,7 @@ impl Bracket{
 
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
-        let expected_value = prob * score; //finally expected value of bracket
+        expected_value += (32.0 * game.winner.seed as f64) * game.winnerprob;
         assert!(games6winners.len() == 1);
 
         Bracket{
@@ -448,7 +469,107 @@ impl Bracket{
             score,
             sim_score: 0.0,
             expected_value: expected_value,
-            binary: binary_string,
+            binary: binary,
         }
     }
+    pub fn mutate(&self,tournamentinfo: &TournamentInfo, mutation_rate: f64) -> Bracket{
+        let mut new_binary: Vec<bool> = self.binary.clone();
+        new_binary.iter_mut().for_each(|x| {
+            let mut rng = rand::thread_rng();
+            let rand: f64 = rng.gen();
+            if rand < mutation_rate{
+                *x = !*x;
+            }
+        });
+        // for i in 0..new_binary.len(){
+        //     let rand: f64 = rng.gen();
+        //     if rand < mutation_rate{
+        //         new_binary[i] = !new_binary[i];
+        //     }
+        // }
+        Bracket::new_from_binary(tournamentinfo, new_binary)
+    }
+    pub fn create_n_children(&mut self, tournamentinfo: &TournamentInfo, n: usize, mutation_rate: f64) -> Vec<Bracket>{
+        let mut children: Vec<Bracket> = (0..n).into_iter().map(|_| self.mutate(tournamentinfo, mutation_rate)).collect();
+        // let mut children: Vec<Bracket> = Vec::new();
+        // for _ in 0..n{
+        //     children.push(self.mutate(tournamentinfo, mutation_rate));
+        // }
+
+        // //add self to children
+        // children.push(self.clone());
+        children
+    }
+    //not sure if this is helpful or not given score(Bracket) uses the same logic with the more relevant points
+    pub fn hamming_distance(&self, other: &Bracket) -> usize{
+        let mut distance = 0;
+        for i in 0..self.binary.len(){
+            if self.binary[i] != other.binary[i]{
+                distance += 1;
+            }
+        }
+        distance
+    }
+    //This will iterate through each round and print out the winner's names
+    pub fn pretty_print(&self){
+        println!("Round 1");
+        for game in &self.round1{
+            println!("{} {}", game.winner.seed, game.winner.name);
+        }
+        println!();
+        println!("Round 2");
+        for game in &self.round2{
+            println!("{} {}", game.winner.seed, game.winner.name);
+        }
+        println!();
+        println!("Sweet 16");
+        for game in &self.round3{
+            println!("{} {}", game.winner.seed, game.winner.name);
+        }
+        println!();
+        println!("Elite 8");
+        for game in &self.round4{
+            println!("{} {}", game.winner.seed, game.winner.name);
+        }
+        println!();
+        println!("Final Four");
+        for game in &self.round5{
+            println!("{} {}", game.winner.seed, game.winner.name);
+        }
+        println!();
+        println!("Championship");
+        for game in &self.round6{
+            println!("{} {} wins!", game.winner.seed, game.winner.name);
+        }
+        println!("Expected Value: {}", self.expected_value);
+        println!("Maximum Score: {}", self.score);
+        println!();
+    }
 }
+pub fn random63bool() -> Vec<bool>{
+    let mut binary: Vec<bool> = (0..63).into_iter().map(|_| {
+        let mut rng = rand::thread_rng();
+        let rand: f64 = rng.gen();
+        if rand < 0.5{
+            false
+        }
+        else{
+            true
+        }
+    }).collect();
+    binary
+    }
+
+
+    // let mut rng = rand::thread_rng();
+    // let mut binary: Vec<bool> = Vec::new();
+    // for _ in 0..63{
+    //     let rand: f64 = rng.gen();
+    //     if rand < 0.5{
+    //         binary.push(false);
+    //     }
+    //     else{
+    //         binary.push(true);
+    //     }
+    //}
+    // binary

@@ -1,0 +1,37 @@
+mod ingest;
+mod bracket;
+mod pool;
+use core::num;
+
+use rand::Rng;
+fn main() {
+    
+    let tournamentinfo = ingest::TournamentInfo::initialize();
+
+    let num_generations = 1000; 
+    let mutation_rate = 1.0/63.0 * 10.0;
+    let num_child_pools = 10;
+    let batch_size = 1000;
+    let num_pool_entries = 10;
+    let num_parents = 1;
+
+    //create an EvolvingPool of 10 brackets
+    let mut pool_entries = pool::EvolvingPool::new(&tournamentinfo, num_pool_entries, mutation_rate, num_child_pools, batch_size);
+
+    let mut pools2 = pool_entries.create_child_pools(&tournamentinfo);
+
+    for i in 0..pools2.len(){
+        pools2[i].score(&tournamentinfo);
+        println!("{} {}", i, pools2[i].fitness);
+    }
+    for i in 0..pools2.len(){
+        println!("{} {:?}", i, pools2[i].brackets[0].binary);
+    }
+
+    let mut bracket1 = pools2[0].brackets[0].clone();
+    let mut bracket2 = bracket1.mutate(&tournamentinfo, mutation_rate);
+    for i in 0..63{
+        println!("{} {} {}", i, bracket1.binary[i], bracket2.binary[i]);
+    }
+    
+}

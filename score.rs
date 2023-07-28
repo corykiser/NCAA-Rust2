@@ -1,0 +1,1 @@
+// This is intended to eventually be a way that you can specify a custom scoring function for a bracket.
