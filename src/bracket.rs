@@ -360,7 +360,7 @@ impl Bracket{
         let mut expected_value = 0.0;
 
         assert!(binary_string.len() == 63, "Binary string must be 63 characters long");
-        let mut binary: Vec<bool> = binary_string.clone(); //reuse the input string for the output binary string
+        let binary: Vec<bool> = binary_string.clone(); //reuse the input string for the output binary string
 
         //Use the following for quick cycling through the 4 regions
         let region_names: Vec<String> = vec!["East".to_string(), "West".to_string(), "South".to_string(), "Midwest".to_string()];
@@ -490,7 +490,7 @@ impl Bracket{
         Bracket::new_from_binary(tournamentinfo, new_binary)
     }
     pub fn create_n_children(&mut self, tournamentinfo: &TournamentInfo, n: usize, mutation_rate: f64) -> Vec<Bracket>{
-        let mut children: Vec<Bracket> = (0..n).into_iter().map(|_| self.mutate(tournamentinfo, mutation_rate)).collect();
+        let children: Vec<Bracket> = (0..n).into_iter().map(|_| self.mutate(tournamentinfo, mutation_rate)).collect();
         // let mut children: Vec<Bracket> = Vec::new();
         // for _ in 0..n{
         //     children.push(self.mutate(tournamentinfo, mutation_rate));
@@ -547,7 +547,7 @@ impl Bracket{
     }
 }
 pub fn random63bool() -> Vec<bool>{
-    let mut binary: Vec<bool> = (0..63).into_iter().map(|_| {
+    let binary: Vec<bool> = (0..63).into_iter().map(|_| {
         let mut rng = rand::thread_rng();
         let rand: f64 = rng.gen();
         if rand < 0.5{

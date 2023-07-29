@@ -1,7 +1,7 @@
 mod ingest;
 mod bracket;
 mod pool;
-use core::num;
+
 
 use rand::Rng;
 fn main() {
@@ -24,7 +24,7 @@ fn main() {
     //let mut generated_bracket = bracket::Bracket::new_from_binary(&tournamentinfo, random_63_bool.clone());
 
     //start with a bracket that is a likely scenario
-    let mut generated_bracket = bracket::Bracket::new(&tournamentinfo);
+    let generated_bracket = bracket::Bracket::new(&tournamentinfo);
 
     let generations = 200;
     let num_children = 63; //I think 63 is helpful? I'm not sure
@@ -42,7 +42,7 @@ fn main() {
     let mut moving_average_tracker: Vec<f64> = Vec::new();
 
     //for tracking if the fittest individual is changing from generation to generation
-    let mut last_max_bracket = generated_bracket.clone();
+    let _last_max_bracket = generated_bracket.clone();
     
     for i in 0..generations{
 
@@ -61,7 +61,7 @@ fn main() {
         //score the batch against the generated bracket (aka score the generated bracket against the batch)
         let mut children = max_bracket.create_n_children(&tournamentinfo, num_children, mutation_rate); //this adds the parent back in for n+1 children total
 
-        let mut last_max_bracket = max_bracket.clone();
+        let last_max_bracket = max_bracket.clone();
 
 
         //score each of the children against the batch, then select the best child
@@ -79,7 +79,7 @@ fn main() {
         }
         
         //test for change from generation to generation of the fittest individual
-        let mut same_flag = if last_max_bracket == max_bracket{
+        let same_flag = if last_max_bracket == max_bracket{
             true
         } else {
             false
