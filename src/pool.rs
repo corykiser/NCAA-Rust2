@@ -164,13 +164,9 @@ pub struct Batch{
 impl Batch{
     //This function will create a batch of brackets from MonteCarlo simulations
     pub fn new(tournamentinfo: &TournamentInfo, num_brackets: i32) -> Batch{
-        // let mut brackets: Vec<Bracket> = Vec::new();
-        // for _i in 0..num_brackets{
-        //     brackets.push(Bracket::new(tournamentinfo));
-        // }
-        let num_cpus = num_cpus::get() as i32;
-        let num_brackets_per_core = num_brackets / num_cpus;
-        let brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core as usize).map(|_| Bracket::new(tournamentinfo)).collect();
+        let num_cpus = num_cpus::get();
+        let num_brackets_per_core = num_brackets as usize / num_cpus;
+        let brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core).map(|_| Bracket::new(tournamentinfo)).collect();
         Batch{
             brackets,
             batch_score: 0.0,

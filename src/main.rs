@@ -1,9 +1,8 @@
 mod ingest;
 mod bracket;
 mod pool;
-
-
 use rand::Rng;
+
 fn main() {
 
     let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";

@@ -559,17 +559,3 @@ pub fn random63bool() -> Vec<bool>{
     }).collect();
     binary
     }
-
-
-    // let mut rng = rand::thread_rng();
-    // let mut binary: Vec<bool> = Vec::new();
-    // for _ in 0..63{
-    //     let rand: f64 = rng.gen();
-    //     if rand < 0.5{
-    //         binary.push(false);
-    //     }
-    //     else{
-    //         binary.push(true);
-    //     }
-    //}
-    // binary
