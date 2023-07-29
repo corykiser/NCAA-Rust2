@@ -4,6 +4,7 @@ use crate::ingest::{Team, TournamentInfo};
 use rayon::prelude::*;
 use std::{fs::File, f32::consts::E};
 use std::io::Write;
+use num_cpus;
 
 //This file is intended to help with the creation of a pool of brackets to be used in the program.
 //The idea is that we can create a pool of bracket entries and run Monte Carlo Simulations against them to test their fitness.
@@ -167,7 +168,9 @@ impl Batch{
         // for _i in 0..num_brackets{
         //     brackets.push(Bracket::new(tournamentinfo));
         // }
-        let mut brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(500).map(|_| Bracket::new(tournamentinfo)).collect();
+        let num_cpus = num_cpus::get() as i32;
+        let num_brackets_per_core = num_brackets / num_cpus;
+        let mut brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core as usize).map(|_| Bracket::new(tournamentinfo)).collect();
         Batch{
             brackets,
             batch_score: 0.0,

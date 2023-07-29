@@ -29,7 +29,7 @@ fn main() {
     let generations = 200;
     let num_children = 63; //I think 63 is helpful? I'm not sure
     let mut mutation_rate = 1.0/63.0 * 5.0; //I think 1/63 is helpful? I'm not sure. One bit flip per child on average.
-    let batch_size = 1000; //increase]ing this uses more cores
+    let batch_size = 1000; //increase]ing this uses more cores bc of how rayon works, obviously it is more compute though
 
 
     let mut max_score = 0.0;
