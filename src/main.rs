@@ -60,7 +60,7 @@ fn main() {
         let mut generated_batch = pool::Batch::new(tournamentinfo_ref, batch_size);
 
         //score the batch against the generated bracket (aka score the generated bracket against the batch)
-        let mut children = max_bracket.create_n_children(tournamentinfo_ref, num_children, mutation_rate); //this adds the parent back in for n+1 children total
+        let mut children = max_bracket.create_n_children(tournamentinfo_ref, num_children); //this adds the parent back in for n+1 children total
 
         let last_max_bracket = max_bracket.clone();
 

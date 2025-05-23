@@ -100,7 +100,7 @@ impl<'a> EvolvingPool<'a>{
     pub fn mutate(&self, tournamentinfo: &'a TournamentInfo) -> EvolvingPool<'a>{
         // mutate every bracket in the pool
         let brackets_to_mutate: Vec<Bracket<'a>> = self.brackets.par_iter()
-            .map(|b| b.mutate(tournamentinfo, self.mutation_rate))
+            .map(|b| b.mutate(tournamentinfo))
             .collect();
 
         EvolvingPool { pool_size: self.pool_size, brackets: brackets_to_mutate, batch: self.batch.clone(), batch_size: self.batch_size, mutation_rate: self.mutation_rate, num_child_pools: self.num_child_pools, max_score: 0.0, average_score: 0.0 , fitness: 0.0}
