@@ -23,11 +23,11 @@ use num_cpus;
 // The Gower Distance is also worth looking into.
 
 use crate::bracket::{Bracket};
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvolvingPool{
+#[derive(Debug, Clone, Serialize)]
+pub struct EvolvingPool<'a>{
     pub pool_size: i32, //how many bracket entries are you allowed to have in the pool
-    pub brackets: Vec<Bracket>,
-    pub batch: Batch, //the batch of brackets that the pool is currently being scored against
+    pub brackets: Vec<Bracket<'a>>,
+    pub batch: Batch<'a>, //the batch of brackets that the pool is currently being scored against
     pub batch_size: i32, //how many monte carlo simulations to run against each bracket in the pool
     pub mutation_rate: f64, //how often to mutate a bit in a child
     pub num_child_pools: i32, //how many child pools to create each generation
@@ -51,12 +51,12 @@ pub struct EvolvingPool{
 
 //find a way to detect convergence of the pool
 
-impl EvolvingPool{
+impl<'a> EvolvingPool<'a>{
     //new function will create a pool of brackets from needed inputs
-    pub fn new(tournamentinfo: &TournamentInfo, pool_size: i32, mutation_rate: f64, num_child_pools: i32, batch_size: i32) -> EvolvingPool{
+    pub fn new(tournamentinfo: &'a TournamentInfo, pool_size: i32, mutation_rate: f64, num_child_pools: i32, batch_size: i32) -> EvolvingPool<'a>{
         // create a vector of random brackets of size pool_size
         //let mut brackets: Vec<Bracket> = (0..pool_size).into_par_iter().map(|_| Bracket::new_from_binary( tournamentinfo, bracket::random63bool() )).collect();
-        let brackets: Vec<Bracket> = (0..pool_size).into_par_iter().map(|_| Bracket::new( tournamentinfo)).collect();
+        let brackets: Vec<Bracket<'a>> = (0..pool_size).into_par_iter().map(|_| Bracket::new( tournamentinfo)).collect();
         // let mut brackets: Vec<Bracket> = Vec::new();
         // for _i in 0..pool_size{
         //     brackets.push(Bracket::new(tournamentinfo));
@@ -67,7 +67,7 @@ impl EvolvingPool{
         EvolvingPool{
             pool_size,
             brackets,
-            batch: Batch::new(tournamentinfo, batch_size),
+            batch: Batch::new(tournamentinfo, batch_size), // Batch might need 'Deserialize' removed too
             batch_size,
             mutation_rate,
             num_child_pools,
@@ -76,11 +76,11 @@ impl EvolvingPool{
             fitness: 0.0, //hasn't been scored yet
         }
     }
-    pub fn score(&mut self, _tournamentinfo: &TournamentInfo) -> f64{
+    pub fn score(&mut self, _tournamentinfo: &'a TournamentInfo) -> f64{
         let mut max_score = 0.0; //max average score of any one bracket in the batch
         let mut sum_score = 0.0; //sum of all the scores of the brackets in the batch
         for bracket in &mut self.brackets{
-            let individual_score = self.batch.score_against_ref(bracket);
+            let individual_score = self.batch.score_against_ref(bracket); // score_against_ref needs to take &'a Bracket
             sum_score += individual_score;
             if individual_score > max_score{
                 max_score = individual_score;
@@ -97,20 +97,17 @@ impl EvolvingPool{
         self.fitness = self.average_score;
         self.average_score
     }
-    pub fn mutate(&self, tournamentinfo: &TournamentInfo) -> EvolvingPool{
+    pub fn mutate(&self, tournamentinfo: &'a TournamentInfo) -> EvolvingPool<'a>{
         // mutate every bracket in the pool
-        let mut brackets_to_mutate = Vec::new();
-
-        for i in 0..self.brackets.len(){
-            brackets_to_mutate.push(self.brackets[i].clone().mutate(tournamentinfo, self.mutation_rate));
-        }
+        let brackets_to_mutate: Vec<Bracket<'a>> = self.brackets.par_iter()
+            .map(|b| b.mutate(tournamentinfo, self.mutation_rate))
+            .collect();
 
         EvolvingPool { pool_size: self.pool_size, brackets: brackets_to_mutate, batch: self.batch.clone(), batch_size: self.batch_size, mutation_rate: self.mutation_rate, num_child_pools: self.num_child_pools, max_score: 0.0, average_score: 0.0 , fitness: 0.0}
     }
-    pub fn create_child_pools(&mut self, tournamentinfo: &TournamentInfo) -> Vec<EvolvingPool>{
+    pub fn create_child_pools(&mut self, tournamentinfo: &'a TournamentInfo) -> Vec<EvolvingPool<'a>>{
         // create n child pools with the parents of the current pool
-        let _child_pools: Vec<EvolvingPool> = Vec::new();
-        let child_pools: Vec<EvolvingPool> = (0..self.num_child_pools).into_par_iter().map(|_| EvolvingPool::mutate(self, tournamentinfo)).collect();
+        let child_pools: Vec<EvolvingPool<'a>> = (0..self.num_child_pools).into_par_iter().map(|_| self.mutate(tournamentinfo)).collect();
         // //create n child pools
         // for _i in 0..self.num_child_pools{
         //     let mut child_pool = EvolvingPool::mutate(&self, tournamentinfo);
@@ -119,10 +116,10 @@ impl EvolvingPool{
         // child_pools.push(self.clone()); //add the parent pool to the vector of child pools
         child_pools
     }
-    pub fn update_batch(&mut self, tournamentinfo: &TournamentInfo){
+    pub fn update_batch(&mut self, tournamentinfo: &'a TournamentInfo){
         self.batch = Batch::new(tournamentinfo, self.batch_size);
     }
-    pub fn pretty_print(&self, _tournamentinfo: &TournamentInfo){
+    pub fn pretty_print(&self, _tournamentinfo: &'a TournamentInfo){
         println!("Pool Size: {}", self.pool_size);
         println!("Mutation Rate: {}", self.mutation_rate);
         println!("Number of Child Pools: {}", self.num_child_pools);
@@ -135,7 +132,7 @@ impl EvolvingPool{
             bracket.pretty_print();
         }
     }
-    pub fn export_to_file(&self, _tournamentinfo: &TournamentInfo, filename: &str){
+    pub fn export_to_file(&self, _tournamentinfo: &'a TournamentInfo, filename: &str){
         let mut file = File::create(filename).unwrap();
         let serialized = serde_json::to_string(&self.brackets).unwrap();
         file.write_all(serialized.as_bytes()).unwrap();
@@ -154,19 +151,19 @@ impl EvolvingPool{
 
 
 
-#[derive(Debug, Clone,  Serialize, Deserialize)]
-pub struct Batch{
-    pub brackets: Vec<Bracket>,
+#[derive(Debug, Clone, Serialize)]
+pub struct Batch<'a>{
+    pub brackets: Vec<Bracket<'a>>, // This also needs Serialize, but not Deserialize if Bracket doesn't have it
     pub batch_score: f64,
     pub batch_score_std_dev: f64,
 }
 
-impl Batch{
+impl<'a> Batch<'a>{
     //This function will create a batch of brackets from MonteCarlo simulations
-    pub fn new(tournamentinfo: &TournamentInfo, num_brackets: i32) -> Batch{
+    pub fn new(tournamentinfo: &'a TournamentInfo, num_brackets: i32) -> Batch<'a>{
         let num_cpus = num_cpus::get();
         let num_brackets_per_core = num_brackets as usize / num_cpus;
-        let brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core).map(|_| Bracket::new(tournamentinfo)).collect();
+        let brackets: Vec<Bracket<'a>> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core).map(|_| Bracket::new(tournamentinfo)).collect();
         Batch{
             brackets,
             batch_score: 0.0,
@@ -174,7 +171,7 @@ impl Batch{
         }
     }
     // This function will score each bracket in the batch against random sims and then return the average score
-    pub fn score_against_simulations(&mut self,tournamentinfo: &TournamentInfo, num_sims: i32){
+    pub fn score_against_simulations(&mut self,tournamentinfo: &'a TournamentInfo, num_sims: i32){
         //start sims
         for _i in 0..num_sims{
             let sim_bracket = Bracket::new(&tournamentinfo);
@@ -196,7 +193,7 @@ impl Batch{
         self.batch_score /= self.brackets.len() as f64;
     }
     //This function will score each bracket in the batch against a reference bracket and then return the average score
-    pub fn score_against_ref(&mut self, ref_bracket: &Bracket) -> f64{
+    pub fn score_against_ref(&mut self, ref_bracket: &Bracket<'a>) -> f64{
         //iterate through the brackets and score them against the reference bracket, collect it all into a new vector
         //doesn't need to be mutable
         let batch_scores: Vec<f64> = self.brackets.par_iter().map(|x| x.score(ref_bracket)).collect();

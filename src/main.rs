@@ -4,12 +4,14 @@ mod pool;
 use rand::Rng;
 
 fn main() {
-
-    let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";
+    let file_path = "fivethirtyeight_ncaa_forecasts.csv"; // Updated path
     
     let tournamentinfo = ingest::TournamentInfo::initialize(file_path);
 
-    //let ref_bracket = bracket::Bracket::new(&tournamentinfo);
+    // Create a lifetime for tournamentinfo that will be used throughout main
+    let tournamentinfo_ref = &tournamentinfo;
+
+    //let ref_bracket = bracket::Bracket::new(tournamentinfo_ref);
 
     let mut random_63_bool: Vec<bool> = Vec::new();
     for _i in 0..63 {
@@ -20,10 +22,10 @@ fn main() {
     println!("{:?}", random_63_bool);
     
     //uncoment to start totally random
-    //let mut generated_bracket = bracket::Bracket::new_from_binary(&tournamentinfo, random_63_bool.clone());
+    //let mut generated_bracket = bracket::Bracket::new_from_binary(tournamentinfo_ref, random_63_bool.clone());
 
     //start with a bracket that is a likely scenario
-    let generated_bracket = bracket::Bracket::new(&tournamentinfo);
+    let generated_bracket = bracket::Bracket::new(tournamentinfo_ref);
 
     let generations = 200;
     let num_children = 63; //I think 63 is helpful? I'm not sure
@@ -33,15 +35,15 @@ fn main() {
 
     let mut max_score = 0.0;
     let mut max_std_dev = 0.0;
-    let mut max_bracket = generated_bracket.clone();
+    let mut max_bracket: bracket::Bracket<'_> = generated_bracket.clone();
     //create a batch of random brackets to score against
-    let mut generated_batch = pool::Batch::new(&tournamentinfo, batch_size);
+    let mut generated_batch = pool::Batch::new(tournamentinfo_ref, batch_size);
 
     //for tracking the moving average
     let mut moving_average_tracker: Vec<f64> = Vec::new();
 
     //for tracking if the fittest individual is changing from generation to generation
-    let _last_max_bracket = generated_bracket.clone();
+    let _last_max_bracket: bracket::Bracket<'_> = generated_bracket.clone();
     
     for i in 0..generations{
 
@@ -55,10 +57,10 @@ fn main() {
         }
 
         //create a batch of random brackets to the new round score against
-        let mut generated_batch = pool::Batch::new(&tournamentinfo, batch_size);
+        let mut generated_batch = pool::Batch::new(tournamentinfo_ref, batch_size);
 
         //score the batch against the generated bracket (aka score the generated bracket against the batch)
-        let mut children = max_bracket.create_n_children(&tournamentinfo, num_children, mutation_rate); //this adds the parent back in for n+1 children total
+        let mut children = max_bracket.create_n_children(tournamentinfo_ref, num_children, mutation_rate); //this adds the parent back in for n+1 children total
 
         let last_max_bracket = max_bracket.clone();
 
@@ -66,7 +68,7 @@ fn main() {
         //score each of the children against the batch, then select the best child
         let mut fitness = 0.0; //reset max score of batch
         for child in &mut children{
-            generated_batch.score_against_ref(&child);
+            generated_batch.score_against_ref(child); // child is already a reference
             if generated_batch.batch_score > fitness{
             //if generated_batch.batch_score.powf(8.0) * (1.0 / generated_batch.batch_score_std_dev) > fitness{
                 fitness = generated_batch.batch_score;
