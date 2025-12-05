@@ -4,8 +4,14 @@
 use serde::{Serialize, Deserialize};
 use csv;
 use csv::StringRecord;
+use std::collections::HashMap;
+use std::sync::Arc;
 use crate::elo::EloSystem;
 use crate::game_result::BracketTeam;
+
+/// Atomically reference-counted Team for efficient sharing without cloning.
+/// Arc is used instead of Rc because it's thread-safe for parallel processing with rayon.
+pub type RcTeam = Arc<Team>;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Team {
@@ -35,14 +41,17 @@ impl PartialEq for Team {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug)]
 pub struct TournamentInfo {
-    pub teams: Vec<Team>,
+    pub teams: Vec<RcTeam>,
     pub round1: [[i32; 2]; 8],
     pub round2: [[i32; 4]; 4],
     pub round3: [[i32; 8]; 2],
     pub round4: [[i32; 16]; 1],
-    pub regions: Vec<Vec<Team>>,
+    pub regions: Vec<Vec<RcTeam>>,
+    /// Fast lookup map: (region, seed) -> RcTeam
+    /// This avoids O(n) filtering in bracket construction
+    pub team_lookup: HashMap<(String, i32), RcTeam>,
 }
 
 impl TournamentInfo {
@@ -68,7 +77,8 @@ impl TournamentInfo {
         let round3: [[i32; 8]; 2] = [[1, 16, 8, 9, 5, 12, 4, 13], [6, 11, 3, 14, 7, 10, 2, 15]];
         let round4: [[i32; 16]; 1] = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]];
 
-        let mut teams: Vec<Team> = Vec::with_capacity(64);
+        let mut teams: Vec<RcTeam> = Vec::with_capacity(64);
+        let mut team_lookup: HashMap<(String, i32), RcTeam> = HashMap::with_capacity(64);
 
         //TODO check if file exists and download if it doesn't exist OR specify file path as an argument
         //let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";
@@ -110,51 +120,56 @@ impl TournamentInfo {
             } else {
                 seed[i] = mensrecords[i][16].parse().unwrap();
             }
-            //add team to the vector
-            teams.push(Team::new(name[i].clone(), seed[i] as i32, region[i].clone(), rating[i] as f32));
-            //add team to the region hashset
-
+            //add team to the vector as Arc<Team>
+            let team = Arc::new(Team::new(name[i].clone(), seed[i] as i32, region[i].clone(), rating[i] as f32));
+            team_lookup.insert((region[i].clone(), seed[i] as i32), Arc::clone(&team));
+            teams.push(team);
         }
         assert!(teams.len() == 64, "There are not 64 teams in the tournament");
 
-        let east: Vec<Team> = teams
-        .iter()
-        .filter(|&x| x.region == "East")
-        .cloned()
-        .collect();
+        // Build region vectors using Arc::clone (cheap atomic reference counting, no data copy)
+        let east: Vec<RcTeam> = teams.iter()
+            .filter(|x| x.region == "East")
+            .map(Arc::clone)
+            .collect();
 
-        let west: Vec<Team> = teams
-        .iter()
-        .filter(|&x| x.region == "West")
-        .cloned()
-        .collect();
+        let west: Vec<RcTeam> = teams.iter()
+            .filter(|x| x.region == "West")
+            .map(Arc::clone)
+            .collect();
 
-        let south: Vec<Team> = teams
-        .iter()
-        .filter(|&x| x.region == "South")
-        .cloned()
-        .collect();
+        let south: Vec<RcTeam> = teams.iter()
+            .filter(|x| x.region == "South")
+            .map(Arc::clone)
+            .collect();
 
-        let midwest: Vec<Team> = teams
-        .iter()
-        .filter(|&x| x.region == "Midwest")
-        .cloned()
-        .collect();
+        let midwest: Vec<RcTeam> = teams.iter()
+            .filter(|x| x.region == "Midwest")
+            .map(Arc::clone)
+            .collect();
 
         let regions = vec![east, west, south, midwest];
 
-
-        TournamentInfo { 
-            teams: teams, 
-            round1: round1, 
-            round2: round2, 
-            round3: round3, 
-            round4: round4,
-            regions: regions,
+        TournamentInfo {
+            teams,
+            round1,
+            round2,
+            round3,
+            round4,
+            regions,
+            team_lookup,
         }
     }
     pub fn print(&self) {
         println!("{:?}", self);
+    }
+
+    /// Get a team by region and seed using O(1) lookup
+    /// Returns an Arc clone (cheap atomic reference count increment)
+    #[inline]
+    pub fn get_team(&self, region: &str, seed: i32) -> RcTeam {
+        Arc::clone(self.team_lookup.get(&(region.to_string(), seed))
+            .unwrap_or_else(|| panic!("Team not found: region={}, seed={}", region, seed)))
     }
 
     /// Create TournamentInfo from ELO ratings and bracket team information
@@ -176,7 +191,8 @@ impl TournamentInfo {
         ];
         let round4: [[i32; 16]; 1] = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]];
 
-        let mut teams: Vec<Team> = Vec::with_capacity(64);
+        let mut teams: Vec<RcTeam> = Vec::with_capacity(64);
+        let mut team_lookup: HashMap<(String, i32), RcTeam> = HashMap::with_capacity(64);
 
         // Convert bracket teams to Team structs with ELO ratings
         for bracket_team in &bracket_teams {
@@ -190,21 +206,23 @@ impl TournamentInfo {
                 75.0 // Middle-of-the-road default
             };
 
-            teams.push(Team::new(
+            let team = Arc::new(Team::new(
                 bracket_team.team_name.clone(),
                 bracket_team.seed,
                 bracket_team.region.clone(),
                 rating,
             ));
+            team_lookup.insert((bracket_team.region.clone(), bracket_team.seed), Arc::clone(&team));
+            teams.push(team);
         }
 
         assert!(teams.len() == 64, "There must be exactly 64 teams in the tournament");
 
-        // Organize teams by region
-        let east: Vec<Team> = teams.iter().filter(|&x| x.region == "East").cloned().collect();
-        let west: Vec<Team> = teams.iter().filter(|&x| x.region == "West").cloned().collect();
-        let south: Vec<Team> = teams.iter().filter(|&x| x.region == "South").cloned().collect();
-        let midwest: Vec<Team> = teams.iter().filter(|&x| x.region == "Midwest").cloned().collect();
+        // Organize teams by region using Arc::clone (cheap atomic reference counting)
+        let east: Vec<RcTeam> = teams.iter().filter(|x| x.region == "East").map(Arc::clone).collect();
+        let west: Vec<RcTeam> = teams.iter().filter(|x| x.region == "West").map(Arc::clone).collect();
+        let south: Vec<RcTeam> = teams.iter().filter(|x| x.region == "South").map(Arc::clone).collect();
+        let midwest: Vec<RcTeam> = teams.iter().filter(|x| x.region == "Midwest").map(Arc::clone).collect();
 
         let regions = vec![east, west, south, midwest];
 
@@ -215,6 +233,7 @@ impl TournamentInfo {
             round3,
             round4,
             regions,
+            team_lookup,
         }
     }
 
