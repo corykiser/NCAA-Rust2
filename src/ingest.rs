@@ -1,9 +1,11 @@
 // This file is used to ingest the data from the csv file that contains the 538 ratings and store it in a struct to be used later in other parts of the program
+// Also supports creating tournament info from custom ELO ratings calculated from live API data
 
 use serde::{Serialize, Deserialize};
 use csv;
-
 use csv::StringRecord;
+use crate::elo::EloSystem;
+use crate::game_result::BracketTeam;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Team {
@@ -153,5 +155,120 @@ impl TournamentInfo {
     }
     pub fn print(&self) {
         println!("{:?}", self);
+    }
+
+    /// Create TournamentInfo from ELO ratings and bracket team information
+    /// This allows using custom-calculated ELO ratings from live API data
+    /// instead of the FiveThirtyEight CSV file
+    pub fn from_elo_ratings(elo_system: &EloSystem, bracket_teams: Vec<BracketTeam>) -> TournamentInfo {
+        // Tournament structure (same as initialize)
+        let round1: [[i32; 2]; 8] = [
+            [1, 16], [2, 15], [3, 14], [4, 13],
+            [5, 12], [6, 11], [7, 10], [8, 9],
+        ];
+        let round2: [[i32; 4]; 4] = [
+            [1, 16, 8, 9], [5, 12, 4, 13],
+            [6, 11, 3, 14], [7, 10, 2, 15],
+        ];
+        let round3: [[i32; 8]; 2] = [
+            [1, 16, 8, 9, 5, 12, 4, 13],
+            [6, 11, 3, 14, 7, 10, 2, 15],
+        ];
+        let round4: [[i32; 16]; 1] = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]];
+
+        let mut teams: Vec<Team> = Vec::with_capacity(64);
+
+        // Convert bracket teams to Team structs with ELO ratings
+        for bracket_team in &bracket_teams {
+            // Look up the team's ELO rating
+            let rating = if let Some(elo_rating) = elo_system.find_team_by_name(&bracket_team.team_name) {
+                elo_system.to_538_scale(&elo_rating.team_id)
+            } else {
+                // If team not found in ELO system, use a default rating
+                // This might happen for play-in game teams with limited data
+                println!("Warning: No ELO rating found for '{}', using default", bracket_team.team_name);
+                75.0 // Middle-of-the-road default
+            };
+
+            teams.push(Team::new(
+                bracket_team.team_name.clone(),
+                bracket_team.seed,
+                bracket_team.region.clone(),
+                rating,
+            ));
+        }
+
+        assert!(teams.len() == 64, "There must be exactly 64 teams in the tournament");
+
+        // Organize teams by region
+        let east: Vec<Team> = teams.iter().filter(|&x| x.region == "East").cloned().collect();
+        let west: Vec<Team> = teams.iter().filter(|&x| x.region == "West").cloned().collect();
+        let south: Vec<Team> = teams.iter().filter(|&x| x.region == "South").cloned().collect();
+        let midwest: Vec<Team> = teams.iter().filter(|&x| x.region == "Midwest").cloned().collect();
+
+        let regions = vec![east, west, south, midwest];
+
+        TournamentInfo {
+            teams,
+            round1,
+            round2,
+            round3,
+            round4,
+            regions,
+        }
+    }
+
+    /// Create a sample bracket team list for testing
+    /// In production, this would come from the NCAA bracket announcement
+    pub fn sample_bracket_teams() -> Vec<BracketTeam> {
+        // This is a sample based on 2024 tournament structure
+        // Would need to be updated each year when brackets are announced
+        let regions = ["East", "West", "South", "Midwest"];
+        let mut teams = Vec::new();
+
+        // Sample teams - in reality, these would come from the official bracket
+        let sample_teams_by_region = [
+            // East (sample teams)
+            vec![
+                ("Connecticut", 1), ("Iowa State", 2), ("Illinois", 3), ("Auburn", 4),
+                ("San Diego State", 5), ("BYU", 6), ("Texas", 7), ("Florida Atlantic", 8),
+                ("Northwestern", 9), ("Drake", 10), ("Duquesne", 11), ("UAB", 12),
+                ("Yale", 13), ("Morehead State", 14), ("Long Beach State", 15), ("Stetson", 16),
+            ],
+            // West
+            vec![
+                ("North Carolina", 1), ("Arizona", 2), ("Baylor", 3), ("Alabama", 4),
+                ("Saint Mary's", 5), ("Clemson", 6), ("Dayton", 7), ("Mississippi State", 8),
+                ("Michigan State", 9), ("Nevada", 10), ("New Mexico", 11), ("Grand Canyon", 12),
+                ("Charleston", 13), ("Colgate", 14), ("Long Island", 15), ("Wagner", 16),
+            ],
+            // South
+            vec![
+                ("Houston", 1), ("Marquette", 2), ("Kentucky", 3), ("Duke", 4),
+                ("Wisconsin", 5), ("Texas Tech", 6), ("Florida", 7), ("Nebraska", 8),
+                ("Texas A&M", 9), ("Colorado", 10), ("NC State", 11), ("James Madison", 12),
+                ("Vermont", 13), ("Oakland", 14), ("Western Kentucky", 15), ("Longwood", 16),
+            ],
+            // Midwest
+            vec![
+                ("Purdue", 1), ("Tennessee", 2), ("Creighton", 3), ("Kansas", 4),
+                ("Gonzaga", 5), ("South Carolina", 6), ("Texas", 7), ("Utah State", 8),
+                ("TCU", 9), ("Colorado State", 10), ("Oregon", 11), ("McNeese", 12),
+                ("Samford", 13), ("Akron", 14), ("Grambling State", 15), ("Montana State", 16),
+            ],
+        ];
+
+        for (region_idx, region_teams) in sample_teams_by_region.iter().enumerate() {
+            for (name, seed) in region_teams {
+                teams.push(BracketTeam::new(
+                    name.to_lowercase().replace(' ', "-"),
+                    name.to_string(),
+                    *seed,
+                    regions[region_idx].to_string(),
+                ));
+            }
+        }
+
+        teams
     }
 }
