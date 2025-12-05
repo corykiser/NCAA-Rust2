@@ -131,6 +131,62 @@ impl Game {
 
 //todo smart mutate function that only mutates the parts of the bracket that are uncertain (i.e. win probability is between 0.4 and 0.6ç)
 
+/// Result of comparing two brackets with weighted distance metric
+#[derive(Debug, Clone)]
+pub struct BracketDistance {
+    /// Total weighted distance (lower = more similar)
+    pub total_distance: f64,
+    /// Similarity percentage (0.0 to 1.0, higher = more similar)
+    pub similarity: f64,
+    /// Distance contribution from each round [R1, R2, Sweet16, Elite8, F4, Championship]
+    pub round_distances: [f64; 6],
+    /// Number of matching picks per round
+    pub round_matches: [usize; 6],
+    /// Total games per round for reference
+    pub round_totals: [usize; 6],
+    /// Whether both brackets have the same champion
+    pub champion_match: bool,
+}
+
+impl BracketDistance {
+    /// Pretty print the distance breakdown
+    pub fn print(&self) {
+        let round_names = ["Round 1", "Round 2", "Sweet 16", "Elite 8", "Final Four", "Championship"];
+
+        println!("\nBracket Similarity Analysis");
+        println!("============================");
+        println!("Overall Similarity: {:.1}%", self.similarity * 100.0);
+        println!("Total Distance: {:.2}", self.total_distance);
+        println!("Same Champion: {}", if self.champion_match { "Yes" } else { "No" });
+        println!();
+        println!("{:<14} {:>8} {:>12}", "Round", "Matches", "Distance");
+        println!("{}", "-".repeat(36));
+
+        for i in 0..6 {
+            println!(
+                "{:<14} {:>3}/{:<4} {:>12.2}",
+                round_names[i],
+                self.round_matches[i],
+                self.round_totals[i],
+                self.round_distances[i]
+            );
+        }
+        println!();
+    }
+
+    /// Returns true if brackets are identical
+    pub fn is_identical(&self) -> bool {
+        self.total_distance == 0.0
+    }
+
+    /// Returns the percentage of games that match in later rounds (Sweet 16+)
+    pub fn late_round_match_pct(&self) -> f64 {
+        let late_matches: usize = self.round_matches[2..].iter().sum();
+        let late_totals: usize = self.round_totals[2..].iter().sum();
+        late_matches as f64 / late_totals as f64
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Bracket {
     pub round1: Vec<Game>, //round of 64
@@ -510,6 +566,103 @@ impl Bracket{
         }
         distance
     }
+
+    /// Weighted distance metric that values later rounds more heavily
+    /// Returns a struct with total distance, similarity percentage, and per-round breakdown
+    pub fn weighted_distance(&self, other: &Bracket) -> BracketDistance {
+        // Round weights based on scoring system
+        // Round 1: base 1, Round 2: base 2, etc. up to Championship: base 32
+        const ROUND_WEIGHTS: [f64; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+
+        let mut round_distances: [f64; 6] = [0.0; 6];
+        let mut round_matches: [usize; 6] = [0; 6];
+        let mut round_totals: [usize; 6] = [32, 16, 8, 4, 2, 1];
+
+        // Round 1: 32 games (indices 0-31 in binary)
+        for i in 0..32 {
+            if self.round1[i].winner == other.round1[i].winner {
+                round_matches[0] += 1;
+            } else {
+                // Weight by average seed of the differing winner
+                let seed_weight = (self.round1[i].winner.seed + other.round1[i].winner.seed) as f64 / 2.0;
+                round_distances[0] += ROUND_WEIGHTS[0] * (1.0 + seed_weight / 16.0);
+            }
+        }
+
+        // Round 2: 16 games
+        for i in 0..16 {
+            if self.round2[i].winner == other.round2[i].winner {
+                round_matches[1] += 1;
+            } else {
+                let seed_weight = (self.round2[i].winner.seed + other.round2[i].winner.seed) as f64 / 2.0;
+                round_distances[1] += ROUND_WEIGHTS[1] * (1.0 + seed_weight / 16.0);
+            }
+        }
+
+        // Round 3 (Sweet 16): 8 games
+        for i in 0..8 {
+            if self.round3[i].winner == other.round3[i].winner {
+                round_matches[2] += 1;
+            } else {
+                let seed_weight = (self.round3[i].winner.seed + other.round3[i].winner.seed) as f64 / 2.0;
+                round_distances[2] += ROUND_WEIGHTS[2] * (1.0 + seed_weight / 16.0);
+            }
+        }
+
+        // Round 4 (Elite 8): 4 games
+        for i in 0..4 {
+            if self.round4[i].winner == other.round4[i].winner {
+                round_matches[3] += 1;
+            } else {
+                let seed_weight = (self.round4[i].winner.seed + other.round4[i].winner.seed) as f64 / 2.0;
+                round_distances[3] += ROUND_WEIGHTS[3] * (1.0 + seed_weight / 16.0);
+            }
+        }
+
+        // Round 5 (Final Four): 2 games
+        for i in 0..2 {
+            if self.round5[i].winner == other.round5[i].winner {
+                round_matches[4] += 1;
+            } else {
+                let seed_weight = (self.round5[i].winner.seed + other.round5[i].winner.seed) as f64 / 2.0;
+                round_distances[4] += ROUND_WEIGHTS[4] * (1.0 + seed_weight / 16.0);
+            }
+        }
+
+        // Round 6 (Championship): 1 game
+        if self.round6[0].winner == other.round6[0].winner {
+            round_matches[5] += 1;
+        } else {
+            let seed_weight = (self.round6[0].winner.seed + other.round6[0].winner.seed) as f64 / 2.0;
+            round_distances[5] += ROUND_WEIGHTS[5] * (1.0 + seed_weight / 16.0);
+        }
+
+        // Calculate total weighted distance
+        let total_distance: f64 = round_distances.iter().sum();
+
+        // Calculate maximum possible distance (if all games differed with seed 16 teams)
+        // Max per round = num_games * weight * (1 + 16/16) = num_games * weight * 2
+        let max_distance: f64 =
+            32.0 * ROUND_WEIGHTS[0] * 2.0 +
+            16.0 * ROUND_WEIGHTS[1] * 2.0 +
+            8.0 * ROUND_WEIGHTS[2] * 2.0 +
+            4.0 * ROUND_WEIGHTS[3] * 2.0 +
+            2.0 * ROUND_WEIGHTS[4] * 2.0 +
+            1.0 * ROUND_WEIGHTS[5] * 2.0;
+
+        // Similarity as percentage (1.0 = identical, 0.0 = maximally different)
+        let similarity = 1.0 - (total_distance / max_distance);
+
+        BracketDistance {
+            total_distance,
+            similarity,
+            round_distances,
+            round_matches,
+            round_totals,
+            champion_match: self.winner == other.winner,
+        }
+    }
+
     //This will iterate through each round and print out the winner's names
     pub fn pretty_print(&self){
         println!("Round 1");
