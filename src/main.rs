@@ -32,6 +32,16 @@ struct Args {
     #[arg(long, default_value_t = api::current_season())]
     season: String,
 
+    /// Tournament year (e.g., 2024 for March Madness 2024)
+    /// Used to fetch bracket teams with seeds and regions
+    #[arg(short, long)]
+    tournament_year: Option<i32>,
+
+    /// Path to bracket JSON file with teams, seeds, and regions
+    /// Alternative to fetching from API
+    #[arg(long)]
+    bracket_file: Option<String>,
+
     /// Path to FiveThirtyEight CSV file (only used with --source csv)
     #[arg(long, default_value = "fivethirtyeight_ncaa_forecasts.csv")]
     csv_path: String,
@@ -109,11 +119,57 @@ fn main() {
                 return;
             }
 
-            // Get bracket teams (would come from official bracket announcement)
-            // For now, use sample data
+            // Get bracket teams - try multiple sources in order:
+            // 1. Local bracket file (if provided)
+            // 2. Fetch from API (if tournament_year provided)
+            // 3. Fall back to sample data
             println!();
-            println!("Using sample bracket teams (update with official bracket when available)");
-            let bracket_teams = ingest::TournamentInfo::sample_bracket_teams();
+            let bracket_teams = if let Some(ref bracket_path) = args.bracket_file {
+                println!("Loading bracket from file: {}", bracket_path);
+                match api::load_bracket_from_file(bracket_path) {
+                    Ok(teams) => {
+                        println!("Loaded {} teams from bracket file", teams.len());
+                        teams
+                    }
+                    Err(e) => {
+                        eprintln!("Error loading bracket file: {}", e);
+                        eprintln!("Falling back to sample bracket...");
+                        ingest::TournamentInfo::sample_bracket_teams()
+                    }
+                }
+            } else if let Some(year) = args.tournament_year {
+                println!("Fetching {} tournament bracket...", year);
+                match client.fetch_tournament_bracket(year) {
+                    Ok(teams) => teams,
+                    Err(e) => {
+                        eprintln!("Error fetching bracket: {}", e);
+                        eprintln!("Falling back to sample bracket...");
+                        ingest::TournamentInfo::sample_bracket_teams()
+                    }
+                }
+            } else {
+                // Derive tournament year from season
+                let parts: Vec<&str> = args.season.split('-').collect();
+                if parts.len() == 2 {
+                    if let Ok(year) = parts[1].parse::<i32>() {
+                        println!("Fetching {} tournament bracket (derived from season)...", year);
+                        match client.fetch_tournament_bracket(year) {
+                            Ok(teams) => teams,
+                            Err(e) => {
+                                eprintln!("Note: {}", e);
+                                println!("Using sample bracket teams");
+                                ingest::TournamentInfo::sample_bracket_teams()
+                            }
+                        }
+                    } else {
+                        println!("Using sample bracket teams");
+                        ingest::TournamentInfo::sample_bracket_teams()
+                    }
+                } else {
+                    println!("Using sample bracket teams");
+                    ingest::TournamentInfo::sample_bracket_teams()
+                }
+            };
 
             // Create tournament info with calculated ELO ratings
             ingest::TournamentInfo::from_elo_ratings(&elo_system, bracket_teams)

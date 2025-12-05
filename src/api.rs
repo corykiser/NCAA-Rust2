@@ -1,14 +1,33 @@
 // This module handles fetching game data from ESPN and NCAA APIs
 // to calculate ELO ratings for NCAA basketball teams
 
-use crate::game_result::{GameCache, GameResult, TeamInfo};
+use crate::game_result::{BracketTeam, GameCache, GameResult, TeamInfo};
 use chrono::{Datelike, NaiveDate};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+
+/// Cached bracket data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BracketCache {
+    pub tournament_year: i32,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    pub teams: Vec<BracketTeam>,
+}
+
+impl BracketCache {
+    pub fn new(tournament_year: i32, teams: Vec<BracketTeam>) -> Self {
+        BracketCache {
+            tournament_year,
+            last_updated: chrono::Utc::now(),
+            teams,
+        }
+    }
+}
 
 /// Data source for fetching game results
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -422,6 +441,217 @@ impl ApiClient {
 
         teams
     }
+
+    /// Fetch tournament bracket for a specific year from ESPN
+    /// tournament_year is the year the tournament ends (e.g., 2024 for March Madness 2024)
+    pub fn fetch_tournament_bracket(&self, tournament_year: i32) -> Result<Vec<BracketTeam>, String> {
+        // Check cache first
+        let cache_path = format!("{}/bracket_{}.json", self.cache_dir, tournament_year);
+        if let Some(cache) = self.load_bracket_cache(&cache_path) {
+            println!("Using cached bracket from {} ({} teams)", cache.last_updated, cache.teams.len());
+            return Ok(cache.teams);
+        }
+
+        println!("Fetching {} tournament bracket from ESPN...", tournament_year);
+
+        // NCAA Tournament typically runs from mid-March (Selection Sunday ~March 17)
+        // First round games are usually March 21-22
+        // We'll fetch the first round games which have seed information
+        let first_round_start = NaiveDate::from_ymd_opt(tournament_year, 3, 19).unwrap();
+        let first_round_end = NaiveDate::from_ymd_opt(tournament_year, 3, 23).unwrap();
+
+        let mut bracket_teams: HashMap<String, BracketTeam> = HashMap::new();
+
+        // Fetch first round tournament games
+        let mut current_date = first_round_start;
+        while current_date <= first_round_end {
+            if let Ok(teams) = self.fetch_tournament_games_for_date(current_date) {
+                for team in teams {
+                    bracket_teams.insert(team.team_id.clone(), team);
+                }
+            }
+            current_date = current_date.succ_opt().unwrap();
+            thread::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS));
+        }
+
+        // If we didn't get 64 teams from first round, try a wider date range
+        if bracket_teams.len() < 64 {
+            println!("Found {} teams, searching more dates...", bracket_teams.len());
+            let extended_start = NaiveDate::from_ymd_opt(tournament_year, 3, 14).unwrap();
+            let extended_end = NaiveDate::from_ymd_opt(tournament_year, 3, 25).unwrap();
+
+            let mut current_date = extended_start;
+            while current_date <= extended_end {
+                if let Ok(teams) = self.fetch_tournament_games_for_date(current_date) {
+                    for team in teams {
+                        bracket_teams.insert(team.team_id.clone(), team);
+                    }
+                }
+                current_date = current_date.succ_opt().unwrap();
+                thread::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS));
+            }
+        }
+
+        let teams: Vec<BracketTeam> = bracket_teams.into_values().collect();
+
+        if teams.len() >= 64 {
+            println!("Found {} tournament teams", teams.len());
+            // Cache the results
+            self.save_bracket_cache(&cache_path, tournament_year, &teams)?;
+            Ok(teams)
+        } else if teams.is_empty() {
+            Err(format!(
+                "Could not fetch bracket for {}. Tournament data may not be available yet.",
+                tournament_year
+            ))
+        } else {
+            println!("Warning: Only found {} teams (expected 64)", teams.len());
+            self.save_bracket_cache(&cache_path, tournament_year, &teams)?;
+            Ok(teams)
+        }
+    }
+
+    /// Fetch tournament games for a specific date and extract bracket team info
+    fn fetch_tournament_games_for_date(&self, date: NaiveDate) -> Result<Vec<BracketTeam>, String> {
+        let date_str = date.format("%Y%m%d").to_string();
+        // Use groups=100 to specifically get NCAA tournament games
+        let url = format!(
+            "{}/scoreboard?dates={}&groups=100&limit=100",
+            ESPN_BASE_URL, date_str
+        );
+
+        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
+        let json: Value = response.json().map_err(|e| e.to_string())?;
+
+        let mut teams = Vec::new();
+
+        if let Some(events) = json.get("events").and_then(|e| e.as_array()) {
+            for event in events {
+                // Check if this is an NCAA Tournament game
+                let is_tournament = event
+                    .get("season")
+                    .and_then(|s| s.get("type"))
+                    .and_then(|t| t.as_i64())
+                    .map(|t| t == 3) // type 3 = postseason
+                    .unwrap_or(false);
+
+                if !is_tournament {
+                    continue;
+                }
+
+                if let Some(competitions) = event.get("competitions").and_then(|c| c.as_array()) {
+                    for competition in competitions {
+                        // Try to get the bracket region from notes
+                        let region = competition
+                            .get("notes")
+                            .and_then(|n| n.as_array())
+                            .and_then(|notes| {
+                                notes.iter().find_map(|note| {
+                                    let headline = note.get("headline")?.as_str()?;
+                                    // Notes often contain region info like "East Regional"
+                                    if headline.contains("East") {
+                                        Some("East".to_string())
+                                    } else if headline.contains("West") {
+                                        Some("West".to_string())
+                                    } else if headline.contains("South") {
+                                        Some("South".to_string())
+                                    } else if headline.contains("Midwest") {
+                                        Some("Midwest".to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or_else(|| "Unknown".to_string());
+
+                        if let Some(competitors) = competition.get("competitors").and_then(|c| c.as_array()) {
+                            for competitor in competitors {
+                                if let Some(bracket_team) = self.parse_tournament_competitor(competitor, &region) {
+                                    teams.push(bracket_team);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(teams)
+    }
+
+    /// Parse a tournament competitor into a BracketTeam
+    fn parse_tournament_competitor(&self, competitor: &Value, default_region: &str) -> Option<BracketTeam> {
+        let team = competitor.get("team")?;
+        let team_id = team.get("id")?.as_str()?.to_string();
+        let team_name = team.get("displayName")
+            .or(team.get("name"))?
+            .as_str()?
+            .to_string();
+
+        // Get seed - this is the key info for tournament teams
+        let seed: i32 = competitor
+            .get("curatedRank")
+            .and_then(|r| r.get("current"))
+            .and_then(|c| c.as_i64())
+            .or_else(|| {
+                // Try alternate location for seed
+                competitor.get("seed").and_then(|s| s.as_i64())
+            })
+            .map(|s| s as i32)
+            .unwrap_or(0);
+
+        // Skip if no valid seed (not a tournament team)
+        if seed < 1 || seed > 16 {
+            return None;
+        }
+
+        Some(BracketTeam::new(
+            team_id,
+            team_name,
+            seed,
+            default_region.to_string(),
+        ))
+    }
+
+    /// Load cached bracket from file
+    fn load_bracket_cache(&self, path: &str) -> Option<BracketCache> {
+        if Path::new(path).exists() {
+            let content = fs::read_to_string(path).ok()?;
+            serde_json::from_str(&content).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Save bracket to cache file
+    fn save_bracket_cache(&self, path: &str, year: i32, teams: &[BracketTeam]) -> Result<(), String> {
+        let cache = BracketCache::new(year, teams.to_vec());
+        let json = serde_json::to_string_pretty(&cache).map_err(|e| e.to_string())?;
+        fs::write(path, json).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Load bracket teams from a local JSON file
+/// File format: array of objects with team_id, team_name, seed, region
+pub fn load_bracket_from_file(path: &str) -> Result<Vec<BracketTeam>, String> {
+    if !Path::new(path).exists() {
+        return Err(format!("Bracket file not found: {}", path));
+    }
+
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+
+    // Try to parse as BracketCache first (our cached format)
+    if let Ok(cache) = serde_json::from_str::<BracketCache>(&content) {
+        return Ok(cache.teams);
+    }
+
+    // Try to parse as raw array of BracketTeam
+    if let Ok(teams) = serde_json::from_str::<Vec<BracketTeam>>(&content) {
+        return Ok(teams);
+    }
+
+    Err("Could not parse bracket file. Expected JSON array of teams with team_id, team_name, seed, region".to_string())
 }
 
 /// Get the current college basketball season string
