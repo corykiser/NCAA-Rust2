@@ -1,0 +1,601 @@
+// Portfolio generation for diverse bracket strategies
+// Supports constrained bracket building and champion-stratified portfolios
+
+use crate::bracket::{Bracket, BracketDistance, Game};
+use crate::ingest::{Team, TournamentInfo};
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+
+/// Specifies how far a team must advance
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdvancementRound {
+    Round2,      // Must win at least 1 game
+    Sweet16,     // Must reach Sweet 16
+    Elite8,      // Must reach Elite 8
+    FinalFour,   // Must reach Final Four
+    Championship, // Must reach championship game
+    Winner,      // Must win it all
+}
+
+impl AdvancementRound {
+    /// Number of wins required to reach this round
+    pub fn wins_required(&self) -> usize {
+        match self {
+            AdvancementRound::Round2 => 1,
+            AdvancementRound::Sweet16 => 2,
+            AdvancementRound::Elite8 => 3,
+            AdvancementRound::FinalFour => 4,
+            AdvancementRound::Championship => 5,
+            AdvancementRound::Winner => 6,
+        }
+    }
+}
+
+/// A constraint on bracket generation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BracketConstraint {
+    pub team_name: String,
+    pub must_reach: AdvancementRound,
+}
+
+impl BracketConstraint {
+    pub fn new(team_name: &str, must_reach: AdvancementRound) -> Self {
+        BracketConstraint {
+            team_name: team_name.to_string(),
+            must_reach,
+        }
+    }
+
+    /// Shorthand for requiring a team to win the championship
+    pub fn champion(team_name: &str) -> Self {
+        Self::new(team_name, AdvancementRound::Winner)
+    }
+
+    /// Shorthand for requiring a team to reach the Final Four
+    pub fn final_four(team_name: &str) -> Self {
+        Self::new(team_name, AdvancementRound::FinalFour)
+    }
+}
+
+/// Builds brackets with constraints
+pub struct ConstrainedBracketBuilder<'a> {
+    tournament: &'a TournamentInfo,
+    constraints: Vec<BracketConstraint>,
+}
+
+impl<'a> ConstrainedBracketBuilder<'a> {
+    pub fn new(tournament: &'a TournamentInfo) -> Self {
+        ConstrainedBracketBuilder {
+            tournament,
+            constraints: Vec::new(),
+        }
+    }
+
+    pub fn with_constraint(mut self, constraint: BracketConstraint) -> Self {
+        self.constraints.push(constraint);
+        self
+    }
+
+    pub fn with_champion(self, team_name: &str) -> Self {
+        self.with_constraint(BracketConstraint::champion(team_name))
+    }
+
+    pub fn with_final_four(self, team_name: &str) -> Self {
+        self.with_constraint(BracketConstraint::final_four(team_name))
+    }
+
+    /// Find a team by name in the tournament
+    fn find_team(&self, name: &str) -> Option<&Team> {
+        let name_lower = name.to_lowercase();
+        self.tournament.teams.iter().find(|t| {
+            t.name.to_lowercase() == name_lower ||
+            t.name.to_lowercase().contains(&name_lower)
+        })
+    }
+
+    /// Get the region index for a team
+    fn get_region_index(&self, team: &Team) -> usize {
+        match team.region.as_str() {
+            "East" => 0,
+            "West" => 1,
+            "South" => 2,
+            "Midwest" => 3,
+            _ => 0,
+        }
+    }
+
+    /// Build a bracket respecting all constraints
+    /// Constrained games are set deterministically, others use probability
+    pub fn build(&self) -> Result<Bracket, String> {
+        // First, generate a random bracket as base
+        let mut bracket = Bracket::new(self.tournament);
+
+        // Apply each constraint
+        for constraint in &self.constraints {
+            let team = self.find_team(&constraint.team_name)
+                .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
+
+            self.apply_constraint(&mut bracket, team, &constraint.must_reach)?;
+        }
+
+        // Recalculate bracket stats
+        self.recalculate_bracket_stats(&mut bracket);
+
+        Ok(bracket)
+    }
+
+    /// Build bracket optimized for EV while respecting constraints
+    /// Uses expected value to decide unconstrained games
+    pub fn build_optimal(&self) -> Result<Bracket, String> {
+        // Start with a fresh bracket using probability-based picks
+        let mut binary = self.generate_optimal_binary()?;
+
+        // Apply constraints to the binary representation
+        for constraint in &self.constraints {
+            let team = self.find_team(&constraint.team_name)
+                .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
+
+            self.apply_constraint_to_binary(&mut binary, team, &constraint.must_reach)?;
+        }
+
+        // Build bracket from binary
+        let bracket = Bracket::new_from_binary(self.tournament, binary);
+        Ok(bracket)
+    }
+
+    /// Generate binary representation that maximizes expected value
+    fn generate_optimal_binary(&self) -> Result<Vec<bool>, String> {
+        let mut binary = Vec::with_capacity(63);
+
+        // For each game, pick the higher probability winner
+        // Round 1: 32 games
+        for region in &["East", "West", "South", "Midwest"] {
+            for matchup in self.tournament.round1 {
+                let teams: Vec<&Team> = self.tournament.teams.iter()
+                    .filter(|t| &t.region == region && (t.seed == matchup[0] || t.seed == matchup[1]))
+                    .collect();
+
+                if teams.len() == 2 {
+                    // Pick higher rated team (lower seed usually)
+                    let pick_first = teams[0].rating >= teams[1].rating;
+                    // hilo = true means lower seed wins
+                    let lower_seed_first = teams[0].seed < teams[1].seed;
+                    binary.push(pick_first == lower_seed_first);
+                } else {
+                    binary.push(true); // Default
+                }
+            }
+        }
+
+        // For later rounds, we need to simulate forward
+        // This is a simplification - just pick favorites
+        // Round 2-6: add remaining bits based on probability
+        for _ in 32..63 {
+            binary.push(true); // Favor lower seeds / earlier alphabet
+        }
+
+        Ok(binary)
+    }
+
+    /// Apply a constraint to a bracket
+    fn apply_constraint(
+        &self,
+        bracket: &mut Bracket,
+        team: &Team,
+        must_reach: &AdvancementRound,
+    ) -> Result<(), String> {
+        let wins_needed = must_reach.wins_required();
+        let region_idx = self.get_region_index(team);
+
+        // Round 1: Ensure team wins their first game
+        if wins_needed >= 1 {
+            let r1_idx = self.find_round1_game_index(team, region_idx);
+            if let Some(idx) = r1_idx {
+                bracket.round1[idx].winner = team.clone();
+            }
+        }
+
+        // Round 2: Ensure team wins
+        if wins_needed >= 2 {
+            let r2_idx = self.find_round2_game_index(team, region_idx);
+            if let Some(idx) = r2_idx {
+                bracket.round2[idx].winner = team.clone();
+            }
+        }
+
+        // Sweet 16 (Round 3)
+        if wins_needed >= 3 {
+            let r3_idx = self.find_round3_game_index(team, region_idx);
+            if let Some(idx) = r3_idx {
+                bracket.round3[idx].winner = team.clone();
+            }
+        }
+
+        // Elite 8 (Round 4)
+        if wins_needed >= 4 {
+            let r4_idx = region_idx; // One Elite 8 game per region
+            bracket.round4[r4_idx].winner = team.clone();
+        }
+
+        // Final Four (Round 5)
+        if wins_needed >= 5 {
+            // Final Four: South/Midwest play each other, East/West play each other
+            let r5_idx = if region_idx == 2 || region_idx == 3 { 0 } else { 1 };
+            bracket.round5[r5_idx].winner = team.clone();
+        }
+
+        // Championship (Round 6)
+        if wins_needed >= 6 {
+            bracket.round6[0].winner = team.clone();
+            bracket.winner = team.clone();
+        }
+
+        Ok(())
+    }
+
+    /// Apply constraint to binary representation
+    fn apply_constraint_to_binary(
+        &self,
+        binary: &mut Vec<bool>,
+        team: &Team,
+        must_reach: &AdvancementRound,
+    ) -> Result<(), String> {
+        let wins_needed = must_reach.wins_required();
+        let region_idx = self.get_region_index(team);
+
+        // Calculate binary indices for this team's games
+        // Round 1: 8 games per region, starting at region_idx * 8
+        if wins_needed >= 1 {
+            let base = region_idx * 8;
+            let game_in_region = self.seed_to_round1_game(team.seed);
+            let idx = base + game_in_region;
+            if idx < 32 {
+                // Set to make team win (depends on seed position)
+                binary[idx] = team.seed < 9; // Lower seeds are "true" in hilo
+            }
+        }
+
+        // For later rounds, the logic is more complex because game indices
+        // depend on who won earlier. We'll handle this by rebuilding the bracket
+        // and then extracting the binary representation.
+        // This is a limitation of the current approach.
+
+        Ok(())
+    }
+
+    /// Find the Round 1 game index for a team
+    fn find_round1_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
+        let base = region_idx * 8;
+        let game_in_region = self.seed_to_round1_game(team.seed);
+        Some(base + game_in_region)
+    }
+
+    /// Map seed to round 1 game within region (0-7)
+    fn seed_to_round1_game(&self, seed: i32) -> usize {
+        match seed {
+            1 | 16 => 0,
+            8 | 9 => 1,
+            5 | 12 => 2,
+            4 | 13 => 3,
+            6 | 11 => 4,
+            3 | 14 => 5,
+            7 | 10 => 6,
+            2 | 15 => 7,
+            _ => 0,
+        }
+    }
+
+    /// Find Round 2 game index
+    fn find_round2_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
+        let base = region_idx * 4;
+        let game_in_region = match team.seed {
+            1 | 16 | 8 | 9 => 0,
+            5 | 12 | 4 | 13 => 1,
+            6 | 11 | 3 | 14 => 2,
+            7 | 10 | 2 | 15 => 3,
+            _ => 0,
+        };
+        Some(base + game_in_region)
+    }
+
+    /// Find Round 3 (Sweet 16) game index
+    fn find_round3_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
+        let base = region_idx * 2;
+        let game_in_region = match team.seed {
+            1 | 16 | 8 | 9 | 5 | 12 | 4 | 13 => 0,
+            6 | 11 | 3 | 14 | 7 | 10 | 2 | 15 => 1,
+            _ => 0,
+        };
+        Some(base + game_in_region)
+    }
+
+    /// Recalculate bracket statistics after modifications
+    fn recalculate_bracket_stats(&self, bracket: &mut Bracket) {
+        let mut prob = 1.0;
+        let mut score = 0.0;
+        let mut expected_value = 0.0;
+
+        // Round 1
+        for game in &bracket.round1 {
+            prob *= game.winnerprob;
+            score += 1.0 + game.winner.seed as f64;
+            expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
+        }
+
+        // Round 2
+        for game in &bracket.round2 {
+            prob *= game.winnerprob;
+            score += 2.0 + game.winner.seed as f64;
+            expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
+        }
+
+        // Round 3
+        for game in &bracket.round3 {
+            prob *= game.winnerprob;
+            score += 4.0 + game.winner.seed as f64;
+            expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
+        }
+
+        // Round 4
+        for game in &bracket.round4 {
+            prob *= game.winnerprob;
+            score += 8.0 * game.winner.seed as f64;
+            expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
+        }
+
+        // Round 5
+        for game in &bracket.round5 {
+            prob *= game.winnerprob;
+            score += 16.0 * game.winner.seed as f64;
+            expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
+        }
+
+        // Round 6
+        for game in &bracket.round6 {
+            prob *= game.winnerprob;
+            score += 32.0 * game.winner.seed as f64;
+            expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
+        }
+
+        bracket.prob = prob;
+        bracket.score = score;
+        bracket.expected_value = expected_value;
+    }
+}
+
+/// A portfolio of diverse brackets
+#[derive(Debug, Clone)]
+pub struct BracketPortfolio {
+    pub brackets: Vec<Bracket>,
+    pub constraints: Vec<Vec<BracketConstraint>>,
+}
+
+impl BracketPortfolio {
+    pub fn new() -> Self {
+        BracketPortfolio {
+            brackets: Vec::new(),
+            constraints: Vec::new(),
+        }
+    }
+
+    /// Generate portfolio stratified by champion
+    /// Each bracket bets on a different championship winner
+    pub fn generate_champion_stratified(
+        tournament: &TournamentInfo,
+        num_brackets: usize,
+    ) -> Self {
+        let mut portfolio = BracketPortfolio::new();
+
+        // Rank teams by rating (proxy for championship probability)
+        let mut ranked_teams: Vec<&Team> = tournament.teams.iter().collect();
+        ranked_teams.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap());
+
+        // Generate one bracket per top team
+        for team in ranked_teams.iter().take(num_brackets) {
+            let constraint = BracketConstraint::champion(&team.name);
+
+            let builder = ConstrainedBracketBuilder::new(tournament)
+                .with_constraint(constraint.clone());
+
+            match builder.build() {
+                Ok(bracket) => {
+                    portfolio.brackets.push(bracket);
+                    portfolio.constraints.push(vec![constraint]);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Could not build bracket for {}: {}", team.name, e);
+                }
+            }
+        }
+
+        portfolio
+    }
+
+    /// Generate portfolio with greedy diversity
+    /// Each subsequent bracket is penalized for similarity to existing ones
+    pub fn generate_greedy_diverse(
+        tournament: &TournamentInfo,
+        num_brackets: usize,
+        diversity_weight: f64,
+        generations: u32,
+    ) -> Self {
+        let mut portfolio = BracketPortfolio::new();
+
+        for i in 0..num_brackets {
+            let bracket = if i == 0 {
+                // First bracket: pure optimization
+                optimize_bracket(tournament, generations)
+            } else {
+                // Subsequent brackets: optimize with diversity penalty
+                optimize_with_diversity(tournament, &portfolio.brackets, diversity_weight, generations)
+            };
+
+            portfolio.brackets.push(bracket);
+            portfolio.constraints.push(Vec::new()); // No explicit constraints
+        }
+
+        portfolio
+    }
+
+    /// Calculate statistics about the portfolio
+    pub fn stats(&self) -> PortfolioStats {
+        if self.brackets.is_empty() {
+            return PortfolioStats::default();
+        }
+
+        // Calculate average EV
+        let avg_ev = self.brackets.iter()
+            .map(|b| b.expected_value)
+            .sum::<f64>() / self.brackets.len() as f64;
+
+        // Calculate pairwise similarities
+        let mut total_similarity = 0.0;
+        let mut min_similarity = 1.0;
+        let mut comparisons = 0;
+
+        for i in 0..self.brackets.len() {
+            for j in (i + 1)..self.brackets.len() {
+                let dist = self.brackets[i].weighted_distance(&self.brackets[j]);
+                total_similarity += dist.similarity;
+                if dist.similarity < min_similarity {
+                    min_similarity = dist.similarity;
+                }
+                comparisons += 1;
+            }
+        }
+
+        let avg_similarity = if comparisons > 0 {
+            total_similarity / comparisons as f64
+        } else {
+            1.0
+        };
+
+        // Count unique champions
+        let mut champions: Vec<String> = self.brackets.iter()
+            .map(|b| b.winner.name.clone())
+            .collect();
+        champions.sort();
+        champions.dedup();
+
+        PortfolioStats {
+            num_brackets: self.brackets.len(),
+            avg_expected_value: avg_ev,
+            avg_similarity,
+            min_similarity,
+            unique_champions: champions.len(),
+            champion_names: champions,
+        }
+    }
+
+    /// Pretty print portfolio summary
+    pub fn print_summary(&self) {
+        let stats = self.stats();
+
+        println!("\n=== Bracket Portfolio Summary ===");
+        println!("Number of brackets: {}", stats.num_brackets);
+        println!("Average EV: {:.2}", stats.avg_expected_value);
+        println!("Average similarity: {:.1}%", stats.avg_similarity * 100.0);
+        println!("Minimum similarity: {:.1}%", stats.min_similarity * 100.0);
+        println!("Unique champions: {}", stats.unique_champions);
+        println!("Champions: {:?}", stats.champion_names);
+        println!();
+
+        for (i, bracket) in self.brackets.iter().enumerate() {
+            println!("Bracket {}: Champion = {} (seed {}), EV = {:.2}",
+                     i + 1, bracket.winner.name, bracket.winner.seed, bracket.expected_value);
+        }
+        println!();
+    }
+
+    /// Print detailed comparison between brackets
+    pub fn print_pairwise_distances(&self) {
+        println!("\n=== Pairwise Bracket Distances ===");
+        for i in 0..self.brackets.len() {
+            for j in (i + 1)..self.brackets.len() {
+                let dist = self.brackets[i].weighted_distance(&self.brackets[j]);
+                println!("Brackets {} vs {}: Similarity = {:.1}%, Champion match = {}",
+                         i + 1, j + 1, dist.similarity * 100.0, dist.champion_match);
+            }
+        }
+        println!();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PortfolioStats {
+    pub num_brackets: usize,
+    pub avg_expected_value: f64,
+    pub avg_similarity: f64,
+    pub min_similarity: f64,
+    pub unique_champions: usize,
+    pub champion_names: Vec<String>,
+}
+
+/// Optimize a single bracket using genetic algorithm
+fn optimize_bracket(tournament: &TournamentInfo, generations: u32) -> Bracket {
+    let mut bracket = Bracket::new(tournament);
+    let mutation_rate = 1.0 / 63.0 * 3.0;
+
+    for _ in 0..generations {
+        let child = bracket.mutate(tournament, mutation_rate);
+        if child.expected_value > bracket.expected_value {
+            bracket = child;
+        }
+    }
+
+    bracket
+}
+
+/// Optimize bracket with diversity penalty from existing brackets
+fn optimize_with_diversity(
+    tournament: &TournamentInfo,
+    existing: &[Bracket],
+    diversity_weight: f64,
+    generations: u32,
+) -> Bracket {
+    let mut best_bracket = Bracket::new(tournament);
+    let mut best_score = fitness_with_diversity(&best_bracket, existing, diversity_weight);
+    let mutation_rate = 1.0 / 63.0 * 3.0;
+
+    for _ in 0..generations {
+        let child = best_bracket.mutate(tournament, mutation_rate);
+        let child_score = fitness_with_diversity(&child, existing, diversity_weight);
+
+        if child_score > best_score {
+            best_bracket = child;
+            best_score = child_score;
+        }
+    }
+
+    best_bracket
+}
+
+/// Calculate fitness combining EV and diversity
+fn fitness_with_diversity(bracket: &Bracket, existing: &[Bracket], diversity_weight: f64) -> f64 {
+    let ev = bracket.expected_value;
+
+    if existing.is_empty() {
+        return ev;
+    }
+
+    // Calculate minimum distance to any existing bracket
+    let min_distance = existing.iter()
+        .map(|b| bracket.weighted_distance(b).total_distance)
+        .min_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or(0.0);
+
+    // Higher distance = more diverse = better
+    ev + diversity_weight * min_distance
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_advancement_round_wins() {
+        assert_eq!(AdvancementRound::Round2.wins_required(), 1);
+        assert_eq!(AdvancementRound::FinalFour.wins_required(), 4);
+        assert_eq!(AdvancementRound::Winner.wins_required(), 6);
+    }
+}
