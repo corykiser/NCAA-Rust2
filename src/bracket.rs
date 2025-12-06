@@ -9,27 +9,30 @@
 
 //It would be nice to have a function that fills in the the rest of a bracket if you have decided to pick a certain team(s) to win.
 
-use serde::{Serialize, Deserialize};
 use rand::Rng;
-use crate::ingest::{Team, TournamentInfo};
-use rayon::prelude::*;
+use std::sync::Arc;
+use crate::ingest::{Team, RcTeam, TournamentInfo};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Game struct uses reference-counted Team pointers (RcTeam) to avoid
+/// cloning Team data. Arc::clone() is O(1) - just increments a counter.
+#[derive(Debug, Clone)]
 pub struct Game {
-    pub team1: Team,
-    pub team2: Team,
+    pub team1: RcTeam,
+    pub team2: RcTeam,
     pub team1prob: f64,
     pub team2prob: f64,
     pub winnerprob: f64,
-    pub winner: Team,
+    pub winner: RcTeam,
     pub hilo: bool, //did the lower seed (or the region first in alphabetical order win) win?
 }
 
 
-//TODO Cloning the teams is really inefficient. I should just pass out references of the teams and then clone them when I need them.
+// Using RcTeam (Rc<Team>) avoids cloning Team data.
+// Arc::clone() is O(1) - just increments a reference counter.
 impl Game {
-    //This will simulate a game between two teams
-    pub fn new(team1: &Team, team2: &Team) -> Game {
+    /// Simulate a game between two teams.
+    /// Takes RcTeam references and uses Arc::clone() which is O(1).
+    pub fn new(team1: &RcTeam, team2: &RcTeam) -> Game {
         let rating_diff = team1.rating as f64 - team2.rating as f64;
         let team1prob: f64 = 1.0 / (1.0 + 10.0f64.powf(-1.0 * rating_diff * 30.464 / 400.0));
         let team2prob: f64 = 1.0 - team1prob;
@@ -37,16 +40,11 @@ impl Game {
         let mut rng = rand::thread_rng();
         let rand_num: f64 = rng.gen(); // generates a float between 0 and 1
 
-        let winner: Team = if rand_num < team1prob {
-            team1.clone()
+        // Arc::clone is O(1) - just increments reference count
+        let (winner, winnerprob) = if rand_num < team1prob {
+            (Arc::clone(team1), team1prob)
         } else {
-            team2.clone()
-        };
-
-        let winnerprob = if rand_num < team1prob {
-            team1prob
-        } else {
-            team2prob
+            (Arc::clone(team2), team2prob)
         };
 
         // Check if the regions are the same. If so, did the lower seed win? If not, did the region first in alphabetical order win?
@@ -55,9 +53,10 @@ impl Game {
         } else {
             team1.region < team2.region
         };
+
         Game {
-            team1: team1.clone(),
-            team2: team2.clone(),
+            team1: Arc::clone(team1),
+            team2: Arc::clone(team2),
             team1prob,
             team2prob,
             winnerprob,
@@ -68,59 +67,47 @@ impl Game {
     //TODO create a new_from_partial_binary() version of this that takes in a partial bracket and fills in the rest of the bracket
     //You can use Some(hilo) and None in Vec<Option<bool>> to indicate if what parts need to be filled in
     //This would be useful for filling in the first round.
-    pub fn new_from_binary(team1: &Team, team2: &Team, hilo: bool) -> Game {
-        //find the lower seed team
-        let low_seed_team: Team = if team1.seed < team2.seed {
-            team1.clone()
+    /// Create a game from binary (hilo) representation.
+    /// Uses RcTeam to avoid cloning Team data - Arc::clone() is O(1).
+    pub fn new_from_binary(team1: &RcTeam, team2: &RcTeam, hilo: bool) -> Game {
+        // Determine winner based on hilo flag
+        // Using references to avoid any cloning until we need to store
+        let (low_seed_team, high_seed_team) = if team1.seed < team2.seed {
+            (team1, team2)
         } else {
-            team2.clone()
-        };
-        //find the higher seed team
-        let high_seed_team: Team = if team1.seed < team2.seed {
-            team2.clone()
-        } else {
-            team1.clone()
-        };
-        //find which region is first alphabetically
-        let low_alpha_team: Team = if team1.region < team2.region {
-            team1.clone()
-        } else {
-            team2.clone()
-        };
-        //find which region is second alphabetically
-        let high_alpha_team: Team = if team1.region < team2.region {
-            team2.clone()
-        } else {
-            team1.clone()
+            (team2, team1)
         };
 
-        let winner: Team = match hilo {
-            true if team1.region==team2.region => low_seed_team.clone(),
-            false if team1.region==team2.region => high_seed_team.clone(),
-            true if team1.region!=team2.region => low_alpha_team.clone(),
-            false if team1.region!=team2.region => high_alpha_team.clone(),
-            _ => {panic!("Something went wrong in the hilo logic")
-        }
-            
+        let (low_alpha_team, high_alpha_team) = if team1.region < team2.region {
+            (team1, team2)
+        } else {
+            (team2, team1)
+        };
+
+        // Select winner based on hilo and region match
+        let winner: &RcTeam = if team1.region == team2.region {
+            if hilo { low_seed_team } else { high_seed_team }
+        } else {
+            if hilo { low_alpha_team } else { high_alpha_team }
         };
 
         let rating_diff = team1.rating as f64 - team2.rating as f64;
         let team1prob: f64 = 1.0 / (1.0 + 10.0f64.powf(-1.0 * rating_diff * 30.464 / 400.0));
         let team2prob: f64 = 1.0 - team1prob;
 
-        let winnerprob = if winner == *team1 {
+        let winnerprob = if Arc::ptr_eq(winner, team1) {
             team1prob
         } else {
             team2prob
         };
 
         Game {
-            team1: team1.clone(),
-            team2: team2.clone(),
+            team1: Arc::clone(team1),
+            team2: Arc::clone(team2),
             team1prob,
             team2prob,
             winnerprob,
-            winner,
+            winner: Arc::clone(winner),
             hilo,
         }
     }
@@ -187,7 +174,7 @@ impl BracketDistance {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Bracket {
     pub round1: Vec<Game>, //round of 64
     pub round2: Vec<Game>, //round of 32
@@ -195,7 +182,7 @@ pub struct Bracket {
     pub round4: Vec<Game>, //round of 8
     pub round5: Vec<Game>, //round of 4
     pub round6: Vec<Game>, //round of 2
-    pub winner: Team, //winner of tournament
+    pub winner: RcTeam, //winner of tournament (reference counted, cheap to clone)
     pub prob: f64,  //probability of bracket scenario occuring
     pub score: f64, //score if bracket were perfectly picked
     pub sim_score: f64, //score from simulations
@@ -210,8 +197,14 @@ impl PartialEq for Bracket {
 }
 
 impl Bracket{
+    /// Create a new random bracket using Monte Carlo simulation.
+    ///
+    /// Optimized to use:
+    /// - O(1) team lookups via team_lookup map instead of O(n) filtering
+    /// - RcTeam (Rc<Team>) for O(1) reference counting instead of cloning
+    /// - Extracting winner before pushing game to avoid double cloning
     pub fn new(tournamentinfo: &TournamentInfo) -> Bracket{
-        //preallocating makes this faster... supposedly
+        // Preallocate vectors
         let mut games1: Vec<Game> = Vec::with_capacity(32);
         let mut games2: Vec<Game> = Vec::with_capacity(16);
         let mut games3: Vec<Game> = Vec::with_capacity(8);
@@ -219,129 +212,153 @@ impl Bracket{
         let mut games5: Vec<Game> = Vec::with_capacity(2);
         let mut games6: Vec<Game> = Vec::with_capacity(1);
 
-        let mut games1winners: Vec<Team> = Vec::with_capacity(32);
-        let mut games2winners: Vec<Team> = Vec::with_capacity(16);
-        let mut games3winners: Vec<Team> = Vec::with_capacity(8);
-        let mut games4winners: Vec<Team> = Vec::with_capacity(4);
-        let mut games5winners: Vec<Team> = Vec::with_capacity(2);
-        let mut games6winners: Vec<Team> = Vec::with_capacity(1);
+        // Winners are stored as RcTeam (cheap reference counting)
+        let mut games1winners: Vec<RcTeam> = Vec::with_capacity(32);
+        let mut games2winners: Vec<RcTeam> = Vec::with_capacity(16);
+        let mut games3winners: Vec<RcTeam> = Vec::with_capacity(8);
+        let mut games4winners: Vec<RcTeam> = Vec::with_capacity(4);
+        let mut games5winners: Vec<RcTeam> = Vec::with_capacity(2);
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
         let mut expected_value = 0.0;
-
-        //TODO USE A VECTOR INSTEAD OF ARRAY?
-        //array of bools to represent the bracket
         let mut binary: Vec<bool> = Vec::with_capacity(63);
 
-        //Use the following for quick cycling through the 4 regions
-        let region_names: Vec<String> = vec!["East".to_string(), "West".to_string(), "South".to_string(), "Midwest".to_string()];
+        let region_names = ["East", "West", "South", "Midwest"];
 
-        //Round 1
-        for region in &region_names{
-            for matchup in tournamentinfo.round1{
-                let matching_teams: Vec<Team> = tournamentinfo.teams.iter().filter(|&x| x.region == *region && (x.seed == matchup[0] || x.seed == matchup[1])).cloned().collect();
-                let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-                games1.push(game.clone());
-                games1winners.push(game.clone().winner);
+        // Round 1: Use O(1) team lookup instead of O(n) filtering
+        for region in &region_names {
+            for matchup in tournamentinfo.round1 {
+                // O(1) lookup instead of filtering entire teams vector
+                let team1 = tournamentinfo.get_team(region, matchup[0]);
+                let team2 = tournamentinfo.get_team(region, matchup[1]);
 
+                let game = Game::new(&team1, &team2);
+
+                // Extract winner before pushing game (avoids cloning game)
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
-
                 binary.push(game.hilo);
+                games1winners.push(Arc::clone(&game.winner));
+                games1.push(game);
             }
         }
-        assert!(games1winners.len() == 32);
+        debug_assert!(games1winners.len() == 32);
 
-        //Round 2
-        for region in &region_names{
-            for matchup in tournamentinfo.round2{
-                let matching_teams: Vec<Team> = games1winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-                games2.push(game.clone());
-                games2winners.push(game.clone().winner);
+        // Helper to find winner by region and matching seeds
+        #[inline]
+        fn find_teams_for_matchup(winners: &[RcTeam], region: &str, matchup: &[i32]) -> (RcTeam, RcTeam) {
+            let mut found: Vec<RcTeam> = Vec::with_capacity(2);
+            for w in winners {
+                if w.region == region && matchup.contains(&w.seed) {
+                    found.push(Arc::clone(w));
+                    if found.len() == 2 { break; }
+                }
+            }
+            (found.remove(0), found.remove(0))
+        }
+
+        // Round 2
+        for region in &region_names {
+            for matchup in tournamentinfo.round2 {
+                let (team1, team2) = find_teams_for_matchup(&games1winners, region, &matchup);
+                let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
-
                 binary.push(game.hilo);
+                games2winners.push(Arc::clone(&game.winner));
+                games2.push(game);
             }
         }
-        assert!(games2winners.len() == 16);
-        
-        //Round 3
-        for region in &region_names{
-            for matchup in tournamentinfo.round3{
-                let matching_teams: Vec<Team> = games2winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-                games3.push(game.clone());
-                games3winners.push(game.clone().winner);
+        debug_assert!(games2winners.len() == 16);
+
+        // Round 3 (Sweet 16)
+        for region in &region_names {
+            for matchup in tournamentinfo.round3 {
+                let (team1, team2) = find_teams_for_matchup(&games2winners, region, &matchup);
+                let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
-
                 binary.push(game.hilo);
+                games3winners.push(Arc::clone(&game.winner));
+                games3.push(game);
             }
         }
-        assert!(games3winners.len() == 8);
+        debug_assert!(games3winners.len() == 8);
 
-        //Round 4
-        for region in &region_names{
-            for matchup in tournamentinfo.round4{
-                let matching_teams: Vec<Team> = games3winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-                games4.push(game.clone());
-                games4winners.push(game.clone().winner);
+        // Round 4 (Elite 8)
+        for region in &region_names {
+            for matchup in tournamentinfo.round4 {
+                let (team1, team2) = find_teams_for_matchup(&games3winners, region, &matchup);
+                let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
                 expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
-
                 binary.push(game.hilo);
+                games4winners.push(Arc::clone(&game.winner));
+                games4.push(game);
             }
         }
-        assert!(games4winners.len() == 4);
+        debug_assert!(games4winners.len() == 4);
 
-        //Match South with Midwest
-        let matching_teams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "South" || x.region == "Midwest").cloned().collect();
-        let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-        games5.push(game.clone());
-        games5winners.push(game.clone().winner);
-
+        // Final Four: South vs Midwest
+        let (south_winner, midwest_winner) = {
+            let mut south = None;
+            let mut midwest = None;
+            for w in &games4winners {
+                match w.region.as_str() {
+                    "South" => south = Some(Arc::clone(w)),
+                    "Midwest" => midwest = Some(Arc::clone(w)),
+                    _ => {}
+                }
+            }
+            (south.unwrap(), midwest.unwrap())
+        };
+        let game = Game::new(&south_winner, &midwest_winner);
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
-
         binary.push(game.hilo);
+        games5winners.push(Arc::clone(&game.winner));
+        games5.push(game);
 
-        //Match East with West
-        let matching_teams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "East" || x.region == "West").cloned().collect();
-        let game = Game::new(&matching_teams[0].clone(), &matching_teams[1].clone());
-        games5.push(game.clone());
-        games5winners.push(game.clone().winner);
-        assert!(games5winners.len() == 2);
-
+        // Final Four: East vs West
+        let (east_winner, west_winner) = {
+            let mut east = None;
+            let mut west = None;
+            for w in &games4winners {
+                match w.region.as_str() {
+                    "East" => east = Some(Arc::clone(w)),
+                    "West" => west = Some(Arc::clone(w)),
+                    _ => {}
+                }
+            }
+            (east.unwrap(), west.unwrap())
+        };
+        let game = Game::new(&east_winner, &west_winner);
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
-
         binary.push(game.hilo);
-        
-        //championship game
-        let game = Game::new(&games5winners[0].clone(), &games5winners[1].clone());
-        games6.push(game.clone());
-        games6winners.push(game.clone().winner);
+        games5winners.push(Arc::clone(&game.winner));
+        games5.push(game);
+        debug_assert!(games5winners.len() == 2);
 
+        // Championship game
+        let game = Game::new(&games5winners[0], &games5winners[1]);
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
-
         binary.push(game.hilo);
-        assert!(games6winners.len() == 1);
-        assert!(binary.len() == 63);
+        let tournament_winner = Arc::clone(&game.winner);
+        games6.push(game);
+        debug_assert!(binary.len() == 63);
 
         Bracket{
             round1: games1,
@@ -350,7 +367,7 @@ impl Bracket{
             round4: games4,
             round5: games5,
             round6: games6,
-            winner: games6winners[0].clone(),
+            winner: tournament_winner,
             prob,
             score,
             sim_score: 0.0,
@@ -360,43 +377,53 @@ impl Bracket{
     }
     pub fn score(&self, referencebracket: &Bracket) -> f64{
         let mut score: f64 = 0.0;
+        // Using name comparison (Team's PartialEq compares by name)
         //round 1
         for i in 0..32{
-            if self.round1[i].winner == referencebracket.round1[i].winner{
+            if self.round1[i].winner.name == referencebracket.round1[i].winner.name{
                 score += 1.0 + self.round1[i].winner.seed as f64;
             }
         }
         //round 2
         for i in 0..16{
-            if self.round2[i].winner == referencebracket.round2[i].winner{
+            if self.round2[i].winner.name == referencebracket.round2[i].winner.name{
                 score += 2.0 + self.round2[i].winner.seed as f64;
             }
         }
         //round 3
         for i in 0..8{
-            if self.round3[i].winner == referencebracket.round3[i].winner{
+            if self.round3[i].winner.name == referencebracket.round3[i].winner.name{
                 score += 4.0 + self.round3[i].winner.seed as f64;
             }
         }
         //round 4
         for i in 0..4{
-            if self.round4[i].winner == referencebracket.round4[i].winner{
+            if self.round4[i].winner.name == referencebracket.round4[i].winner.name{
                 score += 8.0 * self.round4[i].winner.seed as f64;
             }
         }
         //round 5
         for i in 0..2{
-            if self.round5[i].winner == referencebracket.round5[i].winner{
+            if self.round5[i].winner.name == referencebracket.round5[i].winner.name{
                 score += 16.0 * self.round5[i].winner.seed as f64;
             }
         }
         //round 6
-        if self.round6[0].winner == referencebracket.round6[0].winner{
+        if self.round6[0].winner.name == referencebracket.round6[0].winner.name{
             score += 32.0 * self.round6[0].winner.seed as f64;
         }
         score
     }
-    pub fn new_from_binary(tournamentinfo: &TournamentInfo, mut binary_string: Vec<bool>) -> Bracket{
+
+    /// Create a bracket from a binary (hilo) representation.
+    ///
+    /// Optimized to use:
+    /// - Takes a slice instead of owned Vec to avoid cloning
+    /// - O(1) team lookups via team_lookup map instead of O(n) filtering
+    /// - RcTeam (Rc<Team>) for O(1) reference counting instead of cloning
+    pub fn new_from_binary(tournamentinfo: &TournamentInfo, binary_slice: &[bool]) -> Bracket{
+        assert!(binary_slice.len() == 63, "Binary slice must be 63 elements long");
+
         let mut games1: Vec<Game> = Vec::with_capacity(32);
         let mut games2: Vec<Game> = Vec::with_capacity(16);
         let mut games3: Vec<Game> = Vec::with_capacity(8);
@@ -404,114 +431,149 @@ impl Bracket{
         let mut games5: Vec<Game> = Vec::with_capacity(2);
         let mut games6: Vec<Game> = Vec::with_capacity(1);
 
-        let mut games1winners: Vec<Team> = Vec::with_capacity(32);
-        let mut games2winners: Vec<Team> = Vec::with_capacity(16);
-        let mut games3winners: Vec<Team> = Vec::with_capacity(8);
-        let mut games4winners: Vec<Team> = Vec::with_capacity(4);
-        let mut games5winners: Vec<Team> = Vec::with_capacity(2);
-        let mut games6winners: Vec<Team> = Vec::with_capacity(1);
+        let mut games1winners: Vec<RcTeam> = Vec::with_capacity(32);
+        let mut games2winners: Vec<RcTeam> = Vec::with_capacity(16);
+        let mut games3winners: Vec<RcTeam> = Vec::with_capacity(8);
+        let mut games4winners: Vec<RcTeam> = Vec::with_capacity(4);
+        let mut games5winners: Vec<RcTeam> = Vec::with_capacity(2);
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
         let mut expected_value = 0.0;
 
-        assert!(binary_string.len() == 63, "Binary string must be 63 characters long");
-        let binary: Vec<bool> = binary_string.clone(); //reuse the input string for the output binary string
+        // Use an index to track position in binary slice
+        let mut idx = 0;
 
-        //Use the following for quick cycling through the 4 regions
-        let region_names: Vec<String> = vec!["East".to_string(), "West".to_string(), "South".to_string(), "Midwest".to_string()];
+        let region_names = ["East", "West", "South", "Midwest"];
 
-        //maybe it's sloppy to not do the first four round in a loop, but I think it's more readable this way
-        //Round 1
-        for region in &region_names{
-            for matchup in tournamentinfo.round1{
-                let matching_teams: Vec<Team> = tournamentinfo.teams.iter().filter(|&x| x.region == *region && (x.seed == matchup[0] || x.seed == matchup[1])).cloned().collect();
-                let game = Game::new_from_binary(&matching_teams[0].clone(), &matching_teams[1].clone(), binary_string.remove(0));
-                games1.push(game.clone());
-                games1winners.push(game.clone().winner);
+        // Helper to find teams for matchup (for rounds after round 1)
+        #[inline]
+        fn find_teams_for_matchup(winners: &[RcTeam], region: &str, matchup: &[i32]) -> (RcTeam, RcTeam) {
+            let mut found: Vec<RcTeam> = Vec::with_capacity(2);
+            for w in winners {
+                if w.region == region && matchup.contains(&w.seed) {
+                    found.push(Arc::clone(w));
+                    if found.len() == 2 { break; }
+                }
+            }
+            (found.remove(0), found.remove(0))
+        }
+
+        // Round 1: Use O(1) team lookup
+        for region in &region_names {
+            for matchup in tournamentinfo.round1 {
+                let team1 = tournamentinfo.get_team(region, matchup[0]);
+                let team2 = tournamentinfo.get_team(region, matchup[1]);
+                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                idx += 1;
 
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
                 expected_value += (1.0 + game.winner.seed as f64) * game.winnerprob;
+                games1winners.push(Arc::clone(&game.winner));
+                games1.push(game);
             }
         }
-        assert!(games1winners.len() == 32);
+        debug_assert!(games1winners.len() == 32);
 
-        //Round 2
-        for region in &region_names{
-            for matchup in tournamentinfo.round2{
-                let matching_teams: Vec<Team> = games1winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new_from_binary(&matching_teams[0].clone(), &matching_teams[1].clone(), binary_string.remove(0));
-                games2.push(game.clone());
-                games2winners.push(game.clone().winner);
+        // Round 2
+        for region in &region_names {
+            for matchup in tournamentinfo.round2 {
+                let (team1, team2) = find_teams_for_matchup(&games1winners, region, &matchup);
+                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                idx += 1;
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
                 expected_value += (2.0 + game.winner.seed as f64) * game.winnerprob;
+                games2winners.push(Arc::clone(&game.winner));
+                games2.push(game);
             }
         }
-        assert!(games2winners.len() == 16);
-        
-        //Round 3
-        for region in &region_names{
-            for matchup in tournamentinfo.round3{
-                let matching_teams: Vec<Team> = games2winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new_from_binary(&matching_teams[0].clone(), &matching_teams[1].clone(), binary_string.remove(0));
-                games3.push(game.clone());
-                games3winners.push(game.clone().winner);
+        debug_assert!(games2winners.len() == 16);
+
+        // Round 3 (Sweet 16)
+        for region in &region_names {
+            for matchup in tournamentinfo.round3 {
+                let (team1, team2) = find_teams_for_matchup(&games2winners, region, &matchup);
+                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                idx += 1;
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
                 expected_value += (4.0 + game.winner.seed as f64) * game.winnerprob;
+                games3winners.push(Arc::clone(&game.winner));
+                games3.push(game);
             }
         }
-        assert!(games3winners.len() == 8);
+        debug_assert!(games3winners.len() == 8);
 
-        //Round 4
-        for region in &region_names{
-            for matchup in tournamentinfo.round4{
-                let matching_teams: Vec<Team> = games3winners.iter().filter(|&x| x.region == *region && matchup.contains(&x.seed)).cloned().collect();
-                let game = Game::new_from_binary(&matching_teams[0].clone(), &matching_teams[1].clone(), binary_string.remove(0));
-                games4.push(game.clone());
-                games4winners.push(game.clone().winner);
+        // Round 4 (Elite 8)
+        for region in &region_names {
+            for matchup in tournamentinfo.round4 {
+                let (team1, team2) = find_teams_for_matchup(&games3winners, region, &matchup);
+                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                idx += 1;
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
                 expected_value += (8.0 * game.winner.seed as f64) * game.winnerprob;
+                games4winners.push(Arc::clone(&game.winner));
+                games4.push(game);
             }
         }
-        assert!(games4winners.len() == 4);
+        debug_assert!(games4winners.len() == 4);
 
-        //Match South with Midwest
-        let matching_teams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "South" || x.region == "Midwest").cloned().collect();
-        let game = Game::new_from_binary(&matching_teams[0], &matching_teams[1], binary_string.remove(0));
-        games5.push(game.clone());
-        games5winners.push(game.clone().winner);
-
+        // Final Four: South vs Midwest
+        let (south_winner, midwest_winner) = {
+            let mut south = None;
+            let mut midwest = None;
+            for w in &games4winners {
+                match w.region.as_str() {
+                    "South" => south = Some(Arc::clone(w)),
+                    "Midwest" => midwest = Some(Arc::clone(w)),
+                    _ => {}
+                }
+            }
+            (south.unwrap(), midwest.unwrap())
+        };
+        let game = Game::new_from_binary(&south_winner, &midwest_winner, binary_slice[idx]);
+        idx += 1;
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
+        games5winners.push(Arc::clone(&game.winner));
+        games5.push(game);
 
-        //Match East with West
-        let matching_teams: Vec<Team> = games4winners.iter().filter(|&x| x.region == "East" || x.region == "West").cloned().collect();
-        let game = Game::new_from_binary(&matching_teams[0], &matching_teams[1], binary_string.remove(0));
-        games5.push(game.clone());
-        games5winners.push(game.clone().winner);
-        assert!(games5winners.len() == 2);
-
+        // Final Four: East vs West
+        let (east_winner, west_winner) = {
+            let mut east = None;
+            let mut west = None;
+            for w in &games4winners {
+                match w.region.as_str() {
+                    "East" => east = Some(Arc::clone(w)),
+                    "West" => west = Some(Arc::clone(w)),
+                    _ => {}
+                }
+            }
+            (east.unwrap(), west.unwrap())
+        };
+        let game = Game::new_from_binary(&east_winner, &west_winner, binary_slice[idx]);
+        idx += 1;
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
-        
-        //championship game
-        let game = Game::new_from_binary(&games5winners[0], &games5winners[1], binary_string.remove(0));
-        games6.push(game.clone());
-        games6winners.push(game.clone().winner);
+        games5winners.push(Arc::clone(&game.winner));
+        games5.push(game);
+        debug_assert!(games5winners.len() == 2);
 
+        // Championship game
+        let game = Game::new_from_binary(&games5winners[0], &games5winners[1], binary_slice[idx]);
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
         expected_value += (32.0 * game.winner.seed as f64) * game.winnerprob;
-        assert!(games6winners.len() == 1);
+        let tournament_winner = Arc::clone(&game.winner);
+        games6.push(game);
 
         Bracket{
             round1: games1,
@@ -520,30 +582,27 @@ impl Bracket{
             round4: games4,
             round5: games5,
             round6: games6,
-            winner: games6winners[0].clone(),
+            winner: tournament_winner,
             prob,
             score,
             sim_score: 0.0,
-            expected_value: expected_value,
-            binary: binary,
+            expected_value,
+            binary: binary_slice.to_vec(),
         }
     }
-    pub fn mutate(&self,tournamentinfo: &TournamentInfo, mutation_rate: f64) -> Bracket{
+    /// Create a mutated copy of this bracket.
+    /// Uses the binary representation to efficiently create variations.
+    pub fn mutate(&self, tournamentinfo: &TournamentInfo, mutation_rate: f64) -> Bracket {
         let mut new_binary: Vec<bool> = self.binary.clone();
-        new_binary.iter_mut().for_each(|x| {
-            let mut rng = rand::thread_rng();
+        let mut rng = rand::thread_rng();
+        for bit in new_binary.iter_mut() {
             let rand: f64 = rng.gen();
-            if rand < mutation_rate{
-                *x = !*x;
+            if rand < mutation_rate {
+                *bit = !*bit;
             }
-        });
-        // for i in 0..new_binary.len(){
-        //     let rand: f64 = rng.gen();
-        //     if rand < mutation_rate{
-        //         new_binary[i] = !new_binary[i];
-        //     }
-        // }
-        Bracket::new_from_binary(tournamentinfo, new_binary)
+        }
+        // Pass slice instead of owned Vec
+        Bracket::new_from_binary(tournamentinfo, &new_binary)
     }
     pub fn create_n_children(&mut self, tournamentinfo: &TournamentInfo, n: usize, mutation_rate: f64) -> Vec<Bracket>{
         let children: Vec<Bracket> = (0..n).into_iter().map(|_| self.mutate(tournamentinfo, mutation_rate)).collect();

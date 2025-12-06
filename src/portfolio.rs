@@ -1,9 +1,9 @@
 // Portfolio generation for diverse bracket strategies
 // Supports constrained bracket building and champion-stratified portfolios
 
-use crate::bracket::{Bracket, BracketDistance, Game};
-use crate::ingest::{Team, TournamentInfo};
-use rand::Rng;
+use crate::bracket::Bracket;
+use crate::ingest::{Team, RcTeam, TournamentInfo};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Specifies how far a team must advance
@@ -85,12 +85,13 @@ impl<'a> ConstrainedBracketBuilder<'a> {
     }
 
     /// Find a team by name in the tournament
-    fn find_team(&self, name: &str) -> Option<&Team> {
+    /// Returns a clone of the RcTeam (cheap - just increments ref count)
+    fn find_team(&self, name: &str) -> Option<RcTeam> {
         let name_lower = name.to_lowercase();
         self.tournament.teams.iter().find(|t| {
             t.name.to_lowercase() == name_lower ||
             t.name.to_lowercase().contains(&name_lower)
-        })
+        }).map(Arc::clone)
     }
 
     /// Get the region index for a team
@@ -115,7 +116,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
             let team = self.find_team(&constraint.team_name)
                 .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
 
-            self.apply_constraint(&mut bracket, team, &constraint.must_reach)?;
+            self.apply_constraint(&mut bracket, &team, &constraint.must_reach)?;
         }
 
         // Recalculate bracket stats
@@ -135,11 +136,11 @@ impl<'a> ConstrainedBracketBuilder<'a> {
             let team = self.find_team(&constraint.team_name)
                 .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
 
-            self.apply_constraint_to_binary(&mut binary, team, &constraint.must_reach)?;
+            self.apply_constraint_to_binary(&mut binary, &team, &constraint.must_reach)?;
         }
 
-        // Build bracket from binary
-        let bracket = Bracket::new_from_binary(self.tournament, binary);
+        // Build bracket from binary (pass slice instead of Vec)
+        let bracket = Bracket::new_from_binary(self.tournament, &binary);
         Ok(bracket)
     }
 
@@ -148,22 +149,17 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         let mut binary = Vec::with_capacity(63);
 
         // For each game, pick the higher probability winner
-        // Round 1: 32 games
+        // Round 1: 32 games - use O(1) lookups
         for region in &["East", "West", "South", "Midwest"] {
             for matchup in self.tournament.round1 {
-                let teams: Vec<&Team> = self.tournament.teams.iter()
-                    .filter(|t| &t.region == region && (t.seed == matchup[0] || t.seed == matchup[1]))
-                    .collect();
+                let team1 = self.tournament.get_team(region, matchup[0]);
+                let team2 = self.tournament.get_team(region, matchup[1]);
 
-                if teams.len() == 2 {
-                    // Pick higher rated team (lower seed usually)
-                    let pick_first = teams[0].rating >= teams[1].rating;
-                    // hilo = true means lower seed wins
-                    let lower_seed_first = teams[0].seed < teams[1].seed;
-                    binary.push(pick_first == lower_seed_first);
-                } else {
-                    binary.push(true); // Default
-                }
+                // Pick higher rated team (lower seed usually)
+                let pick_first = team1.rating >= team2.rating;
+                // hilo = true means lower seed wins
+                let lower_seed_first = team1.seed < team2.seed;
+                binary.push(pick_first == lower_seed_first);
             }
         }
 
@@ -181,7 +177,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
     fn apply_constraint(
         &self,
         bracket: &mut Bracket,
-        team: &Team,
+        team: &RcTeam,
         must_reach: &AdvancementRound,
     ) -> Result<(), String> {
         let wins_needed = must_reach.wins_required();
@@ -191,7 +187,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 1 {
             let r1_idx = self.find_round1_game_index(team, region_idx);
             if let Some(idx) = r1_idx {
-                bracket.round1[idx].winner = team.clone();
+                bracket.round1[idx].winner = Arc::clone(team);
             }
         }
 
@@ -199,7 +195,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 2 {
             let r2_idx = self.find_round2_game_index(team, region_idx);
             if let Some(idx) = r2_idx {
-                bracket.round2[idx].winner = team.clone();
+                bracket.round2[idx].winner = Arc::clone(team);
             }
         }
 
@@ -207,27 +203,27 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 3 {
             let r3_idx = self.find_round3_game_index(team, region_idx);
             if let Some(idx) = r3_idx {
-                bracket.round3[idx].winner = team.clone();
+                bracket.round3[idx].winner = Arc::clone(team);
             }
         }
 
         // Elite 8 (Round 4)
         if wins_needed >= 4 {
             let r4_idx = region_idx; // One Elite 8 game per region
-            bracket.round4[r4_idx].winner = team.clone();
+            bracket.round4[r4_idx].winner = Arc::clone(team);
         }
 
         // Final Four (Round 5)
         if wins_needed >= 5 {
             // Final Four: South/Midwest play each other, East/West play each other
             let r5_idx = if region_idx == 2 || region_idx == 3 { 0 } else { 1 };
-            bracket.round5[r5_idx].winner = team.clone();
+            bracket.round5[r5_idx].winner = Arc::clone(team);
         }
 
         // Championship (Round 6)
         if wins_needed >= 6 {
-            bracket.round6[0].winner = team.clone();
-            bracket.winner = team.clone();
+            bracket.round6[0].winner = Arc::clone(team);
+            bracket.winner = Arc::clone(team);
         }
 
         Ok(())
@@ -237,7 +233,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
     fn apply_constraint_to_binary(
         &self,
         binary: &mut Vec<bool>,
-        team: &Team,
+        team: &RcTeam,
         must_reach: &AdvancementRound,
     ) -> Result<(), String> {
         let wins_needed = must_reach.wins_required();
@@ -387,7 +383,8 @@ impl BracketPortfolio {
         let mut portfolio = BracketPortfolio::new();
 
         // Rank teams by rating (proxy for championship probability)
-        let mut ranked_teams: Vec<&Team> = tournament.teams.iter().collect();
+        // RcTeam dereferences to Team, so we can access .rating directly
+        let mut ranked_teams: Vec<&RcTeam> = tournament.teams.iter().collect();
         ranked_teams.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap());
 
         // Generate one bracket per top team

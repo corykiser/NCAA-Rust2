@@ -1,10 +1,9 @@
-use serde::{Serialize, Deserialize};
-
-use crate::ingest::{TournamentInfo};
+use crate::ingest::TournamentInfo;
 use rayon::prelude::*;
-use std::{fs::File};
+use std::fs::File;
 use std::io::Write;
 use num_cpus;
+use serde_json;
 
 //This file is intended to help with the creation of a pool of brackets to be used in the program.
 //The idea is that we can create a pool of bracket entries and run Monte Carlo Simulations against them to test their fitness.
@@ -22,8 +21,9 @@ use num_cpus;
 // A variation of it with a score weighting could be used to determine how similar two brackets are to each other in score space.
 // The Gower Distance is also worth looking into.
 
-use crate::bracket::{Bracket};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+use crate::bracket::Bracket;
+
+#[derive(Debug, Clone)]
 pub struct EvolvingPool{
     pub pool_size: i32, //how many bracket entries are you allowed to have in the pool
     pub brackets: Vec<Bracket>,
@@ -99,13 +99,22 @@ impl EvolvingPool{
     }
     pub fn mutate(&self, tournamentinfo: &TournamentInfo) -> EvolvingPool{
         // mutate every bracket in the pool
-        let mut brackets_to_mutate = Vec::new();
+        // Note: bracket.mutate() already creates a new bracket, so no need to clone first
+        let brackets_to_mutate: Vec<Bracket> = self.brackets.iter()
+            .map(|bracket| bracket.mutate(tournamentinfo, self.mutation_rate))
+            .collect();
 
-        for i in 0..self.brackets.len(){
-            brackets_to_mutate.push(self.brackets[i].clone().mutate(tournamentinfo, self.mutation_rate));
+        EvolvingPool {
+            pool_size: self.pool_size,
+            brackets: brackets_to_mutate,
+            batch: self.batch.clone(),
+            batch_size: self.batch_size,
+            mutation_rate: self.mutation_rate,
+            num_child_pools: self.num_child_pools,
+            max_score: 0.0,
+            average_score: 0.0,
+            fitness: 0.0,
         }
-
-        EvolvingPool { pool_size: self.pool_size, brackets: brackets_to_mutate, batch: self.batch.clone(), batch_size: self.batch_size, mutation_rate: self.mutation_rate, num_child_pools: self.num_child_pools, max_score: 0.0, average_score: 0.0 , fitness: 0.0}
     }
     pub fn create_child_pools(&mut self, tournamentinfo: &TournamentInfo) -> Vec<EvolvingPool>{
         // create n child pools with the parents of the current pool
@@ -135,9 +144,14 @@ impl EvolvingPool{
             bracket.pretty_print();
         }
     }
+    /// Export bracket binary representations to a file.
+    /// Since brackets contain RcTeam (not serializable), we export the binary representation
+    /// which can be used to reconstruct brackets later.
     pub fn export_to_file(&self, _tournamentinfo: &TournamentInfo, filename: &str){
         let mut file = File::create(filename).unwrap();
-        let serialized = serde_json::to_string(&self.brackets).unwrap();
+        // Export just the binary representations (Vec<bool>) which are serializable
+        let binaries: Vec<&Vec<bool>> = self.brackets.iter().map(|b| &b.binary).collect();
+        let serialized = serde_json::to_string(&binaries).unwrap();
         file.write_all(serialized.as_bytes()).unwrap();
     }
     pub fn hamming_distance_sum(&mut self) -> f64{
@@ -154,7 +168,7 @@ impl EvolvingPool{
 
 
 
-#[derive(Debug, Clone,  Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Batch{
     pub brackets: Vec<Bracket>,
     pub batch_score: f64,
