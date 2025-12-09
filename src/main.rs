@@ -5,6 +5,7 @@ mod elo;
 mod api;
 mod game_result;
 mod portfolio;
+mod anneal;
 
 use clap::{Parser, ValueEnum};
 use rand::Rng;
@@ -26,6 +27,8 @@ enum PortfolioStrategy {
     Champion,
     /// Greedily maximize EV while penalizing similarity to previous brackets
     Diverse,
+    /// Optimize whole portfolio using Simulated Annealing
+    Annealing,
 }
 
 #[derive(Parser, Debug)]
@@ -87,6 +90,10 @@ struct Args {
     /// Strategy for portfolio generation
     #[arg(long, value_enum, default_value = "champion")]
     portfolio_strategy: PortfolioStrategy,
+
+    /// Number of steps for annealing strategy
+    #[arg(long, default_value = "10000")]
+    anneal_steps: usize,
 
     /// Lock a specific team to reach a round (format: "TeamName:FinalFour")
     /// Can be specified multiple times
@@ -215,6 +222,7 @@ fn main() {
             &args.portfolio_strategy,
             &constraints,
             args.generations,
+            args.anneal_steps,
         );
     } else if !constraints.is_empty() {
         // Run single bracket with constraints
@@ -267,6 +275,7 @@ fn run_portfolio_mode(
     strategy: &PortfolioStrategy,
     constraints: &[BracketConstraint],
     generations: u32,
+    anneal_steps: usize,
 ) {
     println!();
     println!("=== Portfolio Mode ===");
@@ -292,6 +301,15 @@ fn run_portfolio_mode(
                 num_brackets,
                 diversity_weight,
                 generations,
+            )
+        }
+        PortfolioStrategy::Annealing => {
+            println!("Running Simulated Annealing optimization ({} steps)...", anneal_steps);
+            BracketPortfolio::generate_annealing_diverse(
+                tournamentinfo,
+                num_brackets,
+                diversity_weight,
+                anneal_steps,
             )
         }
     };
