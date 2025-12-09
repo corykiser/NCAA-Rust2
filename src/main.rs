@@ -323,6 +323,24 @@ fn run_portfolio_mode(
     portfolio.print_summary();
     portfolio.print_pairwise_distances();
 
+    // Analyze portfolio performance scenarios (if using Genetic strategy)
+    if let PortfolioStrategy::Genetic = strategy {
+        if let GeneticMode::Simultaneous = genetic_mode {
+             // We need access to the simulation pool to do this properly.
+             // But the pool is local to generate_genetic_portfolio.
+             // For now, let's just note this limitation or refactor if needed.
+             // Actually, we can regenerate a temporary pool for analysis or move analysis inside.
+             // Moving analysis inside BracketPortfolio is cleaner.
+             println!("Generating analysis pool...");
+             let analysis_pool = pool::Batch::new(tournamentinfo, genetic_sims);
+             portfolio.analyze_scenarios(&analysis_pool);
+        } else {
+             println!("Generating analysis pool...");
+             let analysis_pool = pool::Batch::new(tournamentinfo, genetic_sims);
+             portfolio.analyze_scenarios(&analysis_pool);
+        }
+    }
+
     // Print each bracket in detail
     for (i, bracket) in portfolio.brackets.iter().enumerate() {
         println!("\n=== Bracket {} ===", i + 1);

@@ -7,6 +7,7 @@ use crate::pool::Batch;
 use crate::genetic::{self, GeneticConfig};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum GeneticMode {
@@ -572,6 +573,98 @@ impl BracketPortfolio {
                 let dist = self.brackets[i].weighted_distance(&self.brackets[j]);
                 println!("Brackets {} vs {}: Similarity = {:.1}%, Champion match = {}",
                          i + 1, j + 1, dist.similarity * 100.0, dist.champion_match);
+            }
+        }
+        println!();
+    }
+
+    /// Analyze how the portfolio performs in different scenarios
+    pub fn analyze_scenarios(&self, simulation_pool: &Batch) {
+        if self.brackets.is_empty() || simulation_pool.brackets.is_empty() {
+            return;
+        }
+
+        println!("\n=== Scenario Analysis ===");
+
+        let mut bracket_wins = HashMap::new();
+        for i in 0..self.brackets.len() {
+            bracket_wins.insert(i, 0);
+        }
+
+        let mut scenario_counts: HashMap<String, usize> = HashMap::new();
+        let mut scenario_best_brackets: HashMap<String, Vec<usize>> = HashMap::new();
+
+        // Categorize each simulation
+        for sim in &simulation_pool.brackets {
+            let winner_seed = sim.winner.seed;
+            let scenario_type = if winner_seed <= 1 {
+                "Favorities (1 Seeds)".to_string()
+            } else if winner_seed <= 4 {
+                "Contenders (2-4 Seeds)".to_string()
+            } else {
+                "Chaos (5+ Seeds)".to_string()
+            };
+
+            *scenario_counts.entry(scenario_type.clone()).or_insert(0) += 1;
+
+            // Find which bracket in portfolio performs best for this specific simulation
+            let mut best_score = -1.0;
+            let mut best_bracket_indices = Vec::new();
+
+            for (idx, bracket) in self.brackets.iter().enumerate() {
+                let score = bracket.score(sim);
+                if score > best_score {
+                    best_score = score;
+                    best_bracket_indices = vec![idx];
+                } else if (score - best_score).abs() < 0.001 {
+                    best_bracket_indices.push(idx);
+                }
+            }
+
+            // Update win counts
+            // If multiple brackets tie for best, fractional win? Or full win for each?
+            // Let's give full win for "best performing in scenario"
+            for &idx in &best_bracket_indices {
+                *bracket_wins.get_mut(&idx).unwrap() += 1;
+
+                scenario_best_brackets.entry(scenario_type.clone())
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+        }
+
+        // Print breakdown by bracket
+        println!("\nBest Performing Bracket by Simulation Count:");
+        for i in 0..self.brackets.len() {
+            let wins = bracket_wins.get(&i).unwrap_or(&0);
+            let pct = *wins as f64 / simulation_pool.brackets.len() as f64 * 100.0;
+            println!("Bracket {}: Best in {} simulations ({:.1}%)", i + 1, wins, pct);
+        }
+
+        // Print breakdown by scenario
+        println!("\nPerformance by Scenario Type:");
+        let mut sorted_scenarios: Vec<_> = scenario_counts.keys().cloned().collect();
+        sorted_scenarios.sort();
+
+        for scenario in sorted_scenarios {
+            let count = scenario_counts.get(&scenario).unwrap();
+            let pct = *count as f64 / simulation_pool.brackets.len() as f64 * 100.0;
+
+            println!("\nScenario: {} ({} sims, {:.1}%)", scenario, count, pct);
+
+            // Calculate which bracket is best most often in this scenario
+            let best_indices = scenario_best_brackets.get(&scenario).unwrap();
+            let mut bracket_scenario_wins = HashMap::new();
+            for &idx in best_indices {
+                *bracket_scenario_wins.entry(idx).or_insert(0) += 1;
+            }
+
+            let mut sorted_wins: Vec<_> = bracket_scenario_wins.iter().collect();
+            sorted_wins.sort_by(|a, b| b.1.cmp(a.1));
+
+            for (idx, wins) in sorted_wins.iter().take(3) {
+                let win_pct = **wins as f64 / *count as f64 * 100.0;
+                println!("  Bracket {}: Best in {:.1}% of these scenarios", *idx + 1, win_pct);
             }
         }
         println!();
