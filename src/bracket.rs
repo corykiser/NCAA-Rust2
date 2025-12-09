@@ -4,11 +4,6 @@
 //Both structs also provide a way to create a game from binary data or to extract a binary representation of each.
 // the Bracket struct also provides a way to score a bracket against a reference bracket.
 
-
-
-
-//It would be nice to have a function that fills in the the rest of a bracket if you have decided to pick a certain team(s) to win.
-
 use rand::Rng;
 use std::sync::Arc;
 use crate::ingest::{Team, RcTeam, TournamentInfo};
@@ -176,12 +171,7 @@ impl BracketDistance {
 
 #[derive(Debug, Clone)]
 pub struct Bracket {
-    pub round1: Vec<Game>, //round of 64
-    pub round2: Vec<Game>, //round of 32
-    pub round3: Vec<Game>, //round of 16
-    pub round4: Vec<Game>, //round of 8
-    pub round5: Vec<Game>, //round of 4
-    pub round6: Vec<Game>, //round of 2
+    pub games: Vec<Game>, // Flattened vector of 63 games. 0-31: R1, 32-47: R2, 48-55: R3, 56-59: R4, 60-61: R5, 62: R6
     pub winner: RcTeam, //winner of tournament (reference counted, cheap to clone)
     pub prob: f64,  //probability of bracket scenario occuring
     pub score: f64, //score if bracket were perfectly picked
@@ -204,20 +194,8 @@ impl Bracket{
     /// - RcTeam (Rc<Team>) for O(1) reference counting instead of cloning
     /// - Extracting winner before pushing game to avoid double cloning
     pub fn new(tournamentinfo: &TournamentInfo) -> Bracket{
-        // Preallocate vectors
-        let mut games1: Vec<Game> = Vec::with_capacity(32);
-        let mut games2: Vec<Game> = Vec::with_capacity(16);
-        let mut games3: Vec<Game> = Vec::with_capacity(8);
-        let mut games4: Vec<Game> = Vec::with_capacity(4);
-        let mut games5: Vec<Game> = Vec::with_capacity(2);
-        let mut games6: Vec<Game> = Vec::with_capacity(1);
-
-        // Winners are stored as RcTeam (cheap reference counting)
-        let mut games1winners: Vec<RcTeam> = Vec::with_capacity(32);
-        let mut games2winners: Vec<RcTeam> = Vec::with_capacity(16);
-        let mut games3winners: Vec<RcTeam> = Vec::with_capacity(8);
-        let mut games4winners: Vec<RcTeam> = Vec::with_capacity(4);
-        let mut games5winners: Vec<RcTeam> = Vec::with_capacity(2);
+        // Preallocate vector for all games
+        let mut games: Vec<Game> = Vec::with_capacity(63);
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
@@ -225,6 +203,12 @@ impl Bracket{
         let mut binary: Vec<bool> = Vec::with_capacity(63);
 
         let region_names = ["East", "West", "South", "Midwest"];
+
+        // Matchup indices for direct lookup (avoids search)
+        // These correspond to the indices in the previous round's winners vector
+        const R2_INDICES: [(usize, usize); 4] = [(0, 7), (4, 3), (5, 2), (6, 1)];
+        const R3_INDICES: [(usize, usize); 2] = [(0, 1), (2, 3)];
+        const R4_INDICES: [(usize, usize); 1] = [(0, 1)];
 
         // Round 1: Use O(1) team lookup instead of O(n) filtering
         for region in &region_names {
@@ -240,133 +224,101 @@ impl Bracket{
                 score += 1.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
                 binary.push(game.hilo);
-                games1winners.push(Arc::clone(&game.winner));
-                games1.push(game);
+                games.push(game);
             }
-        }
-        debug_assert!(games1winners.len() == 32);
-
-        // Helper to find winner by region and matching seeds
-        #[inline]
-        fn find_teams_for_matchup(winners: &[RcTeam], region: &str, matchup: &[i32]) -> (RcTeam, RcTeam) {
-            let mut found: Vec<RcTeam> = Vec::with_capacity(2);
-            for w in winners {
-                if w.region == region && matchup.contains(&w.seed) {
-                    found.push(Arc::clone(w));
-                    if found.len() == 2 { break; }
-                }
-            }
-            (found.remove(0), found.remove(0))
         }
 
         // Round 2
-        for region in &region_names {
-            for matchup in tournamentinfo.round2 {
-                let (team1, team2) = find_teams_for_matchup(&games1winners, region, &matchup);
+        let r1_start = 0;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 8;
+            for &(idx1, idx2) in &R2_INDICES {
+                let team1 = Arc::clone(&games[r1_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r1_start + offset + idx2].winner);
                 let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
                 binary.push(game.hilo);
-                games2winners.push(Arc::clone(&game.winner));
-                games2.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games2winners.len() == 16);
 
         // Round 3 (Sweet 16)
-        for region in &region_names {
-            for matchup in tournamentinfo.round3 {
-                let (team1, team2) = find_teams_for_matchup(&games2winners, region, &matchup);
+        let r2_start = 32;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 4;
+            for &(idx1, idx2) in &R3_INDICES {
+                let team1 = Arc::clone(&games[r2_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r2_start + offset + idx2].winner);
                 let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
                 expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
                 binary.push(game.hilo);
-                games3winners.push(Arc::clone(&game.winner));
-                games3.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games3winners.len() == 8);
 
         // Round 4 (Elite 8)
-        for region in &region_names {
-            for matchup in tournamentinfo.round4 {
-                let (team1, team2) = find_teams_for_matchup(&games3winners, region, &matchup);
+        let r3_start = 48;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 2;
+            for &(idx1, idx2) in &R4_INDICES {
+                let team1 = Arc::clone(&games[r3_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r3_start + offset + idx2].winner);
                 let game = Game::new(&team1, &team2);
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
                 expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
                 binary.push(game.hilo);
-                games4winners.push(Arc::clone(&game.winner));
-                games4.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games4winners.len() == 4);
 
         // Final Four: South vs Midwest
-        let (south_winner, midwest_winner) = {
-            let mut south = None;
-            let mut midwest = None;
-            for w in &games4winners {
-                match w.region.as_str() {
-                    "South" => south = Some(Arc::clone(w)),
-                    "Midwest" => midwest = Some(Arc::clone(w)),
-                    _ => {}
-                }
-            }
-            (south.unwrap(), midwest.unwrap())
-        };
+        // games from r4 order: East, West, South, Midwest
+        let r4_start = 56;
+        let south_winner = Arc::clone(&games[r4_start + 2].winner);
+        let midwest_winner = Arc::clone(&games[r4_start + 3].winner);
+
         let game = Game::new(&south_winner, &midwest_winner);
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
         binary.push(game.hilo);
-        games5winners.push(Arc::clone(&game.winner));
-        games5.push(game);
+        games.push(game);
 
         // Final Four: East vs West
-        let (east_winner, west_winner) = {
-            let mut east = None;
-            let mut west = None;
-            for w in &games4winners {
-                match w.region.as_str() {
-                    "East" => east = Some(Arc::clone(w)),
-                    "West" => west = Some(Arc::clone(w)),
-                    _ => {}
-                }
-            }
-            (east.unwrap(), west.unwrap())
-        };
+        let east_winner = Arc::clone(&games[r4_start + 0].winner);
+        let west_winner = Arc::clone(&games[r4_start + 1].winner);
+
         let game = Game::new(&east_winner, &west_winner);
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
         binary.push(game.hilo);
-        games5winners.push(Arc::clone(&game.winner));
-        games5.push(game);
-        debug_assert!(games5winners.len() == 2);
+        games.push(game);
 
         // Championship game
-        let game = Game::new(&games5winners[0], &games5winners[1]);
+        // games from r5 order: S/MW, E/W
+        let r5_start = 60;
+        let team1 = Arc::clone(&games[r5_start + 0].winner);
+        let team2 = Arc::clone(&games[r5_start + 1].winner);
+        let game = Game::new(&team1, &team2);
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
         expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
         binary.push(game.hilo);
         let tournament_winner = Arc::clone(&game.winner);
-        games6.push(game);
+        games.push(game);
         debug_assert!(binary.len() == 63);
 
         Bracket{
-            round1: games1,
-            round2: games2,
-            round3: games3,
-            round4: games4,
-            round5: games5,
-            round6: games6,
+            games,
             winner: tournament_winner,
             prob,
             score,
@@ -377,40 +329,42 @@ impl Bracket{
     }
     pub fn score(&self, referencebracket: &Bracket) -> f64{
         let mut score: f64 = 0.0;
-        // Using name comparison (Team's PartialEq compares by name)
+        // Using pointer comparison for performance (O(1) instead of string comparison)
+        // Since all brackets use RcTeam from the same TournamentInfo, identical teams share the same Arc pointer
+
         //round 1
         for i in 0..32{
-            if self.round1[i].winner.name == referencebracket.round1[i].winner.name{
-                score += 1.0 + self.round1[i].winner.seed as f64;
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += 1.0 + self.games[i].winner.seed as f64;
             }
         }
         //round 2
         for i in 0..16{
-            if self.round2[i].winner.name == referencebracket.round2[i].winner.name{
-                score += 2.0 + self.round2[i].winner.seed as f64;
+            if Arc::ptr_eq(&self.games[32+i].winner, &referencebracket.games[32+i].winner) {
+                score += 2.0 + self.games[32+i].winner.seed as f64;
             }
         }
         //round 3
         for i in 0..8{
-            if self.round3[i].winner.name == referencebracket.round3[i].winner.name{
-                score += 4.0 + self.round3[i].winner.seed as f64;
+            if Arc::ptr_eq(&self.games[48+i].winner, &referencebracket.games[48+i].winner) {
+                score += 4.0 + self.games[48+i].winner.seed as f64;
             }
         }
         //round 4
         for i in 0..4{
-            if self.round4[i].winner.name == referencebracket.round4[i].winner.name{
-                score += 8.0 * self.round4[i].winner.seed as f64;
+            if Arc::ptr_eq(&self.games[56+i].winner, &referencebracket.games[56+i].winner) {
+                score += 8.0 * self.games[56+i].winner.seed as f64;
             }
         }
         //round 5
         for i in 0..2{
-            if self.round5[i].winner.name == referencebracket.round5[i].winner.name{
-                score += 16.0 * self.round5[i].winner.seed as f64;
+            if Arc::ptr_eq(&self.games[60+i].winner, &referencebracket.games[60+i].winner) {
+                score += 16.0 * self.games[60+i].winner.seed as f64;
             }
         }
         //round 6
-        if self.round6[0].winner.name == referencebracket.round6[0].winner.name{
-            score += 32.0 * self.round6[0].winner.seed as f64;
+        if Arc::ptr_eq(&self.games[62].winner, &referencebracket.games[62].winner) {
+            score += 32.0 * self.games[62].winner.seed as f64;
         }
         score
     }
@@ -424,18 +378,7 @@ impl Bracket{
     pub fn new_from_binary(tournamentinfo: &TournamentInfo, binary_slice: &[bool]) -> Bracket{
         assert!(binary_slice.len() == 63, "Binary slice must be 63 elements long");
 
-        let mut games1: Vec<Game> = Vec::with_capacity(32);
-        let mut games2: Vec<Game> = Vec::with_capacity(16);
-        let mut games3: Vec<Game> = Vec::with_capacity(8);
-        let mut games4: Vec<Game> = Vec::with_capacity(4);
-        let mut games5: Vec<Game> = Vec::with_capacity(2);
-        let mut games6: Vec<Game> = Vec::with_capacity(1);
-
-        let mut games1winners: Vec<RcTeam> = Vec::with_capacity(32);
-        let mut games2winners: Vec<RcTeam> = Vec::with_capacity(16);
-        let mut games3winners: Vec<RcTeam> = Vec::with_capacity(8);
-        let mut games4winners: Vec<RcTeam> = Vec::with_capacity(4);
-        let mut games5winners: Vec<RcTeam> = Vec::with_capacity(2);
+        let mut games: Vec<Game> = Vec::with_capacity(63);
 
         let mut prob: f64 = 1.0;
         let mut score: f64 = 0.0;
@@ -446,18 +389,10 @@ impl Bracket{
 
         let region_names = ["East", "West", "South", "Midwest"];
 
-        // Helper to find teams for matchup (for rounds after round 1)
-        #[inline]
-        fn find_teams_for_matchup(winners: &[RcTeam], region: &str, matchup: &[i32]) -> (RcTeam, RcTeam) {
-            let mut found: Vec<RcTeam> = Vec::with_capacity(2);
-            for w in winners {
-                if w.region == region && matchup.contains(&w.seed) {
-                    found.push(Arc::clone(w));
-                    if found.len() == 2 { break; }
-                }
-            }
-            (found.remove(0), found.remove(0))
-        }
+        // Matchup indices for direct lookup (avoids search)
+        const R2_INDICES: [(usize, usize); 4] = [(0, 7), (4, 3), (5, 2), (6, 1)];
+        const R3_INDICES: [(usize, usize); 2] = [(0, 1), (2, 3)];
+        const R4_INDICES: [(usize, usize); 1] = [(0, 1)];
 
         // Round 1: Use O(1) team lookup
         for region in &region_names {
@@ -470,118 +405,97 @@ impl Bracket{
                 prob *= game.winnerprob;
                 score += 1.0 + game.winner.seed as f64;
                 expected_value += (1.0 + game.winner.seed as f64) * game.winnerprob;
-                games1winners.push(Arc::clone(&game.winner));
-                games1.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games1winners.len() == 32);
 
         // Round 2
-        for region in &region_names {
-            for matchup in tournamentinfo.round2 {
-                let (team1, team2) = find_teams_for_matchup(&games1winners, region, &matchup);
+        let r1_start = 0;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 8;
+            for &(idx1, idx2) in &R2_INDICES {
+                let team1 = Arc::clone(&games[r1_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r1_start + offset + idx2].winner);
                 let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
                 idx += 1;
 
                 prob *= game.winnerprob;
                 score += 2.0 + game.winner.seed as f64;
                 expected_value += (2.0 + game.winner.seed as f64) * game.winnerprob;
-                games2winners.push(Arc::clone(&game.winner));
-                games2.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games2winners.len() == 16);
 
         // Round 3 (Sweet 16)
-        for region in &region_names {
-            for matchup in tournamentinfo.round3 {
-                let (team1, team2) = find_teams_for_matchup(&games2winners, region, &matchup);
+        let r2_start = 32;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 4;
+            for &(idx1, idx2) in &R3_INDICES {
+                let team1 = Arc::clone(&games[r2_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r2_start + offset + idx2].winner);
                 let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
                 idx += 1;
 
                 prob *= game.winnerprob;
                 score += 4.0 + game.winner.seed as f64;
                 expected_value += (4.0 + game.winner.seed as f64) * game.winnerprob;
-                games3winners.push(Arc::clone(&game.winner));
-                games3.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games3winners.len() == 8);
 
         // Round 4 (Elite 8)
-        for region in &region_names {
-            for matchup in tournamentinfo.round4 {
-                let (team1, team2) = find_teams_for_matchup(&games3winners, region, &matchup);
+        let r3_start = 48;
+        for (i, _) in region_names.iter().enumerate() {
+            let offset = i * 2;
+            for &(idx1, idx2) in &R4_INDICES {
+                let team1 = Arc::clone(&games[r3_start + offset + idx1].winner);
+                let team2 = Arc::clone(&games[r3_start + offset + idx2].winner);
                 let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
                 idx += 1;
 
                 prob *= game.winnerprob;
                 score += 8.0 * game.winner.seed as f64;
                 expected_value += (8.0 * game.winner.seed as f64) * game.winnerprob;
-                games4winners.push(Arc::clone(&game.winner));
-                games4.push(game);
+                games.push(game);
             }
         }
-        debug_assert!(games4winners.len() == 4);
 
         // Final Four: South vs Midwest
-        let (south_winner, midwest_winner) = {
-            let mut south = None;
-            let mut midwest = None;
-            for w in &games4winners {
-                match w.region.as_str() {
-                    "South" => south = Some(Arc::clone(w)),
-                    "Midwest" => midwest = Some(Arc::clone(w)),
-                    _ => {}
-                }
-            }
-            (south.unwrap(), midwest.unwrap())
-        };
+        let r4_start = 56;
+        let south_winner = Arc::clone(&games[r4_start + 2].winner);
+        let midwest_winner = Arc::clone(&games[r4_start + 3].winner);
+
         let game = Game::new_from_binary(&south_winner, &midwest_winner, binary_slice[idx]);
         idx += 1;
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
-        games5winners.push(Arc::clone(&game.winner));
-        games5.push(game);
+        games.push(game);
 
         // Final Four: East vs West
-        let (east_winner, west_winner) = {
-            let mut east = None;
-            let mut west = None;
-            for w in &games4winners {
-                match w.region.as_str() {
-                    "East" => east = Some(Arc::clone(w)),
-                    "West" => west = Some(Arc::clone(w)),
-                    _ => {}
-                }
-            }
-            (east.unwrap(), west.unwrap())
-        };
+        let east_winner = Arc::clone(&games[r4_start + 0].winner);
+        let west_winner = Arc::clone(&games[r4_start + 1].winner);
+
         let game = Game::new_from_binary(&east_winner, &west_winner, binary_slice[idx]);
         idx += 1;
         prob *= game.winnerprob;
         score += 16.0 * game.winner.seed as f64;
         expected_value += (16.0 * game.winner.seed as f64) * game.winnerprob;
-        games5winners.push(Arc::clone(&game.winner));
-        games5.push(game);
-        debug_assert!(games5winners.len() == 2);
+        games.push(game);
 
         // Championship game
-        let game = Game::new_from_binary(&games5winners[0], &games5winners[1], binary_slice[idx]);
+        let r5_start = 60;
+        let team1 = Arc::clone(&games[r5_start + 0].winner);
+        let team2 = Arc::clone(&games[r5_start + 1].winner);
+        let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
         prob *= game.winnerprob;
         score += 32.0 * game.winner.seed as f64;
         expected_value += (32.0 * game.winner.seed as f64) * game.winnerprob;
         let tournament_winner = Arc::clone(&game.winner);
-        games6.push(game);
+        games.push(game);
 
         Bracket{
-            round1: games1,
-            round2: games2,
-            round3: games3,
-            round4: games4,
-            round5: games5,
-            round6: games6,
+            games,
             winner: tournament_winner,
             prob,
             score,
@@ -639,60 +553,60 @@ impl Bracket{
 
         // Round 1: 32 games (indices 0-31 in binary)
         for i in 0..32 {
-            if self.round1[i].winner == other.round1[i].winner {
+            if self.games[i].winner == other.games[i].winner {
                 round_matches[0] += 1;
             } else {
                 // Weight by average seed of the differing winner
-                let seed_weight = (self.round1[i].winner.seed + other.round1[i].winner.seed) as f64 / 2.0;
+                let seed_weight = (self.games[i].winner.seed + other.games[i].winner.seed) as f64 / 2.0;
                 round_distances[0] += ROUND_WEIGHTS[0] * (1.0 + seed_weight / 16.0);
             }
         }
 
         // Round 2: 16 games
         for i in 0..16 {
-            if self.round2[i].winner == other.round2[i].winner {
+            if self.games[32+i].winner == other.games[32+i].winner {
                 round_matches[1] += 1;
             } else {
-                let seed_weight = (self.round2[i].winner.seed + other.round2[i].winner.seed) as f64 / 2.0;
+                let seed_weight = (self.games[32+i].winner.seed + other.games[32+i].winner.seed) as f64 / 2.0;
                 round_distances[1] += ROUND_WEIGHTS[1] * (1.0 + seed_weight / 16.0);
             }
         }
 
         // Round 3 (Sweet 16): 8 games
         for i in 0..8 {
-            if self.round3[i].winner == other.round3[i].winner {
+            if self.games[48+i].winner == other.games[48+i].winner {
                 round_matches[2] += 1;
             } else {
-                let seed_weight = (self.round3[i].winner.seed + other.round3[i].winner.seed) as f64 / 2.0;
+                let seed_weight = (self.games[48+i].winner.seed + other.games[48+i].winner.seed) as f64 / 2.0;
                 round_distances[2] += ROUND_WEIGHTS[2] * (1.0 + seed_weight / 16.0);
             }
         }
 
         // Round 4 (Elite 8): 4 games
         for i in 0..4 {
-            if self.round4[i].winner == other.round4[i].winner {
+            if self.games[56+i].winner == other.games[56+i].winner {
                 round_matches[3] += 1;
             } else {
-                let seed_weight = (self.round4[i].winner.seed + other.round4[i].winner.seed) as f64 / 2.0;
+                let seed_weight = (self.games[56+i].winner.seed + other.games[56+i].winner.seed) as f64 / 2.0;
                 round_distances[3] += ROUND_WEIGHTS[3] * (1.0 + seed_weight / 16.0);
             }
         }
 
         // Round 5 (Final Four): 2 games
         for i in 0..2 {
-            if self.round5[i].winner == other.round5[i].winner {
+            if self.games[60+i].winner == other.games[60+i].winner {
                 round_matches[4] += 1;
             } else {
-                let seed_weight = (self.round5[i].winner.seed + other.round5[i].winner.seed) as f64 / 2.0;
+                let seed_weight = (self.games[60+i].winner.seed + other.games[60+i].winner.seed) as f64 / 2.0;
                 round_distances[4] += ROUND_WEIGHTS[4] * (1.0 + seed_weight / 16.0);
             }
         }
 
         // Round 6 (Championship): 1 game
-        if self.round6[0].winner == other.round6[0].winner {
+        if self.games[62].winner == other.games[62].winner {
             round_matches[5] += 1;
         } else {
-            let seed_weight = (self.round6[0].winner.seed + other.round6[0].winner.seed) as f64 / 2.0;
+            let seed_weight = (self.games[62].winner.seed + other.games[62].winner.seed) as f64 / 2.0;
             round_distances[5] += ROUND_WEIGHTS[5] * (1.0 + seed_weight / 16.0);
         }
 
@@ -725,32 +639,32 @@ impl Bracket{
     //This will iterate through each round and print out the winner's names
     pub fn pretty_print(&self){
         println!("Round 1");
-        for game in &self.round1{
+        for game in &self.games[0..32]{
             println!("{} {}", game.winner.seed, game.winner.name);
         }
         println!();
         println!("Round 2");
-        for game in &self.round2{
+        for game in &self.games[32..48]{
             println!("{} {}", game.winner.seed, game.winner.name);
         }
         println!();
         println!("Sweet 16");
-        for game in &self.round3{
+        for game in &self.games[48..56]{
             println!("{} {}", game.winner.seed, game.winner.name);
         }
         println!();
         println!("Elite 8");
-        for game in &self.round4{
+        for game in &self.games[56..60]{
             println!("{} {}", game.winner.seed, game.winner.name);
         }
         println!();
         println!("Final Four");
-        for game in &self.round5{
+        for game in &self.games[60..62]{
             println!("{} {}", game.winner.seed, game.winner.name);
         }
         println!();
         println!("Championship");
-        for game in &self.round6{
+        for game in &self.games[62..63]{
             println!("{} {} wins!", game.winner.seed, game.winner.name);
         }
         println!("Expected Value: {}", self.expected_value);

@@ -187,7 +187,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 1 {
             let r1_idx = self.find_round1_game_index(team, region_idx);
             if let Some(idx) = r1_idx {
-                bracket.round1[idx].winner = Arc::clone(team);
+                bracket.games[idx].winner = Arc::clone(team);
             }
         }
 
@@ -195,7 +195,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 2 {
             let r2_idx = self.find_round2_game_index(team, region_idx);
             if let Some(idx) = r2_idx {
-                bracket.round2[idx].winner = Arc::clone(team);
+                bracket.games[32 + idx].winner = Arc::clone(team);
             }
         }
 
@@ -203,26 +203,26 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         if wins_needed >= 3 {
             let r3_idx = self.find_round3_game_index(team, region_idx);
             if let Some(idx) = r3_idx {
-                bracket.round3[idx].winner = Arc::clone(team);
+                bracket.games[48 + idx].winner = Arc::clone(team);
             }
         }
 
         // Elite 8 (Round 4)
         if wins_needed >= 4 {
             let r4_idx = region_idx; // One Elite 8 game per region
-            bracket.round4[r4_idx].winner = Arc::clone(team);
+            bracket.games[56 + r4_idx].winner = Arc::clone(team);
         }
 
         // Final Four (Round 5)
         if wins_needed >= 5 {
             // Final Four: South/Midwest play each other, East/West play each other
             let r5_idx = if region_idx == 2 || region_idx == 3 { 0 } else { 1 };
-            bracket.round5[r5_idx].winner = Arc::clone(team);
+            bracket.games[60 + r5_idx].winner = Arc::clone(team);
         }
 
         // Championship (Round 6)
         if wins_needed >= 6 {
-            bracket.round6[0].winner = Arc::clone(team);
+            bracket.games[62].winner = Arc::clone(team);
             bracket.winner = Arc::clone(team);
         }
 
@@ -312,42 +312,42 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         let mut expected_value = 0.0;
 
         // Round 1
-        for game in &bracket.round1 {
+        for game in &bracket.games[0..32] {
             prob *= game.winnerprob;
             score += 1.0 + game.winner.seed as f64;
             expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
         }
 
         // Round 2
-        for game in &bracket.round2 {
+        for game in &bracket.games[32..48] {
             prob *= game.winnerprob;
             score += 2.0 + game.winner.seed as f64;
             expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
         }
 
         // Round 3
-        for game in &bracket.round3 {
+        for game in &bracket.games[48..56] {
             prob *= game.winnerprob;
             score += 4.0 + game.winner.seed as f64;
             expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
         }
 
         // Round 4
-        for game in &bracket.round4 {
+        for game in &bracket.games[56..60] {
             prob *= game.winnerprob;
             score += 8.0 * game.winner.seed as f64;
             expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
         }
 
         // Round 5
-        for game in &bracket.round5 {
+        for game in &bracket.games[60..62] {
             prob *= game.winnerprob;
             score += 16.0 * game.winner.seed as f64;
             expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
         }
 
         // Round 6
-        for game in &bracket.round6 {
+        for game in &bracket.games[62..63] {
             prob *= game.winnerprob;
             score += 32.0 * game.winner.seed as f64;
             expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
