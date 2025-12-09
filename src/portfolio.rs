@@ -3,6 +3,7 @@
 
 use crate::bracket::Bracket;
 use crate::ingest::{Team, RcTeam, TournamentInfo};
+use crate::anneal::{self, AnnealingConfig};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
@@ -432,6 +433,22 @@ impl BracketPortfolio {
         }
 
         portfolio
+    }
+
+    /// Generate portfolio using Simulated Annealing optimization
+    pub fn generate_annealing_diverse(
+        tournament: &TournamentInfo,
+        num_brackets: usize,
+        diversity_weight: f64,
+        steps: usize,
+    ) -> Self {
+        let config = AnnealingConfig {
+            steps,
+            diversity_weight,
+            ..Default::default()
+        };
+
+        anneal::optimize_portfolio(tournament, num_brackets, config)
     }
 
     /// Calculate statistics about the portfolio
