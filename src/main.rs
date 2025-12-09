@@ -9,7 +9,7 @@ mod genetic;
 
 use clap::{Parser, ValueEnum};
 use rand::Rng;
-use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder};
+use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder, GeneticMode};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
@@ -99,6 +99,10 @@ struct Args {
     /// Number of simulations for genetic portfolio optimization
     #[arg(long, default_value = "10000")]
     genetic_sims: i32,
+
+    /// Mode for genetic algorithm
+    #[arg(long, value_enum, default_value = "sequential")]
+    genetic_mode: GeneticMode,
 }
 
 fn main() {
@@ -223,6 +227,7 @@ fn main() {
             &constraints,
             args.generations,
             args.genetic_sims,
+            args.genetic_mode,
         );
     } else if !constraints.is_empty() {
         // Run single bracket with constraints
@@ -276,6 +281,7 @@ fn run_portfolio_mode(
     constraints: &[BracketConstraint],
     generations: u32,
     genetic_sims: i32,
+    genetic_mode: GeneticMode,
 ) {
     println!();
     println!("=== Portfolio Mode ===");
@@ -309,6 +315,7 @@ fn run_portfolio_mode(
                 num_brackets,
                 genetic_sims,
                 generations,
+                genetic_mode,
             )
         }
     };

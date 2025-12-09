@@ -2,6 +2,7 @@ use rand::Rng;
 use crate::bracket::Bracket;
 use crate::ingest::TournamentInfo;
 use crate::pool::Batch;
+use rayon::prelude::*;
 
 /// Configuration for Genetic Algorithm
 pub struct GeneticConfig {
@@ -61,7 +62,8 @@ pub fn optimize_portfolio_bracket(
     // Main evolution loop
     for _gen in 0..config.generations {
         // Calculate fitness for all individuals
-        let mut fitness_scores: Vec<(usize, f64)> = population.iter().enumerate().map(|(idx, bracket)| {
+        // Parallelize fitness calculation for performance
+        let mut fitness_scores: Vec<(usize, f64)> = population.par_iter().enumerate().map(|(idx, bracket)| {
             (idx, calculate_fitness_with_precalc(bracket, &existing_max_scores, simulation_pool))
         }).collect();
 
@@ -99,8 +101,91 @@ pub fn optimize_portfolio_bracket(
     }
 
     // Return the best individual from the final generation
-    let best_idx = population.iter()
+    let best_idx = population.par_iter()
         .map(|b| calculate_fitness_with_precalc(b, &existing_max_scores, simulation_pool))
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    population[best_idx].clone()
+}
+
+/// Optimize a whole portfolio simultaneously using Genetic Algorithm
+///
+/// Individual: A vector of N brackets (Portfolio)
+/// Fitness: Average maximum score across the simulation pool for the entire portfolio
+pub fn optimize_whole_portfolio(
+    tournament: &TournamentInfo,
+    portfolio_size: usize,
+    simulation_pool: &Batch,
+    config: &GeneticConfig,
+) -> Vec<Bracket> {
+    let mut rng = rand::thread_rng();
+
+    // Initialize population of portfolios
+    let mut population: Vec<Vec<Bracket>> = Vec::with_capacity(config.population_size);
+    for _ in 0..config.population_size {
+        let mut portfolio = Vec::with_capacity(portfolio_size);
+        for _ in 0..portfolio_size {
+            portfolio.push(Bracket::new(tournament));
+        }
+        population.push(portfolio);
+    }
+
+    // Main evolution loop
+    for _gen in 0..config.generations {
+        // Calculate fitness for all portfolios
+        // Parallelize fitness calculation (expensive)
+        let mut fitness_scores: Vec<(usize, f64)> = population.par_iter().enumerate().map(|(idx, portfolio)| {
+            (idx, calculate_portfolio_fitness(portfolio, simulation_pool))
+        }).collect();
+
+        // Sort by fitness descending
+        fitness_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Elitism
+        let mut new_population = Vec::with_capacity(config.population_size);
+        for i in 0..config.elitism_count {
+            if i < fitness_scores.len() {
+                new_population.push(population[fitness_scores[i].0].clone());
+            }
+        }
+
+        // Generate rest
+        while new_population.len() < config.population_size {
+            // Selection (Tournament)
+            let parent1 = tournament_selection_portfolio(&population, &fitness_scores, &mut rng);
+            let parent2 = tournament_selection_portfolio(&population, &fitness_scores, &mut rng);
+
+            // Crossover: Mix brackets from two parents
+            let mut child = Vec::with_capacity(portfolio_size);
+            for i in 0..portfolio_size {
+                if rng.gen::<bool>() {
+                    child.push(parent1[i].clone());
+                } else {
+                    child.push(parent2[i].clone());
+                }
+            }
+
+            // Mutation: Randomly mutate one or more brackets in the portfolio
+            for bracket in child.iter_mut() {
+                // Mutate each bracket with a probability derived from overall mutation rate
+                // Increase mutation chance since we want to explore portfolio space
+                if rng.gen::<f64>() < 0.2 { // 20% chance per bracket to be mutated
+                    *bracket = bracket.smart_mutate(tournament, config.mutation_rate);
+                }
+            }
+
+            new_population.push(child);
+        }
+
+        population = new_population;
+    }
+
+    // Return best portfolio
+    let best_idx = population.par_iter()
+        .map(|p| calculate_portfolio_fitness(p, simulation_pool))
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
         .map(|(idx, _)| idx)
@@ -119,6 +204,43 @@ fn tournament_selection<'a>(
     let mut best_fitness = 0.0;
 
     // Find fitness of initial random pick (naive search)
+    // Optimization: create a map or direct lookup if perf becomes issue
+    // For population 50, linear search is fine (~50 iters)
+    for (idx, score) in fitness_scores {
+        if *idx == best_idx {
+            best_fitness = *score;
+            break;
+        }
+    }
+
+    for _ in 1..k {
+        let idx = rng.gen_range(0..population.len());
+        let mut fitness = 0.0;
+        for (f_idx, f_score) in fitness_scores {
+            if *f_idx == idx {
+                fitness = *f_score;
+                break;
+            }
+        }
+
+        if fitness > best_fitness {
+            best_fitness = fitness;
+            best_idx = idx;
+        }
+    }
+
+    &population[best_idx]
+}
+
+fn tournament_selection_portfolio<'a>(
+    population: &'a [Vec<Bracket>],
+    fitness_scores: &[(usize, f64)],
+    rng: &mut impl Rng,
+) -> &'a Vec<Bracket> {
+    let k = 3;
+    let mut best_idx = rng.gen_range(0..population.len());
+    let mut best_fitness = 0.0;
+
     for (idx, score) in fitness_scores {
         if *idx == best_idx {
             best_fitness = *score;
@@ -158,6 +280,25 @@ fn calculate_fitness_with_precalc(
         } else {
             existing_max
         }
+    }).sum();
+
+    total_score / pool.brackets.len() as f64
+}
+
+/// Calculate fitness for a whole portfolio from scratch
+fn calculate_portfolio_fitness(
+    portfolio: &[Bracket],
+    pool: &Batch,
+) -> f64 {
+    if portfolio.is_empty() {
+        return 0.0;
+    }
+
+    let total_score: f64 = pool.brackets.iter().map(|sim| {
+        // Find max score among all brackets in portfolio for this simulation
+        portfolio.iter()
+            .map(|b| b.score(sim))
+            .fold(0.0, f64::max)
     }).sum();
 
     total_score / pool.brackets.len() as f64

@@ -8,6 +8,15 @@ use crate::genetic::{self, GeneticConfig};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GeneticMode {
+    /// Optimize brackets one by one (Sequential)
+    Sequential,
+    /// Optimize all brackets simultaneously (Holistic)
+    Simultaneous,
+}
+use clap::ValueEnum;
+
 /// Specifies how far a team must advance
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdvancementRound {
@@ -443,6 +452,7 @@ impl BracketPortfolio {
         num_brackets: usize,
         num_simulations: i32,
         generations: u32,
+        mode: GeneticMode,
     ) -> Self {
         let mut portfolio = BracketPortfolio::new();
 
@@ -451,18 +461,34 @@ impl BracketPortfolio {
 
         let config = GeneticConfig::new(generations);
 
-        for i in 0..num_brackets {
-            println!("Optimizing bracket {} of {}...", i + 1, num_brackets);
+        match mode {
+            GeneticMode::Sequential => {
+                println!("Running Genetic Algorithm in Sequential mode...");
+                for i in 0..num_brackets {
+                    println!("Optimizing bracket {} of {}...", i + 1, num_brackets);
 
-            let bracket = genetic::optimize_portfolio_bracket(
-                tournament,
-                &portfolio.brackets,
-                &simulation_pool,
-                &config
-            );
+                    let bracket = genetic::optimize_portfolio_bracket(
+                        tournament,
+                        &portfolio.brackets,
+                        &simulation_pool,
+                        &config
+                    );
 
-            portfolio.brackets.push(bracket);
-            portfolio.constraints.push(Vec::new());
+                    portfolio.brackets.push(bracket);
+                    portfolio.constraints.push(Vec::new());
+                }
+            },
+            GeneticMode::Simultaneous => {
+                println!("Running Genetic Algorithm in Simultaneous mode (Whole Portfolio)...");
+                let brackets = genetic::optimize_whole_portfolio(
+                    tournament,
+                    num_brackets,
+                    &simulation_pool,
+                    &config
+                );
+                portfolio.brackets = brackets;
+                portfolio.constraints = vec![Vec::new(); num_brackets];
+            }
         }
 
         portfolio
