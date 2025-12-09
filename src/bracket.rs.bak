@@ -518,54 +518,6 @@ impl Bracket{
         // Pass slice instead of owned Vec
         Bracket::new_from_binary(tournamentinfo, &new_binary)
     }
-
-    /// Smart mutation that flips bits based on game uncertainty.
-    /// Games closer to 50/50 probability are more likely to be mutated.
-    /// Uses self.games to determine uncertainty (based on pre-mutation state).
-    pub fn smart_mutate(&self, tournamentinfo: &TournamentInfo, base_rate: f64) -> Bracket {
-        let mut new_binary: Vec<bool> = self.binary.clone();
-        let mut rng = rand::thread_rng();
-
-        for (i, bit) in new_binary.iter_mut().enumerate() {
-            // Get the probability of the matchup in the current bracket
-            // Use team1prob as the baseline probability of the matchup
-            // (team1prob + team2prob = 1.0)
-            let prob = self.games[i].team1prob;
-
-            // Calculate uncertainty: 1.0 when prob is 0.5, 0.0 when prob is 0.0 or 1.0
-            // Formula: 4 * p * (1-p) is a parabola peaking at 0.5
-            let uncertainty = 4.0 * prob * (1.0 - prob);
-
-            // Scale mutation rate by uncertainty
-            // Highly uncertain games get higher mutation rate
-            // Certain games get lower mutation rate
-            let scaled_rate = base_rate * (0.5 + uncertainty);
-
-            if rng.gen::<f64>() < scaled_rate {
-                *bit = !*bit;
-            }
-        }
-
-        Bracket::new_from_binary(tournamentinfo, &new_binary)
-    }
-
-    /// Create a child bracket by crossing over with another bracket.
-    /// Uses uniform crossover on the binary representation.
-    pub fn crossover(&self, other: &Bracket, tournamentinfo: &TournamentInfo) -> Bracket {
-        let mut new_binary = Vec::with_capacity(63);
-        let mut rng = rand::thread_rng();
-
-        for i in 0..63 {
-            if rng.gen::<bool>() {
-                new_binary.push(self.binary[i]);
-            } else {
-                new_binary.push(other.binary[i]);
-            }
-        }
-
-        Bracket::new_from_binary(tournamentinfo, &new_binary)
-    }
-
     pub fn create_n_children(&mut self, tournamentinfo: &TournamentInfo, n: usize, mutation_rate: f64) -> Vec<Bracket>{
         let children: Vec<Bracket> = (0..n).into_iter().map(|_| self.mutate(tournamentinfo, mutation_rate)).collect();
         // let mut children: Vec<Bracket> = Vec::new();

@@ -4,7 +4,7 @@
 use crate::bracket::Bracket;
 use crate::ingest::{Team, RcTeam, TournamentInfo};
 use crate::pool::Batch;
-use crate::anneal::{self, AnnealingSchedule};
+use crate::genetic::{self, GeneticConfig};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
@@ -436,9 +436,9 @@ impl BracketPortfolio {
         portfolio
     }
 
-    /// Generate portfolio using simulated annealing and Monte Carlo simulations
+    /// Generate portfolio using Genetic Algorithm and Monte Carlo simulations
     /// Each bracket maximizes the overall portfolio fitness (max score of set)
-    pub fn generate_annealed_portfolio(
+    pub fn generate_genetic_portfolio(
         tournament: &TournamentInfo,
         num_brackets: usize,
         num_simulations: i32,
@@ -449,20 +449,16 @@ impl BracketPortfolio {
         println!("Generating simulation pool of size {}...", num_simulations);
         let simulation_pool = Batch::new(tournament, num_simulations);
 
-        // Use generations CLI argument as steps per temp
-        // Default generations=200 is small for annealing steps, so we scale it up or expect users to set it higher
-        // Alternatively, we can treat it as "total steps" but annealing usually has steps * temps.
-        // Let's use it as steps_per_temp to be consistent with "generations" concept (iterations at each state)
-        let schedule = AnnealingSchedule::new(generations);
+        let config = GeneticConfig::new(generations);
 
         for i in 0..num_brackets {
             println!("Optimizing bracket {} of {}...", i + 1, num_brackets);
 
-            let bracket = anneal::optimize_portfolio_bracket(
+            let bracket = genetic::optimize_portfolio_bracket(
                 tournament,
                 &portfolio.brackets,
                 &simulation_pool,
-                &schedule
+                &config
             );
 
             portfolio.brackets.push(bracket);

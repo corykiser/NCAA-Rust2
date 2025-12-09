@@ -5,7 +5,7 @@ mod elo;
 mod api;
 mod game_result;
 mod portfolio;
-mod anneal;
+mod genetic;
 
 use clap::{Parser, ValueEnum};
 use rand::Rng;
@@ -27,8 +27,8 @@ enum PortfolioStrategy {
     Champion,
     /// Greedily maximize EV while penalizing similarity to previous brackets
     Diverse,
-    /// Optimize for maximum portfolio performance using simulated annealing
-    Annealing,
+    /// Optimize for maximum portfolio performance using genetic algorithm
+    Genetic,
 }
 
 #[derive(Parser, Debug)]
@@ -96,9 +96,9 @@ struct Args {
     #[arg(long)]
     lock_team: Vec<String>,
 
-    /// Number of simulations for annealing portfolio optimization
+    /// Number of simulations for genetic portfolio optimization
     #[arg(long, default_value = "10000")]
-    annealing_sims: i32,
+    genetic_sims: i32,
 }
 
 fn main() {
@@ -222,7 +222,7 @@ fn main() {
             &args.portfolio_strategy,
             &constraints,
             args.generations,
-            args.annealing_sims,
+            args.genetic_sims,
         );
     } else if !constraints.is_empty() {
         // Run single bracket with constraints
@@ -275,7 +275,7 @@ fn run_portfolio_mode(
     strategy: &PortfolioStrategy,
     constraints: &[BracketConstraint],
     generations: u32,
-    annealing_sims: i32,
+    genetic_sims: i32,
 ) {
     println!();
     println!("=== Portfolio Mode ===");
@@ -303,11 +303,11 @@ fn run_portfolio_mode(
                 generations,
             )
         }
-        PortfolioStrategy::Annealing => {
-            BracketPortfolio::generate_annealed_portfolio(
+        PortfolioStrategy::Genetic => {
+            BracketPortfolio::generate_genetic_portfolio(
                 tournamentinfo,
                 num_brackets,
-                annealing_sims,
+                genetic_sims,
                 generations,
             )
         }
