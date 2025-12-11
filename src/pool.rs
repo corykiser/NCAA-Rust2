@@ -1,27 +1,14 @@
-use crate::ingest::TournamentInfo;
+//This contains all of the simulations using ELO (modified per 538) calculations
+//The Game struct is used to simulate a game between two teams and store the results.
+//The Bracket struct is used to simulate a whole tournament of 63 games and store the results.
+//Both structs also provide a way to create a game from binary data or to extract a binary representation of each.
+// the Bracket struct also provides a way to score a bracket against a reference bracket.
+
 use rayon::prelude::*;
+use crate::bracket::{Bracket, ScoringConfig};
+use crate::ingest::TournamentInfo;
 use std::fs::File;
 use std::io::Write;
-use num_cpus;
-use serde_json;
-
-//This file is intended to help with the creation of a pool of brackets to be used in the program.
-//The idea is that we can create a pool of bracket entries and run Monte Carlo Simulations against them to test their fitness.
-//Fitness of a batch should be the highest MAXIMUM score of any one bracket in the batch.
-
-//It seems like a bracket's expected score when compared against monte carlo simulations converges at around 500-1000 simulations, maybe even less.
-//You probably don't even need to generate 500-1000 simulations each time if you are using an evolutionary algorithm.
-
-//The standard deviation of how an individual bracket performs against monte carlo simulations is an interesting topic to explore.
-// Finding the average score and standard deviation of a random bracket scored against monte carlo simulations could be useful for bayesian inference.
-// You would want to compare that number against the average maximum score of a batch and the standard deviation of the maximum score of a batch.
-
-//Hamming Distance between two brackets is a good metric to use to determine how similar two brackets are to each other.
-//It could come in handy for maximizing diversity in a batch of brackets or for evolutionary algorithms.
-// A variation of it with a score weighting could be used to determine how similar two brackets are to each other in score space.
-// The Gower Distance is also worth looking into.
-
-use crate::bracket::Bracket;
 
 #[derive(Debug, Clone)]
 pub struct EvolvingPool{
@@ -34,6 +21,7 @@ pub struct EvolvingPool{
     pub max_score: f64, //the average maximum score of the best bracket for each round of scoring
     pub average_score: f64, //the average scores of all the brackets in the pool
     pub fitness: f64, //the fitness of the pool
+    pub scoring_config: ScoringConfig,
 }
 
 //impl fn evolve, returns a new EvolvingPool?
@@ -53,10 +41,11 @@ pub struct EvolvingPool{
 
 impl EvolvingPool{
     //new function will create a pool of brackets from needed inputs
-    pub fn new(tournamentinfo: &TournamentInfo, pool_size: i32, mutation_rate: f64, num_child_pools: i32, batch_size: i32) -> EvolvingPool{
+    pub fn new(tournamentinfo: &TournamentInfo, pool_size: i32, mutation_rate: f64, num_child_pools: i32, batch_size: i32, scoring_config: Option<ScoringConfig>) -> EvolvingPool{
+        let config = scoring_config.unwrap_or_default();
         // create a vector of random brackets of size pool_size
         //let mut brackets: Vec<Bracket> = (0..pool_size).into_par_iter().map(|_| Bracket::new_from_binary( tournamentinfo, bracket::random63bool() )).collect();
-        let brackets: Vec<Bracket> = (0..pool_size).into_par_iter().map(|_| Bracket::new( tournamentinfo)).collect();
+        let brackets: Vec<Bracket> = (0..pool_size).into_par_iter().map(|_| Bracket::new( tournamentinfo, Some(&config))).collect();
         // let mut brackets: Vec<Bracket> = Vec::new();
         // for _i in 0..pool_size{
         //     brackets.push(Bracket::new(tournamentinfo));
@@ -67,13 +56,14 @@ impl EvolvingPool{
         EvolvingPool{
             pool_size,
             brackets,
-            batch: Batch::new(tournamentinfo, batch_size),
+            batch: Batch::new(tournamentinfo, batch_size, &config),
             batch_size,
             mutation_rate,
             num_child_pools,
             max_score: 0.0, //hasn't been scored yet
             average_score: 0.0, //hasn't been scored yet
             fitness: 0.0, //hasn't been scored yet
+            scoring_config: config,
         }
     }
     pub fn score(&mut self, _tournamentinfo: &TournamentInfo) -> f64{
@@ -101,7 +91,7 @@ impl EvolvingPool{
         // mutate every bracket in the pool
         // Note: bracket.mutate() already creates a new bracket, so no need to clone first
         let brackets_to_mutate: Vec<Bracket> = self.brackets.iter()
-            .map(|bracket| bracket.mutate(tournamentinfo, self.mutation_rate))
+            .map(|bracket| bracket.mutate(tournamentinfo, self.mutation_rate, Some(&self.scoring_config)))
             .collect();
 
         EvolvingPool {
@@ -114,6 +104,7 @@ impl EvolvingPool{
             max_score: 0.0,
             average_score: 0.0,
             fitness: 0.0,
+            scoring_config: self.scoring_config.clone(),
         }
     }
     pub fn create_child_pools(&mut self, tournamentinfo: &TournamentInfo) -> Vec<EvolvingPool>{
@@ -129,7 +120,7 @@ impl EvolvingPool{
         child_pools
     }
     pub fn update_batch(&mut self, tournamentinfo: &TournamentInfo){
-        self.batch = Batch::new(tournamentinfo, self.batch_size);
+        self.batch = Batch::new(tournamentinfo, self.batch_size, &self.scoring_config);
     }
     pub fn pretty_print(&self, _tournamentinfo: &TournamentInfo){
         println!("Pool Size: {}", self.pool_size);
@@ -173,31 +164,33 @@ pub struct Batch{
     pub brackets: Vec<Bracket>,
     pub batch_score: f64,
     pub batch_score_std_dev: f64,
+    pub scoring_config: ScoringConfig,
 }
 
 impl Batch{
     //This function will create a batch of brackets from MonteCarlo simulations
-    pub fn new(tournamentinfo: &TournamentInfo, num_brackets: i32) -> Batch{
+    pub fn new(tournamentinfo: &TournamentInfo, num_brackets: i32, scoring_config: &ScoringConfig) -> Batch{
         let num_cpus = num_cpus::get();
         let num_brackets_per_core = num_brackets as usize / num_cpus;
-        let brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core).map(|_| Bracket::new(tournamentinfo)).collect();
+        let brackets: Vec<Bracket> = (0..num_brackets).into_par_iter().with_min_len(num_brackets_per_core).map(|_| Bracket::new(tournamentinfo, Some(scoring_config))).collect();
         Batch{
             brackets,
             batch_score: 0.0,
             batch_score_std_dev: 0.0,
+            scoring_config: *scoring_config,
         }
     }
     // This function will score each bracket in the batch against random sims and then return the average score
     pub fn score_against_simulations(&mut self,tournamentinfo: &TournamentInfo, num_sims: i32){
         //start sims
         for _i in 0..num_sims{
-            let sim_bracket = Bracket::new(&tournamentinfo);
+            let sim_bracket = Bracket::new(&tournamentinfo, Some(&self.scoring_config));
             for bracket in &mut self.brackets{
                 bracket.sim_score = 0.0; //reset to zero
             }
             //begin averaging for each individual bracket score
             for bracket in &mut self.brackets{
-                bracket.sim_score += bracket.score(&sim_bracket);
+                bracket.sim_score += bracket.score(&sim_bracket, Some(&self.scoring_config));
             }
             for bracket in &mut self.brackets{
                 bracket.sim_score /= num_sims as f64;
@@ -213,7 +206,7 @@ impl Batch{
     pub fn score_against_ref(&mut self, ref_bracket: &Bracket) -> f64{
         //iterate through the brackets and score them against the reference bracket, collect it all into a new vector
         //doesn't need to be mutable
-        let batch_scores: Vec<f64> = self.brackets.par_iter().map(|x| x.score(ref_bracket)).collect();
+        let batch_scores: Vec<f64> = self.brackets.par_iter().map(|x| x.score(ref_bracket, Some(&self.scoring_config))).collect();
         //do the math to get the mean and standard deviation
         self.batch_score = batch_scores.iter().sum::<f64>() / batch_scores.len() as f64;
         self.batch_score_std_dev = ( batch_scores.iter().map(|x| (x - self.batch_score).powi(2) ).sum::<f64>() / batch_scores.len() as f64 ) .sqrt();
