@@ -1,0 +1,45 @@
+# NCAA Bracket Optimizer Configuration
+# All values shown are defaults - uncomment and modify as needed
+
+# Scoring configuration
+scoring:
+  # Points per round [R1, R2, Sweet16, Elite8, Final4, Championship]
+  round_scores: [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+  # Seed scoring mode per round: "add", "multiply", or "none"
+  # "add" = base_points + seed
+  # "multiply" = base_points * seed
+  # "none" = base_points only
+  seed_scoring: ["add", "add", "add", "multiply", "multiply", "multiply"]
+
+# Genetic Algorithm settings
+ga:
+  # Population size (number of brackets evolved simultaneously)
+  population_size: 100
+  # Number of generations to evolve
+  generations: 200
+  # Mutation rate (probability of mutating each individual)
+  mutation_rate: 0.15
+  # Crossover rate (probability of crossover between parents)
+  crossover_rate: 0.7
+  # Elitism (number of top individuals preserved each generation)
+  elitism_count: 5
+  # Tournament selection size
+  tournament_size: 3
+  # Use smart mutation (team/round based) instead of random bit flips
+  smart_mutation: true
+  # Probability of smart mutation vs bit flip when smart_mutation is enabled
+  smart_mutation_rate: 0.8
+
+# Simulation pool settings
+simulation:
+  # Number of random brackets for scoring (higher = more accurate but slower)
+  pool_size: 10000
+  # Regenerate pool each generation (false = reuse for consistency)
+  regenerate_pool: false
+
+# Portfolio settings
+portfolio:
+  # Number of brackets in portfolio
+  num_brackets: 5
+  # Use best-ball scoring (max score in portfolio per simulation)
+  best_ball: true

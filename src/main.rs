@@ -6,11 +6,15 @@ mod api;
 mod game_result;
 mod portfolio;
 mod anneal;
+mod config;
+mod ga;
 
 use clap::{Parser, ValueEnum};
 use rand::Rng;
 use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder};
 use bracket::{ScoringConfig, SeedScoring};
+use config::Config;
+use ga::{GeneticAlgorithm, SequentialPortfolioOptimizer, HybridOptimizer, SimulationPool, WholePortfolioGA};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
@@ -24,12 +28,26 @@ enum DataSourceArg {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum PortfolioStrategy {
-    /// Each bracket bets on a different championship winner
+    /// Each bracket bets on a different championship winner (legacy)
     Champion,
-    /// Greedily maximize EV while penalizing similarity to previous brackets
+    /// Greedily maximize EV while penalizing similarity (legacy)
     Diverse,
-    /// Optimize whole portfolio using Simulated Annealing
+    /// Evolve whole portfolio at once using SA, fitness = best-ball score
     Annealing,
+    /// Evolve whole portfolio at once using GA, fitness = best-ball score
+    GaWhole,
+    /// Sequential: optimize bracket 1, freeze, optimize bracket 2 for marginal contribution, etc.
+    GaSequential,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OptimizationMode {
+    /// Legacy hill-climbing optimization
+    Legacy,
+    /// Population-based Genetic Algorithm
+    Ga,
+    /// Hybrid Simulated Annealing + GA
+    Hybrid,
 }
 
 #[derive(Parser, Debug)]
@@ -89,7 +107,7 @@ struct Args {
     diversity_weight: f64,
 
     /// Strategy for portfolio generation
-    #[arg(long, value_enum, default_value = "champion")]
+    #[arg(long, value_enum, default_value = "ga-whole")]
     portfolio_strategy: PortfolioStrategy,
 
     /// Number of steps for annealing strategy
@@ -100,6 +118,36 @@ struct Args {
     /// Can be specified multiple times
     #[arg(long)]
     lock_team: Vec<String>,
+
+    // ===== NEW GA OPTIONS =====
+
+    /// Path to YAML configuration file
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Generate a sample configuration file and exit
+    #[arg(long)]
+    generate_config: bool,
+
+    /// Optimization mode for single bracket
+    #[arg(long, value_enum, default_value = "ga")]
+    optimization_mode: OptimizationMode,
+
+    /// GA population size (overrides config)
+    #[arg(long)]
+    population_size: Option<usize>,
+
+    /// Simulation pool size for scoring (overrides config)
+    #[arg(long)]
+    pool_size: Option<usize>,
+
+    /// Enable smart mutation (team/round based)
+    #[arg(long)]
+    smart_mutation: Option<bool>,
+
+    /// Verbose output during optimization
+    #[arg(short, long)]
+    verbose: bool,
 
     // Scoring Configuration
 
@@ -157,9 +205,32 @@ fn parse_seed_mode(s: &str) -> SeedScoring {
 fn main() {
     let args = Args::parse();
 
+    // Handle generate_config flag
+    if args.generate_config {
+        let sample = config::generate_sample_config();
+        println!("{}", sample);
+        println!("\n# Save this to config.yaml and customize as needed");
+        return;
+    }
+
     println!("NCAA Bracket Optimizer");
     println!("======================");
     println!();
+
+    // Load configuration from YAML (or use defaults)
+    let mut app_config = Config::load_or_default(args.config.as_deref());
+
+    // Apply CLI overrides to config
+    if let Some(pop_size) = args.population_size {
+        app_config.ga.population_size = pop_size;
+    }
+    if let Some(pool_size) = args.pool_size {
+        app_config.simulation.pool_size = pool_size;
+    }
+    if let Some(smart_mut) = args.smart_mutation {
+        app_config.ga.smart_mutation = smart_mut;
+    }
+    app_config.ga.generations = args.generations as usize;
 
     // Construct ScoringConfig from args
     let scoring_config = ScoringConfig {
@@ -310,13 +381,25 @@ fn main() {
             args.generations,
             args.anneal_steps,
             &scoring_config,
+            &app_config,
+            args.verbose,
         );
     } else if !constraints.is_empty() {
         // Run single bracket with constraints
         run_constrained_optimization(&tournamentinfo, &constraints, args.generations, args.batch_size, &scoring_config);
     } else {
-        // Run standard bracket optimization
-        run_optimization(&tournamentinfo, args.generations, args.batch_size, &scoring_config);
+        // Run bracket optimization with selected mode
+        match args.optimization_mode {
+            OptimizationMode::Legacy => {
+                run_optimization(&tournamentinfo, args.generations, args.batch_size, &scoring_config);
+            }
+            OptimizationMode::Ga => {
+                run_ga_optimization(&tournamentinfo, &app_config, &scoring_config, args.verbose);
+            }
+            OptimizationMode::Hybrid => {
+                run_hybrid_optimization(&tournamentinfo, &app_config, args.verbose);
+            }
+        }
     }
 }
 
@@ -364,12 +447,13 @@ fn run_portfolio_mode(
     generations: u32,
     anneal_steps: usize,
     scoring_config: &ScoringConfig,
+    app_config: &Config,
+    verbose: bool,
 ) {
     println!();
     println!("=== Portfolio Mode ===");
     println!("Generating {} diverse brackets...", num_brackets);
     println!("Strategy: {:?}", strategy);
-    println!("Diversity weight: {:.2}", diversity_weight);
 
     if !constraints.is_empty() {
         println!("Base constraints:");
@@ -379,39 +463,180 @@ fn run_portfolio_mode(
     }
     println!();
 
-    let portfolio = match strategy {
+    match strategy {
         PortfolioStrategy::Champion => {
-            BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config)
+            let portfolio = BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config);
+            portfolio.print_summary_with_config(Some(scoring_config));
+            portfolio.print_pairwise_distances(scoring_config);
+            for (i, bracket) in portfolio.brackets.iter().enumerate() {
+                println!("\n=== Bracket {} ===", i + 1);
+                bracket.pretty_print();
+            }
         }
         PortfolioStrategy::Diverse => {
-            BracketPortfolio::generate_greedy_diverse(
+            println!("Diversity weight: {:.2}", diversity_weight);
+            let portfolio = BracketPortfolio::generate_greedy_diverse(
                 tournamentinfo,
                 num_brackets,
                 diversity_weight,
                 generations,
                 scoring_config,
-            )
+            );
+            portfolio.print_summary_with_config(Some(scoring_config));
+            portfolio.print_pairwise_distances(scoring_config);
+            for (i, bracket) in portfolio.brackets.iter().enumerate() {
+                println!("\n=== Bracket {} ===", i + 1);
+                bracket.pretty_print();
+            }
         }
         PortfolioStrategy::Annealing => {
-            println!("Running Simulated Annealing optimization ({} steps)...", anneal_steps);
-            BracketPortfolio::generate_annealing_diverse(
+            println!("Mode: Simulated Annealing (whole portfolio)");
+            println!("Fitness: Best-ball score against {} simulations", app_config.simulation.pool_size);
+            println!("Annealing steps: {}", anneal_steps);
+            println!();
+            let portfolio = BracketPortfolio::generate_annealing_diverse(
                 tournamentinfo,
                 num_brackets,
-                diversity_weight,
+                app_config.simulation.pool_size,
                 anneal_steps,
                 scoring_config,
-            )
+            );
+            portfolio.print_summary_with_config(Some(scoring_config));
+            for (i, bracket) in portfolio.brackets.iter().enumerate() {
+                println!("\n=== Bracket {} ===", i + 1);
+                bracket.pretty_print();
+            }
         }
-    };
+        PortfolioStrategy::GaWhole => {
+            println!("Mode: Genetic Algorithm (whole portfolio evolution)");
+            println!("Population size: {} portfolios", app_config.ga.population_size);
+            println!("Generations: {}", app_config.ga.generations);
+            println!("Fitness: Best-ball score against {} simulations", app_config.simulation.pool_size);
+            println!("Smart mutation: {}", app_config.ga.smart_mutation);
+            println!();
 
-    portfolio.print_summary_with_config(Some(scoring_config));
-    portfolio.print_pairwise_distances(scoring_config);
+            // Generate simulation pool
+            let pool = SimulationPool::new(
+                tournamentinfo,
+                app_config.simulation.pool_size,
+                scoring_config,
+            );
 
-    // Print each bracket in detail
-    for (i, bracket) in portfolio.brackets.iter().enumerate() {
-        println!("\n=== Bracket {} ===", i + 1);
-        bracket.pretty_print();
+            // Create and run whole portfolio GA
+            let mut ga = WholePortfolioGA::new(
+                tournamentinfo,
+                num_brackets,
+                app_config.ga.clone(),
+                *scoring_config,
+            );
+
+            let brackets = ga.run(tournamentinfo, &pool, verbose);
+
+            // Calculate final best-ball score
+            let final_score = pool.score_portfolio_best_ball(&brackets, scoring_config);
+            println!("\n=== Portfolio Optimization Complete ===");
+            println!("Final best-ball score: {:.2}", final_score);
+
+            println!("\nPortfolio champions:");
+            for (i, bracket) in brackets.iter().enumerate() {
+                let individual_score = pool.score_bracket(bracket, scoring_config);
+                println!(
+                    "  Bracket {}: {} (seed {}) - Individual score: {:.2}, EV: {:.2}",
+                    i + 1,
+                    bracket.winner.name,
+                    bracket.winner.seed,
+                    individual_score,
+                    bracket.expected_value
+                );
+            }
+
+            for (i, bracket) in brackets.iter().enumerate() {
+                println!("\n=== Bracket {} ===", i + 1);
+                bracket.pretty_print();
+            }
+        }
+        PortfolioStrategy::GaSequential => {
+            println!("Mode: Sequential GA (freeze-and-optimize)");
+            println!("Population size: {}", app_config.ga.population_size);
+            println!("Generations per bracket: {}", app_config.ga.generations);
+            println!("Fitness: Marginal contribution to best-ball score");
+            println!("Simulation pool size: {}", app_config.simulation.pool_size);
+            println!("Smart mutation: {}", app_config.ga.smart_mutation);
+            println!();
+
+            let optimizer = SequentialPortfolioOptimizer::new(app_config.clone());
+            let brackets = optimizer.optimize(tournamentinfo, num_brackets, verbose);
+
+            println!();
+            for (i, bracket) in brackets.iter().enumerate() {
+                println!("\n=== Bracket {} ===", i + 1);
+                bracket.pretty_print();
+            }
+        }
     }
+}
+
+/// Run GA-based single bracket optimization
+fn run_ga_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    app_config: &Config,
+    scoring_config: &ScoringConfig,
+    verbose: bool,
+) {
+    println!();
+    println!("=== Genetic Algorithm Optimization ===");
+    println!("Population size: {}", app_config.ga.population_size);
+    println!("Generations: {}", app_config.ga.generations);
+    println!("Simulation pool size: {}", app_config.simulation.pool_size);
+    println!("Smart mutation: {}", app_config.ga.smart_mutation);
+    println!();
+
+    // Generate simulation pool
+    let pool = SimulationPool::new(
+        tournamentinfo,
+        app_config.simulation.pool_size,
+        scoring_config,
+    );
+
+    // Create and run GA
+    let mut ga = GeneticAlgorithm::new(
+        tournamentinfo,
+        app_config.ga.clone(),
+        *scoring_config,
+    );
+
+    let best_bracket = ga.run(tournamentinfo, &pool, verbose);
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+    best_bracket.pretty_print();
+
+    // Show score against simulation pool
+    let final_score = pool.score_bracket(&best_bracket, scoring_config);
+    println!("Average score against {} simulations: {:.2}", app_config.simulation.pool_size, final_score);
+}
+
+/// Run hybrid SA+GA single bracket optimization
+fn run_hybrid_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    app_config: &Config,
+    verbose: bool,
+) {
+    println!();
+    println!("=== Hybrid SA+GA Optimization ===");
+    println!("Generations: {}", app_config.ga.generations);
+    println!("Simulation pool size: {}", app_config.simulation.pool_size);
+    println!("Smart mutation: {}", app_config.ga.smart_mutation);
+    println!();
+
+    let optimizer = HybridOptimizer::new(app_config.clone());
+    let best_bracket = optimizer.optimize_single(tournamentinfo, verbose);
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+    best_bracket.pretty_print();
 }
 
 /// Run optimization with locked team constraints

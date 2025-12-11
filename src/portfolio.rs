@@ -459,16 +459,17 @@ impl BracketPortfolio {
     }
 
     /// Generate portfolio using Simulated Annealing optimization
+    /// Uses best-ball scoring against a Monte Carlo simulation pool
     pub fn generate_annealing_diverse(
         tournament: &TournamentInfo,
         num_brackets: usize,
-        diversity_weight: f64,
+        pool_size: usize,
         steps: usize,
         scoring_config: &ScoringConfig,
     ) -> Self {
         let config = AnnealingConfig {
             steps,
-            diversity_weight,
+            pool_size,
             ..Default::default()
         };
 
