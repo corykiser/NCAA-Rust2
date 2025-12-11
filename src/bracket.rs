@@ -1,6 +1,6 @@
 use rand::Rng;
 use std::sync::Arc;
-use crate::ingest::{Team, RcTeam, TournamentInfo};
+use crate::ingest::{Team, RcTeam, TournamentInfo, ProbabilityCache};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeedScoring {
@@ -75,6 +75,75 @@ impl Default for ScoreTable {
     }
 }
 
+/// Fast bracket representation using winner indices instead of Arc pointers
+/// Used for high-performance scoring in hot paths
+#[derive(Debug, Clone)]
+pub struct FastBracket {
+    /// Winner team index (0-63) for each of 63 games
+    pub winners: [u8; 63],
+    /// Winner seed for each game (for score calculation)
+    pub winner_seeds: [i32; 63],
+}
+
+impl FastBracket {
+    /// Create a FastBracket from a regular Bracket
+    pub fn from_bracket(bracket: &Bracket) -> Self {
+        let mut winners = [0u8; 63];
+        let mut winner_seeds = [0i32; 63];
+
+        for (i, game) in bracket.games.iter().enumerate() {
+            winners[i] = game.winner.team_index;
+            winner_seeds[i] = game.winner.seed;
+        }
+
+        FastBracket { winners, winner_seeds }
+    }
+
+    /// Score this bracket against another using pre-computed table
+    /// This is the optimized hot path
+    #[inline]
+    pub fn score_against(&self, other: &FastBracket, table: &ScoreTable) -> f64 {
+        let mut score: f64 = 0.0;
+
+        // Round 1 (games 0-31)
+        for i in 0..32 {
+            if self.winners[i] == other.winners[i] {
+                score += table.get(0, self.winner_seeds[i]);
+            }
+        }
+        // Round 2 (games 32-47)
+        for i in 32..48 {
+            if self.winners[i] == other.winners[i] {
+                score += table.get(1, self.winner_seeds[i]);
+            }
+        }
+        // Round 3 (games 48-55)
+        for i in 48..56 {
+            if self.winners[i] == other.winners[i] {
+                score += table.get(2, self.winner_seeds[i]);
+            }
+        }
+        // Round 4 (games 56-59)
+        for i in 56..60 {
+            if self.winners[i] == other.winners[i] {
+                score += table.get(3, self.winner_seeds[i]);
+            }
+        }
+        // Round 5 (games 60-61)
+        for i in 60..62 {
+            if self.winners[i] == other.winners[i] {
+                score += table.get(4, self.winner_seeds[i]);
+            }
+        }
+        // Round 6 (game 62)
+        if self.winners[62] == other.winners[62] {
+            score += table.get(5, self.winner_seeds[62]);
+        }
+
+        score
+    }
+}
+
 /// Game struct uses reference-counted Team pointers (RcTeam) to avoid
 /// cloning Team data. Arc::clone() is O(1) - just increments a counter.
 #[derive(Debug, Clone)]
@@ -85,7 +154,7 @@ pub struct Game {
     pub team2prob: f64,
     pub winnerprob: f64,
     pub winner: RcTeam,
-    pub hilo: bool, //did the lower seed (or the region first in alphabetical order win) win?
+    pub lower_seed_won: bool, //did the lower seed (or the region first in alphabetical order win) win?
 }
 
 
@@ -110,7 +179,7 @@ impl Game {
         };
 
         // Check if the regions are the same. If so, did the lower seed win? If not, did the region first in alphabetical order win?
-        let hilo: bool = if team1.region == team2.region {
+        let lower_seed_won: bool = if team1.region == team2.region {
             team1.seed < team2.seed
         } else {
             team1.region < team2.region
@@ -123,16 +192,49 @@ impl Game {
             team2prob,
             winnerprob,
             winner,
-            hilo,
+            lower_seed_won,
+        }
+    }
+
+    /// Simulate a game using pre-computed probabilities from cache.
+    /// Avoids expensive powf() call - uses O(1) lookup instead.
+    #[inline]
+    pub fn new_with_cache(team1: &RcTeam, team2: &RcTeam, cache: &ProbabilityCache) -> Game {
+        let team1prob = cache.get(team1.team_index, team2.team_index);
+        let team2prob = 1.0 - team1prob;
+
+        let mut rng = rand::thread_rng();
+        let rand_num: f64 = rng.gen();
+
+        let (winner, winnerprob) = if rand_num < team1prob {
+            (Arc::clone(team1), team1prob)
+        } else {
+            (Arc::clone(team2), team2prob)
+        };
+
+        let lower_seed_won: bool = if team1.region == team2.region {
+            team1.seed < team2.seed
+        } else {
+            team1.region < team2.region
+        };
+
+        Game {
+            team1: Arc::clone(team1),
+            team2: Arc::clone(team2),
+            team1prob,
+            team2prob,
+            winnerprob,
+            winner,
+            lower_seed_won,
         }
     }
     //TODO create a new_from_partial_binary() version of this that takes in a partial bracket and fills in the rest of the bracket
-    //You can use Some(hilo) and None in Vec<Option<bool>> to indicate if what parts need to be filled in
+    //You can use Some(lower_seed_won) and None in Vec<Option<bool>> to indicate if what parts need to be filled in
     //This would be useful for filling in the first round.
-    /// Create a game from binary (hilo) representation.
+    /// Create a game from binary (lower_seed_won) representation.
     /// Uses RcTeam to avoid cloning Team data - Arc::clone() is O(1).
-    pub fn new_from_binary(team1: &RcTeam, team2: &RcTeam, hilo: bool) -> Game {
-        // Determine winner based on hilo flag
+    pub fn new_from_binary(team1: &RcTeam, team2: &RcTeam, lower_seed_won: bool) -> Game {
+        // Determine winner based on lower_seed_won flag
         // Using references to avoid any cloning until we need to store
         let (low_seed_team, high_seed_team) = if team1.seed < team2.seed {
             (team1, team2)
@@ -146,11 +248,11 @@ impl Game {
             (team2, team1)
         };
 
-        // Select winner based on hilo and region match
+        // Select winner based on lower_seed_won and region match
         let winner: &RcTeam = if team1.region == team2.region {
-            if hilo { low_seed_team } else { high_seed_team }
+            if lower_seed_won { low_seed_team } else { high_seed_team }
         } else {
-            if hilo { low_alpha_team } else { high_alpha_team }
+            if lower_seed_won { low_alpha_team } else { high_alpha_team }
         };
 
         let rating_diff = team1.rating as f64 - team2.rating as f64;
@@ -170,7 +272,49 @@ impl Game {
             team2prob,
             winnerprob,
             winner: Arc::clone(winner),
-            hilo,
+            lower_seed_won,
+        }
+    }
+
+    /// Create a game from binary representation using pre-computed probabilities.
+    /// Avoids expensive powf() call - uses O(1) lookup instead.
+    #[inline]
+    pub fn new_from_binary_with_cache(team1: &RcTeam, team2: &RcTeam, lower_seed_won: bool, cache: &ProbabilityCache) -> Game {
+        let (low_seed_team, high_seed_team) = if team1.seed < team2.seed {
+            (team1, team2)
+        } else {
+            (team2, team1)
+        };
+
+        let (low_alpha_team, high_alpha_team) = if team1.region < team2.region {
+            (team1, team2)
+        } else {
+            (team2, team1)
+        };
+
+        let winner: &RcTeam = if team1.region == team2.region {
+            if lower_seed_won { low_seed_team } else { high_seed_team }
+        } else {
+            if lower_seed_won { low_alpha_team } else { high_alpha_team }
+        };
+
+        let team1prob = cache.get(team1.team_index, team2.team_index);
+        let team2prob = 1.0 - team1prob;
+
+        let winnerprob = if Arc::ptr_eq(winner, team1) {
+            team1prob
+        } else {
+            team2prob
+        };
+
+        Game {
+            team1: Arc::clone(team1),
+            team2: Arc::clone(team2),
+            team1prob,
+            team2prob,
+            winnerprob,
+            winner: Arc::clone(winner),
+            lower_seed_won,
         }
     }
     pub fn print(&self) {
@@ -266,9 +410,11 @@ impl Bracket{
     }
 
     /// Create a new random bracket using Monte Carlo simulation.
+    /// Uses pre-computed probability cache for O(1) win probability lookups.
     pub fn new(tournamentinfo: &TournamentInfo, config: Option<&ScoringConfig>) -> Bracket{
         let default_config = ScoringConfig::default();
         let config = config.unwrap_or(&default_config);
+        let cache = &tournamentinfo.prob_cache;
 
         // Preallocate vector for all games
         let mut games: Vec<Game> = Vec::with_capacity(63);
@@ -291,13 +437,13 @@ impl Bracket{
                 let team1 = tournamentinfo.get_team(region, matchup[0]);
                 let team2 = tournamentinfo.get_team(region, matchup[1]);
 
-                let game = Game::new(&team1, &team2);
+                let game = Game::new_with_cache(&team1, &team2, cache);
                 let win_score = Self::calculate_win_score(0, game.winner.seed, config);
 
                 prob *= game.winnerprob;
                 score += win_score;
                 expected_value += game.winnerprob * win_score;
-                binary.push(game.hilo);
+                binary.push(game.lower_seed_won);
                 games.push(game);
             }
         }
@@ -309,13 +455,13 @@ impl Bracket{
             for &(idx1, idx2) in &R2_INDICES {
                 let team1 = Arc::clone(&games[r1_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r1_start + offset + idx2].winner);
-                let game = Game::new(&team1, &team2);
+                let game = Game::new_with_cache(&team1, &team2, cache);
                 let win_score = Self::calculate_win_score(1, game.winner.seed, config);
 
                 prob *= game.winnerprob;
                 score += win_score;
                 expected_value += game.winnerprob * win_score;
-                binary.push(game.hilo);
+                binary.push(game.lower_seed_won);
                 games.push(game);
             }
         }
@@ -327,13 +473,13 @@ impl Bracket{
             for &(idx1, idx2) in &R3_INDICES {
                 let team1 = Arc::clone(&games[r2_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r2_start + offset + idx2].winner);
-                let game = Game::new(&team1, &team2);
+                let game = Game::new_with_cache(&team1, &team2, cache);
                 let win_score = Self::calculate_win_score(2, game.winner.seed, config);
 
                 prob *= game.winnerprob;
                 score += win_score;
                 expected_value += game.winnerprob * win_score;
-                binary.push(game.hilo);
+                binary.push(game.lower_seed_won);
                 games.push(game);
             }
         }
@@ -345,13 +491,13 @@ impl Bracket{
             for &(idx1, idx2) in &R4_INDICES {
                 let team1 = Arc::clone(&games[r3_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r3_start + offset + idx2].winner);
-                let game = Game::new(&team1, &team2);
+                let game = Game::new_with_cache(&team1, &team2, cache);
                 let win_score = Self::calculate_win_score(3, game.winner.seed, config);
 
                 prob *= game.winnerprob;
                 score += win_score;
                 expected_value += game.winnerprob * win_score;
-                binary.push(game.hilo);
+                binary.push(game.lower_seed_won);
                 games.push(game);
             }
         }
@@ -362,34 +508,34 @@ impl Bracket{
         let south_winner = Arc::clone(&games[r4_start + 2].winner);
         let midwest_winner = Arc::clone(&games[r4_start + 3].winner);
 
-        let game = Game::new(&south_winner, &midwest_winner);
+        let game = Game::new_with_cache(&south_winner, &midwest_winner, cache);
         let win_score = Self::calculate_win_score(4, game.winner.seed, config);
 
         prob *= game.winnerprob;
         score += win_score;
         expected_value += game.winnerprob * win_score;
-        binary.push(game.hilo);
+        binary.push(game.lower_seed_won);
         games.push(game);
 
         // East vs West
         let east_winner = Arc::clone(&games[r4_start + 0].winner);
         let west_winner = Arc::clone(&games[r4_start + 1].winner);
 
-        let game = Game::new(&east_winner, &west_winner);
+        let game = Game::new_with_cache(&east_winner, &west_winner, cache);
         // Recalculate win score for the winner of this game
         let win_score = Self::calculate_win_score(4, game.winner.seed, config);
 
         prob *= game.winnerprob;
         score += win_score;
         expected_value += game.winnerprob * win_score;
-        binary.push(game.hilo);
+        binary.push(game.lower_seed_won);
         games.push(game);
 
         // Championship game (Index 5)
         let r5_start = 60;
         let team1 = Arc::clone(&games[r5_start + 0].winner);
         let team2 = Arc::clone(&games[r5_start + 1].winner);
-        let game = Game::new(&team1, &team2);
+        let game = Game::new_with_cache(&team1, &team2, cache);
         let win_score = Self::calculate_win_score(5, game.winner.seed, config);
 
         prob *= game.winnerprob;
@@ -397,7 +543,7 @@ impl Bracket{
         expected_value += game.winnerprob * win_score;
 
         let tournament_winner = Arc::clone(&game.winner);
-        binary.push(game.hilo);
+        binary.push(game.lower_seed_won);
         games.push(game);
 
         debug_assert!(binary.len() == 63);
@@ -501,11 +647,13 @@ impl Bracket{
         score
     }
 
-    /// Create a bracket from a binary (hilo) representation.
+    /// Create a bracket from a binary (lower_seed_won) representation.
+    /// Uses pre-computed probability cache for O(1) win probability lookups.
     pub fn new_from_binary(tournamentinfo: &TournamentInfo, binary_slice: &[bool], config: Option<&ScoringConfig>) -> Bracket{
         assert!(binary_slice.len() == 63, "Binary slice must be 63 elements long");
         let default_config = ScoringConfig::default();
         let config = config.unwrap_or(&default_config);
+        let cache = &tournamentinfo.prob_cache;
 
         let mut games: Vec<Game> = Vec::with_capacity(63);
 
@@ -528,7 +676,7 @@ impl Bracket{
             for matchup in tournamentinfo.round1 {
                 let team1 = tournamentinfo.get_team(region, matchup[0]);
                 let team2 = tournamentinfo.get_team(region, matchup[1]);
-                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                let game = Game::new_from_binary_with_cache(&team1, &team2, binary_slice[idx], cache);
                 let win_score = Self::calculate_win_score(0, game.winner.seed, config);
 
                 idx += 1;
@@ -546,7 +694,7 @@ impl Bracket{
             for &(idx1, idx2) in &R2_INDICES {
                 let team1 = Arc::clone(&games[r1_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r1_start + offset + idx2].winner);
-                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                let game = Game::new_from_binary_with_cache(&team1, &team2, binary_slice[idx], cache);
                 let win_score = Self::calculate_win_score(1, game.winner.seed, config);
 
                 idx += 1;
@@ -564,7 +712,7 @@ impl Bracket{
             for &(idx1, idx2) in &R3_INDICES {
                 let team1 = Arc::clone(&games[r2_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r2_start + offset + idx2].winner);
-                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                let game = Game::new_from_binary_with_cache(&team1, &team2, binary_slice[idx], cache);
                 let win_score = Self::calculate_win_score(2, game.winner.seed, config);
 
                 idx += 1;
@@ -582,7 +730,7 @@ impl Bracket{
             for &(idx1, idx2) in &R4_INDICES {
                 let team1 = Arc::clone(&games[r3_start + offset + idx1].winner);
                 let team2 = Arc::clone(&games[r3_start + offset + idx2].winner);
-                let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+                let game = Game::new_from_binary_with_cache(&team1, &team2, binary_slice[idx], cache);
                 let win_score = Self::calculate_win_score(3, game.winner.seed, config);
 
                 idx += 1;
@@ -598,7 +746,7 @@ impl Bracket{
         let south_winner = Arc::clone(&games[r4_start + 2].winner);
         let midwest_winner = Arc::clone(&games[r4_start + 3].winner);
 
-        let game = Game::new_from_binary(&south_winner, &midwest_winner, binary_slice[idx]);
+        let game = Game::new_from_binary_with_cache(&south_winner, &midwest_winner, binary_slice[idx], cache);
         let win_score = Self::calculate_win_score(4, game.winner.seed, config);
 
         idx += 1;
@@ -611,7 +759,7 @@ impl Bracket{
         let east_winner = Arc::clone(&games[r4_start + 0].winner);
         let west_winner = Arc::clone(&games[r4_start + 1].winner);
 
-        let game = Game::new_from_binary(&east_winner, &west_winner, binary_slice[idx]);
+        let game = Game::new_from_binary_with_cache(&east_winner, &west_winner, binary_slice[idx], cache);
         // Same round index 4
         let win_score = Self::calculate_win_score(4, game.winner.seed, config);
 
@@ -625,7 +773,7 @@ impl Bracket{
         let r5_start = 60;
         let team1 = Arc::clone(&games[r5_start + 0].winner);
         let team2 = Arc::clone(&games[r5_start + 1].winner);
-        let game = Game::new_from_binary(&team1, &team2, binary_slice[idx]);
+        let game = Game::new_from_binary_with_cache(&team1, &team2, binary_slice[idx], cache);
         let win_score = Self::calculate_win_score(5, game.winner.seed, config);
 
         prob *= game.winnerprob;

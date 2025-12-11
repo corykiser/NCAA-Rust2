@@ -19,6 +19,9 @@ pub struct Team {
     pub seed: i32,
     pub region: String,
     pub rating: f32,
+    /// Index into tournament.teams array (0-63) for fast lookup
+    #[serde(default)]
+    pub team_index: u8,
 }
 
 impl Team {
@@ -28,6 +31,17 @@ impl Team {
             seed,
             region,
             rating,
+            team_index: 0, // Will be set when added to tournament
+        }
+    }
+
+    pub fn with_index(name: String, seed: i32, region: String, rating: f32, team_index: u8) -> Team {
+        Team {
+            name,
+            seed,
+            region,
+            rating,
+            team_index,
         }
     }
     pub fn print(&self) {
@@ -38,6 +52,42 @@ impl Team {
 impl PartialEq for Team {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+    }
+}
+
+/// Pre-computed win probabilities for all team pairs
+/// Avoids expensive powf() calls during bracket creation
+#[derive(Debug, Clone)]
+pub struct ProbabilityCache {
+    /// probs[team_a_idx][team_b_idx] = probability that team_a beats team_b
+    probs: [[f64; 64]; 64],
+}
+
+impl ProbabilityCache {
+    /// Create cache from team ratings
+    pub fn new(teams: &[RcTeam]) -> Self {
+        let mut probs = [[0.5f64; 64]; 64];
+
+        for (i, team_a) in teams.iter().enumerate() {
+            for (j, team_b) in teams.iter().enumerate() {
+                if i != j {
+                    let rating_diff = team_a.rating as f64 - team_b.rating as f64;
+                    probs[i][j] = 1.0 / (1.0 + 10.0f64.powf(-rating_diff * 30.464 / 400.0));
+                } else {
+                    probs[i][j] = 0.5; // Same team
+                }
+            }
+        }
+
+        ProbabilityCache { probs }
+    }
+
+    /// Get win probability for team_a vs team_b (using team indices)
+    #[inline(always)]
+    pub fn get(&self, team_a_idx: u8, team_b_idx: u8) -> f64 {
+        unsafe {
+            *self.probs.get_unchecked(team_a_idx as usize).get_unchecked(team_b_idx as usize)
+        }
     }
 }
 
@@ -52,6 +102,8 @@ pub struct TournamentInfo {
     /// Fast lookup map: (region, seed) -> RcTeam
     /// This avoids O(n) filtering in bracket construction
     pub team_lookup: HashMap<(String, i32), RcTeam>,
+    /// Pre-computed win probabilities for all team pairs
+    pub prob_cache: ProbabilityCache,
 }
 
 impl TournamentInfo {
@@ -120,12 +172,21 @@ impl TournamentInfo {
             } else {
                 seed[i] = mensrecords[i][16].parse().unwrap();
             }
-            //add team to the vector as Arc<Team>
-            let team = Arc::new(Team::new(name[i].clone(), seed[i] as i32, region[i].clone(), rating[i] as f32));
+            //add team to the vector as Arc<Team> with team_index
+            let team = Arc::new(Team::with_index(
+                name[i].clone(),
+                seed[i] as i32,
+                region[i].clone(),
+                rating[i] as f32,
+                i as u8,  // team_index
+            ));
             team_lookup.insert((region[i].clone(), seed[i] as i32), Arc::clone(&team));
             teams.push(team);
         }
         assert!(teams.len() == 64, "There are not 64 teams in the tournament");
+
+        // Create probability cache from teams
+        let prob_cache = ProbabilityCache::new(&teams);
 
         // Build region vectors using Arc::clone (cheap atomic reference counting, no data copy)
         let east: Vec<RcTeam> = teams.iter()
@@ -158,6 +219,7 @@ impl TournamentInfo {
             round4,
             regions,
             team_lookup,
+            prob_cache,
         }
     }
     pub fn print(&self) {
@@ -195,7 +257,7 @@ impl TournamentInfo {
         let mut team_lookup: HashMap<(String, i32), RcTeam> = HashMap::with_capacity(64);
 
         // Convert bracket teams to Team structs with ELO ratings
-        for bracket_team in &bracket_teams {
+        for (idx, bracket_team) in bracket_teams.iter().enumerate() {
             // Look up the team's ELO rating
             let rating = if let Some(elo_rating) = elo_system.find_team_by_name(&bracket_team.team_name) {
                 elo_system.to_538_scale(&elo_rating.team_id)
@@ -206,17 +268,21 @@ impl TournamentInfo {
                 75.0 // Middle-of-the-road default
             };
 
-            let team = Arc::new(Team::new(
+            let team = Arc::new(Team::with_index(
                 bracket_team.team_name.clone(),
                 bracket_team.seed,
                 bracket_team.region.clone(),
                 rating,
+                idx as u8,  // team_index
             ));
             team_lookup.insert((bracket_team.region.clone(), bracket_team.seed), Arc::clone(&team));
             teams.push(team);
         }
 
         assert!(teams.len() == 64, "There must be exactly 64 teams in the tournament");
+
+        // Create probability cache from teams
+        let prob_cache = ProbabilityCache::new(&teams);
 
         // Organize teams by region using Arc::clone (cheap atomic reference counting)
         let east: Vec<RcTeam> = teams.iter().filter(|x| x.region == "East").map(Arc::clone).collect();
@@ -234,6 +300,7 @@ impl TournamentInfo {
             round4,
             regions,
             team_lookup,
+            prob_cache,
         }
     }
 

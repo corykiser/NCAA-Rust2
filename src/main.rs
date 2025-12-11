@@ -14,7 +14,7 @@ use rand::Rng;
 use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder};
 use bracket::{ScoringConfig, SeedScoring};
 use config::Config;
-use ga::{GeneticAlgorithm, SequentialPortfolioOptimizer, HybridOptimizer, SimulationPool, WholePortfolioGA};
+use ga::{GeneticAlgorithm, SequentialPortfolioOptimizer, HybridOptimizer, MonteCarloScenarios, WholePortfolioGA};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
@@ -516,7 +516,7 @@ fn run_portfolio_mode(
             println!();
 
             // Generate simulation pool
-            let pool = SimulationPool::new(
+            let pool = MonteCarloScenarios::new(
                 tournamentinfo,
                 app_config.simulation.pool_size,
                 scoring_config,
@@ -592,7 +592,7 @@ fn run_ga_optimization(
     println!();
 
     // Generate simulation pool
-    let pool = SimulationPool::new(
+    let pool = MonteCarloScenarios::new(
         tournamentinfo,
         app_config.simulation.pool_size,
         scoring_config,

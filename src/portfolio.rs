@@ -160,7 +160,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
 
                 // Pick higher rated team (lower seed usually)
                 let pick_first = team1.rating >= team2.rating;
-                // hilo = true means lower seed wins
+                // lower_seed_won = true means lower seed wins
                 let lower_seed_first = team1.seed < team2.seed;
                 binary.push(pick_first == lower_seed_first);
             }
@@ -250,7 +250,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
             let idx = base + game_in_region;
             if idx < 32 {
                 // Set to make team win (depends on seed position)
-                binary[idx] = team.seed < 9; // Lower seeds are "true" in hilo
+                binary[idx] = team.seed < 9; // Lower seeds are "true" in lower_seed_won
             }
         }
 

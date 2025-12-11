@@ -1,5 +1,5 @@
 use crate::bracket::{Bracket, ScoringConfig};
-use crate::ga::SimulationPool;
+use crate::ga::MonteCarloScenarios;
 use crate::ingest::TournamentInfo;
 use crate::portfolio::BracketPortfolio;
 use rand::Rng;
@@ -42,7 +42,7 @@ pub fn optimize_portfolio(
     let mut rng = rand::thread_rng();
 
     println!("Generating simulation pool of {} brackets for scoring...", config.pool_size);
-    let pool = SimulationPool::new(tournament, config.pool_size, scoring_config);
+    let pool = MonteCarloScenarios::new(tournament, config.pool_size, scoring_config);
 
     // Initialize random portfolio
     let mut current_brackets: Vec<Bracket> = (0..num_brackets)
@@ -131,12 +131,12 @@ pub fn optimize_portfolio_smart(
     config: AnnealingConfig,
     scoring_config: &ScoringConfig,
 ) -> BracketPortfolio {
-    use crate::ga::SmartMutator;
+    use crate::ga::TeamRoundMutator;
 
     let mut rng = rand::thread_rng();
 
     println!("Generating simulation pool of {} brackets for scoring...", config.pool_size);
-    let pool = SimulationPool::new(tournament, config.pool_size, scoring_config);
+    let pool = MonteCarloScenarios::new(tournament, config.pool_size, scoring_config);
 
     // Initialize random portfolio
     let mut current_brackets: Vec<Bracket> = (0..num_brackets)
@@ -162,7 +162,7 @@ pub fn optimize_portfolio_smart(
 
         // Use smart mutation (80% of time) or bit-flip (20%)
         current_brackets[idx] = if rng.gen::<f64>() < 0.8 {
-            SmartMutator::mutate(&current_brackets[idx], tournament, scoring_config)
+            TeamRoundMutator::mutate(&current_brackets[idx], tournament, scoring_config)
         } else {
             current_brackets[idx].mutate(tournament, 3.0 / 63.0, Some(scoring_config))
         };

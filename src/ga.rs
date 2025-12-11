@@ -1,23 +1,28 @@
 // Genetic Algorithm module for NCAA Bracket Optimization
 // Implements proper population-based GA with smart mutation and best-ball scoring
 
-use crate::bracket::{Bracket, ScoringConfig, ScoreTable};
+use crate::bracket::{Bracket, ScoringConfig, ScoreTable, FastBracket};
 use crate::config::{Config, GaSettings};
 use crate::ingest::{RcTeam, TournamentInfo};
 use rand::Rng;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 /// Pre-generated pool of random brackets for scoring
 /// These represent possible tournament outcomes
+/// Uses FastBracket internally for high-performance scoring in the hot path
 #[derive(Clone)]
-pub struct SimulationPool {
+pub struct MonteCarloScenarios {
+    /// Full bracket objects (kept for debugging/inspection)
     pub brackets: Vec<Bracket>,
+    /// FastBracket versions for high-performance scoring (u8 winner indices)
+    pub fast_brackets: Vec<FastBracket>,
     pub size: usize,
     /// Pre-computed score lookup table for fast scoring
     pub score_table: ScoreTable,
 }
 
-impl SimulationPool {
+impl MonteCarloScenarios {
     /// Generate a new simulation pool with random brackets
     pub fn new(tournament: &TournamentInfo, size: usize, scoring_config: &ScoringConfig) -> Self {
         println!("Generating simulation pool of {} brackets...", size);
@@ -27,27 +32,36 @@ impl SimulationPool {
             .map(|_| Bracket::new(tournament, Some(scoring_config)))
             .collect();
 
+        // Convert to FastBrackets for high-performance scoring
+        let fast_brackets: Vec<FastBracket> = brackets
+            .par_iter()
+            .map(|b| FastBracket::from_bracket(b))
+            .collect();
+
         // Pre-compute score lookup table
         let score_table = ScoreTable::new(scoring_config);
 
         println!("Simulation pool generated.");
 
-        SimulationPool { brackets, size, score_table }
+        MonteCarloScenarios { brackets, fast_brackets, size, score_table }
     }
 
-    /// Score a single bracket against all simulations (fast version)
+    /// Score a single bracket against all simulations using FastBracket
     /// Returns the average score
     pub fn score_bracket(&self, bracket: &Bracket, _scoring_config: &ScoringConfig) -> f64 {
         let table = &self.score_table;
-        let total: f64 = self.brackets
+        // Convert input bracket to FastBracket once
+        let fast_bracket = FastBracket::from_bracket(bracket);
+
+        let total: f64 = self.fast_brackets
             .par_iter()
-            .map(|sim| bracket.score_fast(sim, table))
+            .map(|sim| fast_bracket.score_against(sim, table))
             .sum();
 
         total / self.size as f64
     }
 
-    /// Score a portfolio using best-ball metric (fast version)
+    /// Score a portfolio using best-ball metric with FastBracket
     /// For each simulation, take the max score among all portfolio brackets
     /// Return the average of these max scores
     pub fn score_portfolio_best_ball(
@@ -60,12 +74,19 @@ impl SimulationPool {
         }
 
         let table = &self.score_table;
-        let total: f64 = self.brackets
+
+        // Convert portfolio to FastBrackets once
+        let fast_portfolio: Vec<FastBracket> = portfolio
+            .iter()
+            .map(|b| FastBracket::from_bracket(b))
+            .collect();
+
+        let total: f64 = self.fast_brackets
             .par_iter()
             .map(|sim| {
-                portfolio
+                fast_portfolio
                     .iter()
-                    .map(|b| b.score_fast(sim, table))
+                    .map(|b| b.score_against(sim, table))
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
             })
@@ -74,9 +95,9 @@ impl SimulationPool {
         total / self.size as f64
     }
 
-    /// Score a bracket's marginal contribution to an existing portfolio (fast version)
+    /// Score a bracket's marginal contribution to an existing portfolio using FastBracket
     /// This is the increase in best-ball score when adding this bracket
-    pub fn score_marginal_contribution(
+    pub fn combined_best_ball(
         &self,
         bracket: &Bracket,
         existing_portfolio: &[Bracket],
@@ -87,16 +108,24 @@ impl SimulationPool {
         }
 
         let table = &self.score_table;
-        let total: f64 = self.brackets
+
+        // Convert to FastBrackets once
+        let fast_bracket = FastBracket::from_bracket(bracket);
+        let fast_portfolio: Vec<FastBracket> = existing_portfolio
+            .iter()
+            .map(|b| FastBracket::from_bracket(b))
+            .collect();
+
+        let total: f64 = self.fast_brackets
             .par_iter()
             .map(|sim| {
-                let existing_max = existing_portfolio
+                let existing_max = fast_portfolio
                     .iter()
-                    .map(|b| b.score_fast(sim, table))
+                    .map(|b| b.score_against(sim, table))
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0);
 
-                let new_score = bracket.score_fast(sim, table);
+                let new_score = fast_bracket.score_against(sim, table);
 
                 // Marginal contribution is how much better we do with this bracket
                 new_score.max(existing_max)
@@ -109,9 +138,9 @@ impl SimulationPool {
 
 /// Smart mutation operator
 /// Instead of random bit flips, selects a team and forces them to reach a specific round
-pub struct SmartMutator;
+pub struct TeamRoundMutator;
 
-impl SmartMutator {
+impl TeamRoundMutator {
     /// Perform a smart mutation on a bracket
     /// Picks a random team and random round, forces that team to advance to that round
     pub fn mutate(
@@ -160,17 +189,17 @@ impl SmartMutator {
 
         // For each round up to target_round-1, ensure the team wins
         for round in 1..=target_round {
-            if let Some((game_idx, should_win_hilo)) =
+            if let Some((game_idx, should_win_lower_seed_won)) =
                 Self::get_game_info_for_team(tournament, team, round, region_idx, &new_binary)
             {
-                new_binary[game_idx] = should_win_hilo;
+                new_binary[game_idx] = should_win_lower_seed_won;
             }
         }
 
         new_binary
     }
 
-    /// Get the game index and required hilo value for a team to win in a given round
+    /// Get the game index and required lower_seed_won value for a team to win in a given round
     fn get_game_info_for_team(
         tournament: &TournamentInfo,
         team: &RcTeam,
@@ -184,8 +213,8 @@ impl SmartMutator {
                 let game_in_region = Self::seed_to_r1_game(team.seed);
                 let game_idx = region_idx * 8 + game_in_region;
 
-                // hilo = true means lower seed wins
-                // Team should win, so hilo depends on whether team is lower seed
+                // lower_seed_won = true means lower seed wins
+                // Team should win, so lower_seed_won depends on whether team is lower seed
                 let matchup = tournament.round1[game_in_region];
                 let is_lower_seed = team.seed == matchup[0].min(matchup[1]);
 
@@ -196,9 +225,9 @@ impl SmartMutator {
                 let game_in_region = Self::seed_to_r2_game(team.seed);
                 let game_idx = 32 + region_idx * 4 + game_in_region;
 
-                // Need to determine if team is the "hilo" winner in this matchup
+                // Need to determine if team is the "lower_seed_won" winner in this matchup
                 // This depends on who won Round 1
-                let should_win = Self::should_be_hilo_winner(team, round, region_idx, game_in_region, current_binary, tournament);
+                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, game_in_region, current_binary, tournament);
 
                 Some((game_idx, should_win))
             }
@@ -207,7 +236,7 @@ impl SmartMutator {
                 let game_in_region = Self::seed_to_r3_game(team.seed);
                 let game_idx = 48 + region_idx * 2 + game_in_region;
 
-                let should_win = Self::should_be_hilo_winner(team, round, region_idx, game_in_region, current_binary, tournament);
+                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, game_in_region, current_binary, tournament);
 
                 Some((game_idx, should_win))
             }
@@ -215,7 +244,7 @@ impl SmartMutator {
                 // Elite 8: 1 game per region, starting at index 56
                 let game_idx = 56 + region_idx;
 
-                let should_win = Self::should_be_hilo_winner(team, round, region_idx, 0, current_binary, tournament);
+                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, 0, current_binary, tournament);
 
                 Some((game_idx, should_win))
             }
@@ -225,9 +254,9 @@ impl SmartMutator {
                 // Game 61: East vs West winners
                 let game_idx = if region_idx == 2 || region_idx == 3 { 60 } else { 61 };
 
-                // For cross-region games, hilo is based on alphabetical region order
+                // For cross-region games, lower_seed_won is based on alphabetical region order
                 // East < Midwest < South < West
-                let should_win = Self::should_be_hilo_winner_cross_region(team, region_idx);
+                let should_win = Self::should_be_lower_seed_won_winner_cross_region(team, region_idx);
 
                 Some((game_idx, should_win))
             }
@@ -240,7 +269,7 @@ impl SmartMutator {
                 // Alphabetically: East < Midwest < South < West
                 // Game 60 winner (South/Midwest) has regions 2,3
                 // Game 61 winner (East/West) has regions 0,1
-                // hilo = true means the "first" team wins
+                // lower_seed_won = true means the "first" team wins
                 // The "first" team in championship is from game 60 (South/Midwest)
                 // since South < West and Midwest < West but South > East...
                 // Actually the ordering is: East(0) vs West(1) -> winner at 61
@@ -251,7 +280,7 @@ impl SmartMutator {
                 // East < Midwest < South < West
                 // So if team is from South or Midwest, they're in game 60's bracket
                 // If team is from East or West, they're in game 61's bracket
-                // For hilo in championship: depends on which regions are playing
+                // For lower_seed_won in championship: depends on which regions are playing
 
                 Some((game_idx, should_win))
             }
@@ -259,8 +288,8 @@ impl SmartMutator {
         }
     }
 
-    /// Determine if team should be the hilo winner for a given round/game
-    fn should_be_hilo_winner(
+    /// Determine if team should be the lower_seed_won winner for a given round/game
+    fn should_be_lower_seed_won_winner(
         team: &RcTeam,
         _round: usize,
         _region_idx: usize,
@@ -268,21 +297,21 @@ impl SmartMutator {
         _current_binary: &[bool],
         _tournament: &TournamentInfo,
     ) -> bool {
-        // Within a region, hilo is based on seed (lower seed = true)
+        // Within a region, lower_seed_won is based on seed (lower seed = true)
         // This is a simplification - in reality we'd need to trace through
         // the bracket to see who the opponent is
         team.seed <= 8
     }
 
-    /// Determine hilo for cross-region games
-    fn should_be_hilo_winner_cross_region(team: &RcTeam, region_idx: usize) -> bool {
+    /// Determine lower_seed_won for cross-region games
+    fn should_be_lower_seed_won_winner_cross_region(team: &RcTeam, region_idx: usize) -> bool {
         // Alphabetical order: East(0) < Midwest(3) < South(2) < West(1)
         // Wait, that's not right. Let me fix:
         // East, Midwest, South, West -> alphabetically: East < Midwest < South < West
         // So region ordering should be: East(0)=0, Midwest(3)=1, South(2)=2, West(1)=3
         // For Final Four game 60 (South vs Midwest): Midwest < South, so Midwest is "first"
         // For Final Four game 61 (East vs West): East < West, so East is "first"
-        // hilo = true means the alphabetically first region wins
+        // lower_seed_won = true means the alphabetically first region wins
 
         match region_idx {
             0 => true,  // East is first vs West
@@ -388,7 +417,7 @@ impl GeneticAlgorithm {
     }
 
     /// Evaluate fitness for all individuals using simulation pool
-    pub fn evaluate_fitness(&mut self, pool: &SimulationPool) {
+    pub fn evaluate_fitness(&mut self, pool: &MonteCarloScenarios) {
         // Parallel fitness evaluation
         let fitnesses: Vec<f64> = self.population
             .par_iter()
@@ -414,13 +443,13 @@ impl GeneticAlgorithm {
     /// Evaluate fitness for portfolio mode (marginal contribution)
     pub fn evaluate_fitness_portfolio(
         &mut self,
-        pool: &SimulationPool,
+        pool: &MonteCarloScenarios,
         existing_portfolio: &[Bracket],
     ) {
         let fitnesses: Vec<f64> = self.population
             .par_iter()
             .map(|ind| {
-                pool.score_marginal_contribution(&ind.bracket, existing_portfolio, &self.scoring_config)
+                pool.combined_best_ball(&ind.bracket, existing_portfolio, &self.scoring_config)
             })
             .collect();
 
@@ -454,32 +483,69 @@ impl GeneticAlgorithm {
         best.unwrap()
     }
 
-    /// Uniform crossover - mix bits from two parents
+    /// Team-Round crossover - the genes are Team-Round pairs
+    /// 1. Start with one parent as the base
+    /// 2. Pick N Team-Round pairs that EXIST in the donor bracket
+    /// 3. Apply those Team-Round pairs to the child (force those teams to reach those rounds)
     fn crossover(parent1: &Bracket, parent2: &Bracket, tournament: &TournamentInfo, scoring_config: &ScoringConfig, rng: &mut impl Rng) -> Bracket {
-        let mut child_binary: Vec<bool> = Vec::with_capacity(63);
+        // Pick which parent is the base (50/50)
+        let (base, donor) = if rng.gen::<bool>() {
+            (parent1, parent2)
+        } else {
+            (parent2, parent1)
+        };
 
-        for i in 0..63 {
-            if rng.gen::<bool>() {
-                child_binary.push(parent1.binary[i]);
-            } else {
-                child_binary.push(parent2.binary[i]);
+        // Start with base parent's binary
+        let mut child_binary = base.binary.clone();
+
+        // Pick N Team-Round pairs from donor to inject (N = 1 to 4)
+        let num_injections = rng.gen_range(1..=4);
+
+        for _ in 0..num_injections {
+            // Pick a random round (1-6, but later rounds have fewer teams)
+            let round: usize = rng.gen_range(1..=6);
+
+            // Find a team that actually reached this round in the donor bracket
+            // by looking at the game winners
+            if let Some(team) = Self::get_team_at_round(donor, round, rng) {
+                // Apply this Team-Round pair to the child
+                child_binary = TeamRoundMutator::force_team_to_round(
+                    &child_binary,
+                    tournament,
+                    &team,
+                    round,
+                );
             }
         }
 
         Bracket::new_from_binary(tournament, &child_binary, Some(scoring_config))
     }
 
-    /// Bit-flip mutation
-    fn bit_flip_mutate(bracket: &Bracket, tournament: &TournamentInfo, scoring_config: &ScoringConfig, mutation_rate: f64, rng: &mut impl Rng) -> Bracket {
-        let mut new_binary = bracket.binary.clone();
+    /// Get a random team that reached a specific round in the bracket
+    fn get_team_at_round(bracket: &Bracket, round: usize, rng: &mut impl Rng) -> Option<RcTeam> {
+        // Game indices by round:
+        // Round 1: games 0-31 (32 winners)
+        // Round 2: games 32-47 (16 winners)
+        // Round 3: games 48-55 (8 winners - Sweet 16)
+        // Round 4: games 56-59 (4 winners - Elite 8)
+        // Round 5: games 60-61 (2 winners - Final Four)
+        // Round 6: game 62 (1 winner - Champion)
+        let (start, count) = match round {
+            1 => (0, 32),
+            2 => (32, 16),
+            3 => (48, 8),
+            4 => (56, 4),
+            5 => (60, 2),
+            6 => (62, 1),
+            _ => return None,
+        };
 
-        for bit in new_binary.iter_mut() {
-            if rng.gen::<f64>() < mutation_rate {
-                *bit = !*bit;
-            }
+        if count == 0 {
+            return None;
         }
 
-        Bracket::new_from_binary(tournament, &new_binary, Some(scoring_config))
+        let game_idx = start + rng.gen_range(0..count);
+        Some(Arc::clone(&bracket.games[game_idx].winner))
     }
 
     /// Run one generation of evolution
@@ -508,16 +574,11 @@ impl GeneticAlgorithm {
                 parent1.bracket.clone()
             };
 
-            // Mutation
+            // Mutation: Always use Team-Round mutation (TeamRoundMutator)
+            // Bit-flip mutation is semantically broken for brackets because
+            // flipping an early round bit cascades unpredictably to later rounds
             if rng.gen::<f64>() < self.settings.mutation_rate {
-                if self.settings.smart_mutation && rng.gen::<f64>() < self.settings.smart_mutation_rate {
-                    // Smart mutation
-                    child = SmartMutator::mutate(&child, tournament, &self.scoring_config);
-                } else {
-                    // Bit-flip mutation
-                    let bit_mutation_rate = 3.0 / 63.0; // ~3 bits on average
-                    child = Self::bit_flip_mutate(&child, tournament, &self.scoring_config, bit_mutation_rate, &mut rng);
-                }
+                child = TeamRoundMutator::mutate(&child, tournament, &self.scoring_config);
             }
 
             new_population.push(Individual::new(child));
@@ -531,7 +592,7 @@ impl GeneticAlgorithm {
     pub fn run(
         &mut self,
         tournament: &TournamentInfo,
-        pool: &SimulationPool,
+        pool: &MonteCarloScenarios,
         verbose: bool,
     ) -> Bracket {
         for gen in 0..self.settings.generations {
@@ -564,21 +625,30 @@ impl GeneticAlgorithm {
         })
     }
 
-    /// Run GA for portfolio mode (optimizing marginal contribution)
+    /// Run GA for portfolio mode (optimizing best-ball contribution)
+    /// For empty portfolio: fitness = average score (EV)
+    /// For non-empty portfolio: fitness = marginal contribution to best-ball score
     pub fn run_for_portfolio(
         &mut self,
         tournament: &TournamentInfo,
-        pool: &SimulationPool,
+        pool: &MonteCarloScenarios,
         existing_portfolio: &[Bracket],
         verbose: bool,
     ) -> Bracket {
+        let fitness_label = if existing_portfolio.is_empty() {
+            "Best-ball score"
+        } else {
+            "Marginal contribution"
+        };
+
         for gen in 0..self.settings.generations {
             self.evaluate_fitness_portfolio(pool, existing_portfolio);
 
             if verbose && gen % 20 == 0 {
                 println!(
-                    "Generation {}: Best marginal contribution = {:.2}",
+                    "Generation {}: {} = {:.2}",
                     gen,
+                    fitness_label,
                     self.best_fitness
                 );
             }
@@ -590,7 +660,8 @@ impl GeneticAlgorithm {
 
         if verbose {
             println!(
-                "Final: Best marginal contribution = {:.2}",
+                "Final: {} = {:.2}",
+                fitness_label,
                 self.best_fitness
             );
         }
@@ -670,7 +741,7 @@ impl WholePortfolioGA {
     }
 
     /// Evaluate fitness for all portfolios using best-ball scoring
-    pub fn evaluate_fitness(&mut self, pool: &SimulationPool) {
+    pub fn evaluate_fitness(&mut self, pool: &MonteCarloScenarios) {
         let fitnesses: Vec<f64> = self.population
             .par_iter()
             .map(|ind| pool.score_portfolio_best_ball(&ind.brackets, &self.scoring_config))
@@ -707,24 +778,87 @@ impl WholePortfolioGA {
         best.unwrap()
     }
 
-    /// Crossover two portfolios - swap random brackets between them
+    /// Crossover two portfolios using Team-Round crossover on each bracket
+    /// For each bracket position, do Team-Round crossover of the two parent brackets
     fn crossover(
         parent1: &PortfolioIndividual,
         parent2: &PortfolioIndividual,
+        tournament: &TournamentInfo,
+        scoring_config: &ScoringConfig,
         rng: &mut impl Rng,
     ) -> PortfolioIndividual {
         let mut child_brackets = Vec::with_capacity(parent1.brackets.len());
 
         for i in 0..parent1.brackets.len() {
-            // For each bracket position, pick from either parent
-            if rng.gen::<bool>() {
-                child_brackets.push(parent1.brackets[i].clone());
-            } else {
-                child_brackets.push(parent2.brackets[i].clone());
-            }
+            // Team-Round crossover for each bracket position
+            let child_bracket = Self::team_round_crossover_bracket(
+                &parent1.brackets[i],
+                &parent2.brackets[i],
+                tournament,
+                scoring_config,
+                rng,
+            );
+            child_brackets.push(child_bracket);
         }
 
         PortfolioIndividual::new(child_brackets)
+    }
+
+    /// Team-Round crossover for a single bracket
+    /// Takes Team-Round pairs from donor and applies them to base
+    fn team_round_crossover_bracket(
+        parent1: &Bracket,
+        parent2: &Bracket,
+        tournament: &TournamentInfo,
+        scoring_config: &ScoringConfig,
+        rng: &mut impl Rng,
+    ) -> Bracket {
+        // Pick which parent is the base (50/50)
+        let (base, donor) = if rng.gen::<bool>() {
+            (parent1, parent2)
+        } else {
+            (parent2, parent1)
+        };
+
+        let mut child_binary = base.binary.clone();
+
+        // Pick N Team-Round pairs from donor to inject (N = 1 to 4)
+        let num_injections = rng.gen_range(1..=4);
+
+        for _ in 0..num_injections {
+            let round: usize = rng.gen_range(1..=6);
+
+            if let Some(team) = Self::get_team_at_round(donor, round, rng) {
+                child_binary = TeamRoundMutator::force_team_to_round(
+                    &child_binary,
+                    tournament,
+                    &team,
+                    round,
+                );
+            }
+        }
+
+        Bracket::new_from_binary(tournament, &child_binary, Some(scoring_config))
+    }
+
+    /// Get a random team that reached a specific round in the bracket
+    fn get_team_at_round(bracket: &Bracket, round: usize, rng: &mut impl Rng) -> Option<RcTeam> {
+        let (start, count) = match round {
+            1 => (0, 32),
+            2 => (32, 16),
+            3 => (48, 8),
+            4 => (56, 4),
+            5 => (60, 2),
+            6 => (62, 1),
+            _ => return None,
+        };
+
+        if count == 0 {
+            return None;
+        }
+
+        let game_idx = start + rng.gen_range(0..count);
+        Some(Arc::clone(&bracket.games[game_idx].winner))
     }
 
     /// Mutate a portfolio - apply smart mutation to one random bracket
@@ -740,7 +874,7 @@ impl WholePortfolioGA {
         let idx = rng.gen_range(0..new_brackets.len());
 
         // Apply smart mutation
-        new_brackets[idx] = SmartMutator::mutate(&new_brackets[idx], tournament, scoring_config);
+        new_brackets[idx] = TeamRoundMutator::mutate(&new_brackets[idx], tournament, scoring_config);
 
         PortfolioIndividual::new(new_brackets)
     }
@@ -763,14 +897,14 @@ impl WholePortfolioGA {
             let parent1 = self.tournament_select(&mut rng);
             let parent2 = self.tournament_select(&mut rng);
 
-            // Crossover
+            // Crossover using region-based bracket crossover
             let mut child = if rng.gen::<f64>() < self.settings.crossover_rate {
-                Self::crossover(parent1, parent2, &mut rng)
+                Self::crossover(parent1, parent2, tournament, &self.scoring_config, &mut rng)
             } else {
                 parent1.clone()
             };
 
-            // Mutation
+            // Mutation: always use Team-Round mutation (TeamRoundMutator)
             if rng.gen::<f64>() < self.settings.mutation_rate {
                 child = Self::mutate(&child, tournament, &self.scoring_config, &mut rng);
             }
@@ -786,7 +920,7 @@ impl WholePortfolioGA {
     pub fn run(
         &mut self,
         tournament: &TournamentInfo,
-        pool: &SimulationPool,
+        pool: &MonteCarloScenarios,
         verbose: bool,
     ) -> Vec<Bracket> {
         for gen in 0..self.settings.generations {
@@ -834,7 +968,7 @@ impl SequentialPortfolioOptimizer {
         verbose: bool,
     ) -> Vec<Bracket> {
         // Generate simulation pool once
-        let pool = SimulationPool::new(
+        let pool = MonteCarloScenarios::new(
             tournament,
             self.config.simulation.pool_size,
             &self.scoring_config,
@@ -852,14 +986,10 @@ impl SequentialPortfolioOptimizer {
                 self.scoring_config,
             );
 
-            // Optimize for marginal contribution to existing portfolio
-            let bracket = if i == 0 {
-                // First bracket: optimize for raw score
-                ga.run(tournament, &pool, verbose)
-            } else {
-                // Subsequent brackets: optimize for marginal contribution
-                ga.run_for_portfolio(tournament, &pool, &portfolio, verbose)
-            };
+            // Always optimize for best-ball contribution to portfolio
+            // For first bracket, this is equivalent to EV, but keeps the fitness semantics consistent
+            // For subsequent brackets, this is marginal contribution to existing portfolio
+            let bracket = ga.run_for_portfolio(tournament, &pool, &portfolio, verbose);
 
             // Calculate and display best-ball score
             let portfolio_with_new: Vec<Bracket> = portfolio.iter()
@@ -925,7 +1055,7 @@ impl HybridOptimizer {
         tournament: &TournamentInfo,
         verbose: bool,
     ) -> Bracket {
-        let pool = SimulationPool::new(
+        let pool = MonteCarloScenarios::new(
             tournament,
             self.config.simulation.pool_size,
             &self.scoring_config,
@@ -947,13 +1077,9 @@ impl HybridOptimizer {
         let mut temperature = initial_temp;
 
         for gen in 0..self.config.ga.generations {
-            // Generate neighbor using smart mutation or bit flip
-            let neighbor = if self.config.ga.smart_mutation && rng.gen::<f64>() < self.config.ga.smart_mutation_rate {
-                SmartMutator::mutate(&current, tournament, &self.scoring_config)
-            } else {
-                let bit_mutation_rate = 3.0 / 63.0;
-                GeneticAlgorithm::bit_flip_mutate(&current, tournament, &self.scoring_config, bit_mutation_rate, &mut rng)
-            };
+            // Generate neighbor using Team-Round mutation (TeamRoundMutator)
+            // Bit-flip mutation is semantically broken for brackets
+            let neighbor = TeamRoundMutator::mutate(&current, tournament, &self.scoring_config);
 
             let neighbor_score = pool.score_bracket(&neighbor, &self.scoring_config);
 
@@ -999,8 +1125,8 @@ mod tests {
     use super::*;
 
     // Tests would go here - skipping for brevity but would test:
-    // - SimulationPool generation and scoring
-    // - SmartMutator producing valid brackets
+    // - MonteCarloScenarios generation and scoring
+    // - TeamRoundMutator producing valid brackets
     // - GA selection, crossover, mutation
     // - Sequential portfolio optimization
 }
