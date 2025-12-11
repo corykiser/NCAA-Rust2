@@ -1,4 +1,4 @@
-use crate::bracket::Bracket;
+use crate::bracket::{Bracket, ScoringConfig};
 use crate::ingest::TournamentInfo;
 use crate::portfolio::BracketPortfolio;
 use rand::Rng;
@@ -25,15 +25,16 @@ pub fn optimize_portfolio(
     tournament: &TournamentInfo,
     num_brackets: usize,
     config: AnnealingConfig,
+    scoring_config: &ScoringConfig,
 ) -> BracketPortfolio {
     let mut rng = rand::thread_rng();
 
     // Initialize random portfolio
     let mut current_brackets: Vec<Bracket> = (0..num_brackets)
-        .map(|_| Bracket::new(tournament)) // Random brackets
+        .map(|_| Bracket::new(tournament, Some(scoring_config))) // Random brackets
         .collect();
 
-    let mut current_score = calculate_portfolio_score(&current_brackets, config.diversity_weight);
+    let mut current_score = calculate_portfolio_score(&current_brackets, config.diversity_weight, scoring_config);
 
     let mut best_brackets = current_brackets.clone();
     let mut best_score = current_score;
@@ -51,9 +52,9 @@ pub fn optimize_portfolio(
         // Mutate
         // Using a small mutation rate to make local moves
         let mutation_rate = 1.0 / 63.0 * 3.0;
-        current_brackets[idx] = current_brackets[idx].mutate(tournament, mutation_rate);
+        current_brackets[idx] = current_brackets[idx].mutate(tournament, mutation_rate, Some(scoring_config));
 
-        let new_score = calculate_portfolio_score(&current_brackets, config.diversity_weight);
+        let new_score = calculate_portfolio_score(&current_brackets, config.diversity_weight, scoring_config);
 
         // Accept or reject
         if new_score > current_score {
@@ -84,7 +85,7 @@ pub fn optimize_portfolio(
     portfolio
 }
 
-fn calculate_portfolio_score(brackets: &[Bracket], diversity_weight: f64) -> f64 {
+fn calculate_portfolio_score(brackets: &[Bracket], diversity_weight: f64, scoring_config: &ScoringConfig) -> f64 {
     let total_ev: f64 = brackets.iter().map(|b| b.expected_value).sum();
     let avg_ev = total_ev / brackets.len() as f64;
 
@@ -103,7 +104,7 @@ fn calculate_portfolio_score(brackets: &[Bracket], diversity_weight: f64) -> f64
     for i in 0..brackets.len() {
         for j in (i+1)..brackets.len() {
             // weighted_distance returns a struct. We use total_distance.
-            total_dist += brackets[i].weighted_distance(&brackets[j]).total_distance;
+            total_dist += brackets[i].weighted_distance(&brackets[j], Some(scoring_config)).total_distance;
             count += 1;
         }
     }

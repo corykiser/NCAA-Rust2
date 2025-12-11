@@ -10,6 +10,7 @@ mod anneal;
 use clap::{Parser, ValueEnum};
 use rand::Rng;
 use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder};
+use bracket::{ScoringConfig, SeedScoring};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
@@ -99,6 +100,58 @@ struct Args {
     /// Can be specified multiple times
     #[arg(long)]
     lock_team: Vec<String>,
+
+    // Scoring Configuration
+
+    /// Points for Round 1
+    #[arg(long, default_value = "1.0")]
+    score_r1: f64,
+    /// Points for Round 2
+    #[arg(long, default_value = "2.0")]
+    score_r2: f64,
+    /// Points for Round 3 (Sweet 16)
+    #[arg(long, default_value = "4.0")]
+    score_r3: f64,
+    /// Points for Round 4 (Elite 8)
+    #[arg(long, default_value = "8.0")]
+    score_r4: f64,
+    /// Points for Round 5 (Final Four)
+    #[arg(long, default_value = "16.0")]
+    score_r5: f64,
+    /// Points for Round 6 (Championship)
+    #[arg(long, default_value = "32.0")]
+    score_r6: f64,
+
+    /// Seed scoring mode for R1 (add, multiply, none)
+    #[arg(long, default_value = "add")]
+    seed_r1: String,
+    /// Seed scoring mode for R2
+    #[arg(long, default_value = "add")]
+    seed_r2: String,
+    /// Seed scoring mode for R3
+    #[arg(long, default_value = "add")]
+    seed_r3: String,
+    /// Seed scoring mode for R4
+    #[arg(long, default_value = "multiply")]
+    seed_r4: String,
+    /// Seed scoring mode for R5
+    #[arg(long, default_value = "multiply")]
+    seed_r5: String,
+    /// Seed scoring mode for R6
+    #[arg(long, default_value = "multiply")]
+    seed_r6: String,
+}
+
+fn parse_seed_mode(s: &str) -> SeedScoring {
+    match s.to_lowercase().as_str() {
+        "add" => SeedScoring::Add,
+        "multiply" | "mult" => SeedScoring::Multiply,
+        "none" | "off" => SeedScoring::None,
+        _ => {
+            eprintln!("Warning: Unknown seed mode '{}', defaulting to None", s);
+            SeedScoring::None
+        }
+    }
 }
 
 fn main() {
@@ -106,6 +159,39 @@ fn main() {
 
     println!("NCAA Bracket Optimizer");
     println!("======================");
+    println!();
+
+    // Construct ScoringConfig from args
+    let scoring_config = ScoringConfig {
+        round_scores: [
+            args.score_r1,
+            args.score_r2,
+            args.score_r3,
+            args.score_r4,
+            args.score_r5,
+            args.score_r6,
+        ],
+        round_seed_scoring: [
+            parse_seed_mode(&args.seed_r1),
+            parse_seed_mode(&args.seed_r2),
+            parse_seed_mode(&args.seed_r3),
+            parse_seed_mode(&args.seed_r4),
+            parse_seed_mode(&args.seed_r5),
+            parse_seed_mode(&args.seed_r6),
+        ],
+    };
+
+    // Print config if not default
+    let default_config = ScoringConfig::default();
+    // Simple check - in a real app might implement PartialEq properly
+    // but here we just show it if user provided any flags that differ from current defaults
+    println!("Scoring Configuration:");
+    println!("  R1: {} ({:?})", scoring_config.round_scores[0], scoring_config.round_seed_scoring[0]);
+    println!("  R2: {} ({:?})", scoring_config.round_scores[1], scoring_config.round_seed_scoring[1]);
+    println!("  R3: {} ({:?})", scoring_config.round_scores[2], scoring_config.round_seed_scoring[2]);
+    println!("  R4: {} ({:?})", scoring_config.round_scores[3], scoring_config.round_seed_scoring[3]);
+    println!("  R5: {} ({:?})", scoring_config.round_scores[4], scoring_config.round_seed_scoring[4]);
+    println!("  R6: {} ({:?})", scoring_config.round_scores[5], scoring_config.round_seed_scoring[5]);
     println!();
 
     let tournamentinfo = match args.source {
@@ -223,13 +309,14 @@ fn main() {
             &constraints,
             args.generations,
             args.anneal_steps,
+            &scoring_config,
         );
     } else if !constraints.is_empty() {
         // Run single bracket with constraints
-        run_constrained_optimization(&tournamentinfo, &constraints, args.generations, args.batch_size);
+        run_constrained_optimization(&tournamentinfo, &constraints, args.generations, args.batch_size, &scoring_config);
     } else {
         // Run standard bracket optimization
-        run_optimization(&tournamentinfo, args.generations, args.batch_size);
+        run_optimization(&tournamentinfo, args.generations, args.batch_size, &scoring_config);
     }
 }
 
@@ -276,6 +363,7 @@ fn run_portfolio_mode(
     constraints: &[BracketConstraint],
     generations: u32,
     anneal_steps: usize,
+    scoring_config: &ScoringConfig,
 ) {
     println!();
     println!("=== Portfolio Mode ===");
@@ -293,7 +381,7 @@ fn run_portfolio_mode(
 
     let portfolio = match strategy {
         PortfolioStrategy::Champion => {
-            BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets)
+            BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config)
         }
         PortfolioStrategy::Diverse => {
             BracketPortfolio::generate_greedy_diverse(
@@ -301,6 +389,7 @@ fn run_portfolio_mode(
                 num_brackets,
                 diversity_weight,
                 generations,
+                scoring_config,
             )
         }
         PortfolioStrategy::Annealing => {
@@ -310,12 +399,13 @@ fn run_portfolio_mode(
                 num_brackets,
                 diversity_weight,
                 anneal_steps,
+                scoring_config,
             )
         }
     };
 
-    portfolio.print_summary();
-    portfolio.print_pairwise_distances();
+    portfolio.print_summary_with_config(Some(scoring_config));
+    portfolio.print_pairwise_distances(scoring_config);
 
     // Print each bracket in detail
     for (i, bracket) in portfolio.brackets.iter().enumerate() {
@@ -330,6 +420,7 @@ fn run_constrained_optimization(
     constraints: &[BracketConstraint],
     generations: u32,
     batch_size: i32,
+    scoring_config: &ScoringConfig,
 ) {
     println!();
     println!("=== Constrained Bracket Mode ===");
@@ -337,7 +428,7 @@ fn run_constrained_optimization(
     println!();
 
     // Build initial bracket with constraints
-    let mut builder = ConstrainedBracketBuilder::new(tournamentinfo);
+    let mut builder = ConstrainedBracketBuilder::new(tournamentinfo, scoring_config);
     for constraint in constraints {
         builder = builder.with_constraint(constraint.clone());
     }
@@ -355,11 +446,11 @@ fn run_constrained_optimization(
             let mutation_rate = 1.0 / 63.0 * 3.0;
 
             // Create batch for scoring
-            let mut batch = pool::Batch::new(tournamentinfo, batch_size);
+            let mut batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
 
             for i in 0..generations {
                 // Create mutated child
-                let child = max_bracket.mutate(tournamentinfo, mutation_rate);
+                let child = max_bracket.mutate(tournamentinfo, mutation_rate, Some(scoring_config));
 
                 // Score against batch
                 batch.score_against_ref(&child);
@@ -384,7 +475,7 @@ fn run_constrained_optimization(
     }
 }
 
-fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, batch_size: i32) {
+fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, batch_size: i32, scoring_config: &ScoringConfig) {
     let mut random_63_bool: Vec<bool> = Vec::new();
     for _i in 0..63 {
         let mut rng = rand::thread_rng();
@@ -393,7 +484,7 @@ fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, b
     }
 
     // Start with a bracket that is a likely scenario
-    let generated_bracket = bracket::Bracket::new(tournamentinfo);
+    let generated_bracket = bracket::Bracket::new(tournamentinfo, Some(scoring_config));
 
     let num_children = 63;
     let mut mutation_rate = 1.0 / 63.0 * 5.0;
@@ -403,7 +494,7 @@ fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, b
     let mut max_bracket = generated_bracket.clone();
 
     // Create a batch of random brackets to score against
-    let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size);
+    let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
 
     // For tracking the moving average
     let mut moving_average_tracker: Vec<f64> = Vec::new();
@@ -427,10 +518,10 @@ fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, b
         }
 
         // Create a batch of random brackets to score against for this round
-        let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size);
+        let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
 
         // Score the batch against the generated bracket
-        let mut children = max_bracket.create_n_children(tournamentinfo, num_children, mutation_rate);
+        let mut children = max_bracket.create_n_children(tournamentinfo, num_children, mutation_rate, Some(scoring_config));
 
         let last_max_bracket = max_bracket.clone();
 

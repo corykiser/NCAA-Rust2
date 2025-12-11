@@ -1,7 +1,7 @@
 // Portfolio generation for diverse bracket strategies
 // Supports constrained bracket building and champion-stratified portfolios
 
-use crate::bracket::Bracket;
+use crate::bracket::{Bracket, ScoringConfig, SeedScoring};
 use crate::ingest::{Team, RcTeam, TournamentInfo};
 use crate::anneal::{self, AnnealingConfig};
 use std::sync::Arc;
@@ -62,13 +62,15 @@ impl BracketConstraint {
 pub struct ConstrainedBracketBuilder<'a> {
     tournament: &'a TournamentInfo,
     constraints: Vec<BracketConstraint>,
+    scoring_config: &'a ScoringConfig,
 }
 
 impl<'a> ConstrainedBracketBuilder<'a> {
-    pub fn new(tournament: &'a TournamentInfo) -> Self {
+    pub fn new(tournament: &'a TournamentInfo, scoring_config: &'a ScoringConfig) -> Self {
         ConstrainedBracketBuilder {
             tournament,
             constraints: Vec::new(),
+            scoring_config,
         }
     }
 
@@ -110,7 +112,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
     /// Constrained games are set deterministically, others use probability
     pub fn build(&self) -> Result<Bracket, String> {
         // First, generate a random bracket as base
-        let mut bracket = Bracket::new(self.tournament);
+        let mut bracket = Bracket::new(self.tournament, Some(self.scoring_config));
 
         // Apply each constraint
         for constraint in &self.constraints {
@@ -141,7 +143,7 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         }
 
         // Build bracket from binary (pass slice instead of Vec)
-        let bracket = Bracket::new_from_binary(self.tournament, &binary);
+        let bracket = Bracket::new_from_binary(self.tournament, &binary, Some(self.scoring_config));
         Ok(bracket)
     }
 
@@ -307,56 +309,75 @@ impl<'a> ConstrainedBracketBuilder<'a> {
     }
 
     /// Recalculate bracket statistics after modifications
+    /// Uses the scoring config helper from Bracket
     fn recalculate_bracket_stats(&self, bracket: &mut Bracket) {
         let mut prob = 1.0;
         let mut score = 0.0;
         let mut expected_value = 0.0;
+        let config = self.scoring_config;
 
         // Round 1
         for game in &bracket.games[0..32] {
             prob *= game.winnerprob;
-            score += 1.0 + game.winner.seed as f64;
-            expected_value += game.winnerprob * (1.0 + game.winner.seed as f64);
+            let win_score = self.calculate_win_score(0, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         // Round 2
         for game in &bracket.games[32..48] {
             prob *= game.winnerprob;
-            score += 2.0 + game.winner.seed as f64;
-            expected_value += game.winnerprob * (2.0 + game.winner.seed as f64);
+            let win_score = self.calculate_win_score(1, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         // Round 3
         for game in &bracket.games[48..56] {
             prob *= game.winnerprob;
-            score += 4.0 + game.winner.seed as f64;
-            expected_value += game.winnerprob * (4.0 + game.winner.seed as f64);
+            let win_score = self.calculate_win_score(2, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         // Round 4
         for game in &bracket.games[56..60] {
             prob *= game.winnerprob;
-            score += 8.0 * game.winner.seed as f64;
-            expected_value += game.winnerprob * (8.0 * game.winner.seed as f64);
+            let win_score = self.calculate_win_score(3, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         // Round 5
         for game in &bracket.games[60..62] {
             prob *= game.winnerprob;
-            score += 16.0 * game.winner.seed as f64;
-            expected_value += game.winnerprob * (16.0 * game.winner.seed as f64);
+            let win_score = self.calculate_win_score(4, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         // Round 6
         for game in &bracket.games[62..63] {
             prob *= game.winnerprob;
-            score += 32.0 * game.winner.seed as f64;
-            expected_value += game.winnerprob * (32.0 * game.winner.seed as f64);
+            let win_score = self.calculate_win_score(5, game.winner.seed, config);
+            score += win_score;
+            expected_value += game.winnerprob * win_score;
         }
 
         bracket.prob = prob;
         bracket.score = score;
         bracket.expected_value = expected_value;
+    }
+
+    // Helper to calculate score - duplicating logic from Bracket to avoid making Bracket::calculate_win_score public if it isn't
+    // Actually, I can just copy the logic here, it's simple enough
+    fn calculate_win_score(&self, round_idx: usize, seed: i32, config: &ScoringConfig) -> f64 {
+        let base_score = config.round_scores[round_idx];
+        match config.round_seed_scoring[round_idx] {
+            SeedScoring::Add => base_score + seed as f64,
+            SeedScoring::Multiply => base_score * seed as f64,
+            SeedScoring::None => base_score,
+        }
     }
 }
 
@@ -380,6 +401,7 @@ impl BracketPortfolio {
     pub fn generate_champion_stratified(
         tournament: &TournamentInfo,
         num_brackets: usize,
+        scoring_config: &ScoringConfig,
     ) -> Self {
         let mut portfolio = BracketPortfolio::new();
 
@@ -392,7 +414,7 @@ impl BracketPortfolio {
         for team in ranked_teams.iter().take(num_brackets) {
             let constraint = BracketConstraint::champion(&team.name);
 
-            let builder = ConstrainedBracketBuilder::new(tournament)
+            let builder = ConstrainedBracketBuilder::new(tournament, scoring_config)
                 .with_constraint(constraint.clone());
 
             match builder.build() {
@@ -416,16 +438,17 @@ impl BracketPortfolio {
         num_brackets: usize,
         diversity_weight: f64,
         generations: u32,
+        scoring_config: &ScoringConfig,
     ) -> Self {
         let mut portfolio = BracketPortfolio::new();
 
         for i in 0..num_brackets {
             let bracket = if i == 0 {
                 // First bracket: pure optimization
-                optimize_bracket(tournament, generations)
+                optimize_bracket(tournament, generations, scoring_config)
             } else {
                 // Subsequent brackets: optimize with diversity penalty
-                optimize_with_diversity(tournament, &portfolio.brackets, diversity_weight, generations)
+                optimize_with_diversity(tournament, &portfolio.brackets, diversity_weight, generations, scoring_config)
             };
 
             portfolio.brackets.push(bracket);
@@ -441,6 +464,7 @@ impl BracketPortfolio {
         num_brackets: usize,
         diversity_weight: f64,
         steps: usize,
+        scoring_config: &ScoringConfig,
     ) -> Self {
         let config = AnnealingConfig {
             steps,
@@ -448,11 +472,11 @@ impl BracketPortfolio {
             ..Default::default()
         };
 
-        anneal::optimize_portfolio(tournament, num_brackets, config)
+        anneal::optimize_portfolio(tournament, num_brackets, config, scoring_config)
     }
 
     /// Calculate statistics about the portfolio
-    pub fn stats(&self) -> PortfolioStats {
+    pub fn stats(&self, scoring_config: Option<&ScoringConfig>) -> PortfolioStats {
         if self.brackets.is_empty() {
             return PortfolioStats::default();
         }
@@ -469,7 +493,10 @@ impl BracketPortfolio {
 
         for i in 0..self.brackets.len() {
             for j in (i + 1)..self.brackets.len() {
-                let dist = self.brackets[i].weighted_distance(&self.brackets[j]);
+                // Use the provided scoring config for weighted distance stats
+                // If None, it will use the default config inside weighted_distance, which is a fallback
+                // but ideally the caller should pass the correct config.
+                let dist = self.brackets[i].weighted_distance(&self.brackets[j], scoring_config);
                 total_similarity += dist.similarity;
                 if dist.similarity < min_similarity {
                     min_similarity = dist.similarity;
@@ -503,7 +530,22 @@ impl BracketPortfolio {
 
     /// Pretty print portfolio summary
     pub fn print_summary(&self) {
-        let stats = self.stats();
+        // Warning: This prints stats using default scoring if called without config
+        // But the method signature doesn't take config for now to avoid breaking other calls if any.
+        // Wait, I can update the signature since I'm editing the file.
+        // But main.rs calls it. I should update main.rs too or just make stats take Option.
+        // Let's make stats take Option<&ScoringConfig> and print_summary rely on that.
+        // For print_summary, I probably can't easily change the signature without updating callers.
+        // Let's see: main.rs calls it. I can update main.rs.
+
+        // Actually, print_summary uses self.stats().
+        // I'll update print_summary to take the config.
+        eprintln!("Warning: print_summary called without config, using defaults for stats.");
+        self.print_summary_with_config(None);
+    }
+
+    pub fn print_summary_with_config(&self, scoring_config: Option<&ScoringConfig>) {
+        let stats = self.stats(scoring_config);
 
         println!("\n=== Bracket Portfolio Summary ===");
         println!("Number of brackets: {}", stats.num_brackets);
@@ -522,11 +564,12 @@ impl BracketPortfolio {
     }
 
     /// Print detailed comparison between brackets
-    pub fn print_pairwise_distances(&self) {
+    pub fn print_pairwise_distances(&self, scoring_config: &ScoringConfig) {
         println!("\n=== Pairwise Bracket Distances ===");
         for i in 0..self.brackets.len() {
             for j in (i + 1)..self.brackets.len() {
-                let dist = self.brackets[i].weighted_distance(&self.brackets[j]);
+                // Use actual scoring config for distance
+                let dist = self.brackets[i].weighted_distance(&self.brackets[j], Some(scoring_config));
                 println!("Brackets {} vs {}: Similarity = {:.1}%, Champion match = {}",
                          i + 1, j + 1, dist.similarity * 100.0, dist.champion_match);
             }
@@ -546,12 +589,12 @@ pub struct PortfolioStats {
 }
 
 /// Optimize a single bracket using genetic algorithm
-fn optimize_bracket(tournament: &TournamentInfo, generations: u32) -> Bracket {
-    let mut bracket = Bracket::new(tournament);
+fn optimize_bracket(tournament: &TournamentInfo, generations: u32, scoring_config: &ScoringConfig) -> Bracket {
+    let mut bracket = Bracket::new(tournament, Some(scoring_config));
     let mutation_rate = 1.0 / 63.0 * 3.0;
 
     for _ in 0..generations {
-        let child = bracket.mutate(tournament, mutation_rate);
+        let child = bracket.mutate(tournament, mutation_rate, Some(scoring_config));
         if child.expected_value > bracket.expected_value {
             bracket = child;
         }
@@ -566,14 +609,15 @@ fn optimize_with_diversity(
     existing: &[Bracket],
     diversity_weight: f64,
     generations: u32,
+    scoring_config: &ScoringConfig,
 ) -> Bracket {
-    let mut best_bracket = Bracket::new(tournament);
-    let mut best_score = fitness_with_diversity(&best_bracket, existing, diversity_weight);
+    let mut best_bracket = Bracket::new(tournament, Some(scoring_config));
+    let mut best_score = fitness_with_diversity(&best_bracket, existing, diversity_weight, scoring_config);
     let mutation_rate = 1.0 / 63.0 * 3.0;
 
     for _ in 0..generations {
-        let child = best_bracket.mutate(tournament, mutation_rate);
-        let child_score = fitness_with_diversity(&child, existing, diversity_weight);
+        let child = best_bracket.mutate(tournament, mutation_rate, Some(scoring_config));
+        let child_score = fitness_with_diversity(&child, existing, diversity_weight, scoring_config);
 
         if child_score > best_score {
             best_bracket = child;
@@ -585,7 +629,7 @@ fn optimize_with_diversity(
 }
 
 /// Calculate fitness combining EV and diversity
-fn fitness_with_diversity(bracket: &Bracket, existing: &[Bracket], diversity_weight: f64) -> f64 {
+fn fitness_with_diversity(bracket: &Bracket, existing: &[Bracket], diversity_weight: f64, scoring_config: &ScoringConfig) -> f64 {
     let ev = bracket.expected_value;
 
     if existing.is_empty() {
@@ -594,7 +638,7 @@ fn fitness_with_diversity(bracket: &Bracket, existing: &[Bracket], diversity_wei
 
     // Calculate minimum distance to any existing bracket
     let min_distance = existing.iter()
-        .map(|b| bracket.weighted_distance(b).total_distance)
+        .map(|b| bracket.weighted_distance(b, Some(scoring_config)).total_distance)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
         .unwrap_or(0.0);
 
