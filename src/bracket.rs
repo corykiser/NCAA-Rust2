@@ -31,6 +31,50 @@ impl Default for ScoringConfig {
     }
 }
 
+/// Pre-computed score lookup table for fast scoring
+/// Avoids repeated calculate_win_score() calls (was 18.9 billion calls per run)
+#[derive(Debug, Clone, Copy)]
+pub struct ScoreTable {
+    /// scores[round][seed] = points for correct pick
+    /// Seeds 1-16, index 0 unused for cleaner indexing
+    scores: [[f64; 17]; 6],
+}
+
+impl ScoreTable {
+    /// Create a new score table from a scoring config
+    pub fn new(config: &ScoringConfig) -> Self {
+        let mut scores = [[0.0; 17]; 6];
+
+        for round in 0..6 {
+            let base_score = config.round_scores[round];
+            for seed in 1..=16 {
+                scores[round][seed] = match config.round_seed_scoring[round] {
+                    SeedScoring::Add => base_score + seed as f64,
+                    SeedScoring::Multiply => base_score * seed as f64,
+                    SeedScoring::None => base_score,
+                };
+            }
+        }
+
+        ScoreTable { scores }
+    }
+
+    /// Get score for a correct pick (inlined for performance)
+    #[inline(always)]
+    pub fn get(&self, round: usize, seed: i32) -> f64 {
+        // Safety: round is always 0-5, seed is always 1-16
+        unsafe {
+            *self.scores.get_unchecked(round).get_unchecked(seed as usize)
+        }
+    }
+}
+
+impl Default for ScoreTable {
+    fn default() -> Self {
+        Self::new(&ScoringConfig::default())
+    }
+}
+
 /// Game struct uses reference-counted Team pointers (RcTeam) to avoid
 /// cloning Team data. Arc::clone() is O(1) - just increments a counter.
 #[derive(Debug, Clone)]
@@ -410,6 +454,50 @@ impl Bracket{
         if Arc::ptr_eq(&self.games[62].winner, &referencebracket.games[62].winner) {
             score += Self::calculate_win_score(5, self.games[62].winner.seed, config);
         }
+        score
+    }
+
+    /// Fast scoring using pre-computed lookup table
+    /// This is the hot path - called ~300 million times per optimization run
+    #[inline]
+    pub fn score_fast(&self, referencebracket: &Bracket, table: &ScoreTable) -> f64 {
+        let mut score: f64 = 0.0;
+
+        // Round 1 (games 0-31)
+        for i in 0..32 {
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += table.get(0, self.games[i].winner.seed);
+            }
+        }
+        // Round 2 (games 32-47)
+        for i in 32..48 {
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += table.get(1, self.games[i].winner.seed);
+            }
+        }
+        // Round 3 (games 48-55)
+        for i in 48..56 {
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += table.get(2, self.games[i].winner.seed);
+            }
+        }
+        // Round 4 (games 56-59)
+        for i in 56..60 {
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += table.get(3, self.games[i].winner.seed);
+            }
+        }
+        // Round 5 (games 60-61)
+        for i in 60..62 {
+            if Arc::ptr_eq(&self.games[i].winner, &referencebracket.games[i].winner) {
+                score += table.get(4, self.games[i].winner.seed);
+            }
+        }
+        // Round 6 (game 62)
+        if Arc::ptr_eq(&self.games[62].winner, &referencebracket.games[62].winner) {
+            score += table.get(5, self.games[62].winner.seed);
+        }
+
         score
     }
 

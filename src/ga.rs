@@ -1,13 +1,11 @@
 // Genetic Algorithm module for NCAA Bracket Optimization
 // Implements proper population-based GA with smart mutation and best-ball scoring
 
-use crate::bracket::{Bracket, ScoringConfig};
-use crate::config::{Config, GaSettings, SimulationSettings};
+use crate::bracket::{Bracket, ScoringConfig, ScoreTable};
+use crate::config::{Config, GaSettings};
 use crate::ingest::{RcTeam, TournamentInfo};
-use rand::seq::SliceRandom;
 use rand::Rng;
 use rayon::prelude::*;
-use std::sync::Arc;
 
 /// Pre-generated pool of random brackets for scoring
 /// These represent possible tournament outcomes
@@ -15,6 +13,8 @@ use std::sync::Arc;
 pub struct SimulationPool {
     pub brackets: Vec<Bracket>,
     pub size: usize,
+    /// Pre-computed score lookup table for fast scoring
+    pub score_table: ScoreTable,
 }
 
 impl SimulationPool {
@@ -27,40 +27,45 @@ impl SimulationPool {
             .map(|_| Bracket::new(tournament, Some(scoring_config)))
             .collect();
 
+        // Pre-compute score lookup table
+        let score_table = ScoreTable::new(scoring_config);
+
         println!("Simulation pool generated.");
 
-        SimulationPool { brackets, size }
+        SimulationPool { brackets, size, score_table }
     }
 
-    /// Score a single bracket against all simulations
+    /// Score a single bracket against all simulations (fast version)
     /// Returns the average score
-    pub fn score_bracket(&self, bracket: &Bracket, scoring_config: &ScoringConfig) -> f64 {
+    pub fn score_bracket(&self, bracket: &Bracket, _scoring_config: &ScoringConfig) -> f64 {
+        let table = &self.score_table;
         let total: f64 = self.brackets
             .par_iter()
-            .map(|sim| bracket.score(sim, Some(scoring_config)))
+            .map(|sim| bracket.score_fast(sim, table))
             .sum();
 
         total / self.size as f64
     }
 
-    /// Score a portfolio using best-ball metric
+    /// Score a portfolio using best-ball metric (fast version)
     /// For each simulation, take the max score among all portfolio brackets
     /// Return the average of these max scores
     pub fn score_portfolio_best_ball(
         &self,
         portfolio: &[Bracket],
-        scoring_config: &ScoringConfig,
+        _scoring_config: &ScoringConfig,
     ) -> f64 {
         if portfolio.is_empty() {
             return 0.0;
         }
 
+        let table = &self.score_table;
         let total: f64 = self.brackets
             .par_iter()
             .map(|sim| {
                 portfolio
                     .iter()
-                    .map(|b| b.score(sim, Some(scoring_config)))
+                    .map(|b| b.score_fast(sim, table))
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0)
             })
@@ -69,28 +74,29 @@ impl SimulationPool {
         total / self.size as f64
     }
 
-    /// Score a bracket's marginal contribution to an existing portfolio
+    /// Score a bracket's marginal contribution to an existing portfolio (fast version)
     /// This is the increase in best-ball score when adding this bracket
     pub fn score_marginal_contribution(
         &self,
         bracket: &Bracket,
         existing_portfolio: &[Bracket],
-        scoring_config: &ScoringConfig,
+        _scoring_config: &ScoringConfig,
     ) -> f64 {
         if existing_portfolio.is_empty() {
-            return self.score_bracket(bracket, scoring_config);
+            return self.score_bracket(bracket, &ScoringConfig::default());
         }
 
+        let table = &self.score_table;
         let total: f64 = self.brackets
             .par_iter()
             .map(|sim| {
                 let existing_max = existing_portfolio
                     .iter()
-                    .map(|b| b.score(sim, Some(scoring_config)))
+                    .map(|b| b.score_fast(sim, table))
                     .max_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap_or(0.0);
 
-                let new_score = bracket.score(sim, Some(scoring_config));
+                let new_score = bracket.score_fast(sim, table);
 
                 // Marginal contribution is how much better we do with this bracket
                 new_score.max(existing_max)
