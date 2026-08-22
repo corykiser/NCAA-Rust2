@@ -174,6 +174,108 @@ fn main() {
     if b.filter.as_deref() == Some("contrarian") {
         contrarian_experiment(&t, &scoring);
     }
+    if b.filter.as_deref() == Some("sweep") {
+        entry_count_sweep(&t, &scoring);
+    }
+}
+
+/// What does each additional entry buy you?
+///
+/// Holds the opposing field at 100 entries and sweeps how many brackets you
+/// submit, reporting how often one of them finishes first. Emits CSV on stdout.
+///
+/// Every number is measured **out of sample**: portfolios are built against one
+/// pool of tournaments and one set of field draws, then scored against an
+/// independently seeded pool and an independently drawn field. Reporting the
+/// training score instead would flatter the curve, because the search picked
+/// those entries to beat those particular sampled opponents.
+fn entry_count_sweep(t: &TournamentInfo, scoring: &ScoringConfig) {
+    const TRAIN_SCENARIOS: usize = 30_000;
+    const TEST_SCENARIOS: usize = 120_000;
+    const REPLICATES: usize = 6;
+    const TEST_REPLICATES: usize = 12;
+    const OPPONENTS: usize = 100;
+    const MAX_ENTRIES: usize = 16;
+
+    let train = ScenarioPool::new(t, TRAIN_SCENARIOS, scoring, 1);
+    let test = ScenarioPool::new(t, TEST_SCENARIOS, scoring, 0xDEC0DE);
+    let locks = ga::LockSet::default();
+
+    let public = match field::fetch_espn(2023, "./data")
+        .and_then(|f| field::PickPopularity::from_file(&f, t))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("no ESPN pick data ({}); using the chalk fallback", e);
+            field::PickPopularity::chalk(t, 1.6)
+        }
+    };
+    let public = &public;
+
+    let draw = |salt: u64| {
+        move |replicate: usize, i: usize| {
+            let mut rng = SmallRng::seed_from_u64(
+                salt ^ ((replicate as u64) << 40)
+                    ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15),
+            );
+            public.sample_entry(t, &mut rng)
+        }
+    };
+
+    // The competition does not change as your entry count does, so each field
+    // is sampled and reduced to per-scenario order statistics once.
+    let training_field = train.competition(REPLICATES, OPPONENTS, draw(0x5EED));
+    let holdout_field = test.competition(TEST_REPLICATES, OPPONENTS, draw(0xA11CE));
+
+    eprintln!(
+        "field: {}, {} opposing entries; train {} scenarios x {} draws; test {} x {}",
+        public.source, OPPONENTS, TRAIN_SCENARIOS, REPLICATES, TEST_SCENARIOS, TEST_REPLICATES
+    );
+
+    println!("entries,total_pool,win_optimized,points_optimized,fair_share,in_sample,champions");
+    let mut profile = vec![0.0f32; test.size()];
+
+    for entries in 1..=MAX_ENTRIES {
+        let fp = optimize::optimize_for(
+            t,
+            scoring,
+            &train,
+            &locks,
+            entries,
+            optimize::Objective::FirstPlace(&training_field),
+            false,
+        );
+
+        // The same number of entries, chosen to maximize points instead.
+        let bb = optimize::optimize_for(
+            t, scoring, &train, &locks, entries, optimize::Objective::BestBall, false,
+        );
+
+        test.best_ball_into(&test.prepare_all(&fp.entries), &mut profile);
+        let win_held = test.mean_win_share(&profile, &holdout_field);
+        test.best_ball_into(&test.prepare_all(&bb.entries), &mut profile);
+        let points_held = test.mean_win_share(&profile, &holdout_field);
+
+        let total = OPPONENTS + entries;
+        let mut champions: Vec<&str> = fp
+            .entries
+            .iter()
+            .map(|p| t.teams[p.champion() as usize].name.as_str())
+            .collect();
+        champions.sort_unstable();
+        champions.dedup();
+
+        println!(
+            "{},{},{:.6},{:.6},{:.6},{:.6},{}",
+            entries,
+            total,
+            win_held,
+            points_held,
+            entries as f64 / total as f64,
+            fp.best_ball,
+            champions.join(" ")
+        );
+    }
 }
 
 /// How should pool size change what you enter?
