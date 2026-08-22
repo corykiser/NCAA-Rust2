@@ -66,6 +66,9 @@ form.
 ### Portfolio Modes (`--portfolio-strategy`)
 
 1. **Exact basis + coordinate ascent** (`--portfolio-strategy exact-basis`, default)
+   - Maximizes either expected best-ball score or, with `--objective
+     first-place`, `P(one of my entries finishes first)` against the rest of
+     the pool — see [Objectives](#objectives)
    - Builds every bracket that is exactly optimal subject to one extra
      advancement requirement — 384 constrained solves, a few milliseconds — and
      greedily selects the entries that add most to best-ball
@@ -88,6 +91,69 @@ form.
 4. **Simulated Annealing** (`--portfolio-strategy annealing`)
    - Classic SA optimization on portfolio
    - Uses Team-Round mutations
+
+### Objectives
+
+Maximizing expected *score* is only correct if your payout is linear in points.
+Most pools pay the top finisher, and then what you want is
+`P(one of my entries finishes first)` — which depends on what everyone else
+entered, not just on the tournament.
+
+That distinction is not cosmetic. The expected-score-optimal bracket is
+favourite-heavy, and so is the public consensus bracket, so maximizing expected
+score steers you toward the bracket most likely to be duplicated by a large
+slice of the field. In 2023, 18.9% of ESPN's 18.9 million entries picked Alabama
+to win it all: being right about Alabama meant splitting first place with three
+and a half million people.
+
+`--objective first-place` optimizes the thing you actually care about. It needs
+a model of the competition, which comes from published pick rates:
+
+```bash
+# Fetch ESPN's pick rates and optimize for winning a 200-person pool
+cargo run --release -- --portfolio 3 --objective first-place \
+    --fetch-picks 2024 --pool-entries 200
+```
+
+Against the real 2023 ESPN field, scoring each portfolio by how often it
+actually finishes first (`cargo run --release --bin bench -- contrarian`):
+
+| Pool size | Entries | EV-optimal | Best-ball | First-place | vs EV |
+|---:|---:|---:|---:|---:|---:|
+| 20 | 1 | 15.900% | 15.743% | **16.912%** | 1.06x |
+| 100 | 1 | 4.518% | 4.392% | **5.162%** | 1.14x |
+| 100 | 3 | 4.560% | 10.920% | **12.794%** | 2.81x |
+| 1,000 | 3 | 0.851% | 1.565% | **2.495%** | 2.93x |
+| 10,000 | 3 | 0.125% | 0.212% | **0.534%** | 4.28x |
+
+Two things to read off it. **Pool size decides how contrarian to be**: in a
+20-person pool the expected-score bracket is nearly optimal, and by 10,000
+entrants optimizing for first place wins over four times as often. And the
+**expected score you give up is trivial** — the winning entries above sacrifice
+2 to 12 points of expected score out of ~233 to multiply their win rate.
+
+At one entry in a 100-person pool the objective already changes the champion,
+from Houston (the expected-score optimum, and a popular pick) to Gonzaga.
+
+**Where the opponent model comes from.** ESPN's Tournament Challenge publishes,
+for every round and all 64 teams, the share of entries picking that team to
+survive — `--fetch-picks <year>` pulls it and caches it under `./data/`. Those
+are marginals, not whole brackets, so `field.rs` reconstructs a joint
+distribution: walking the bracket, an entry advances a team with probability
+proportional to its *conditional* advance rate, which reproduces the published
+marginals while producing legal brackets. Supply your own numbers with
+`--pick-popularity <file.json>` (same schema as the cache), or, with no data at
+all, fall back to `--chalk-tilt` — a model of a public that picks chalkier than
+the ratings justify. The fallback is a shape, not data; fetch the real numbers
+if you can, because how concentrated the public is on the favourite is the
+single biggest input to this objective.
+
+**Limits.** The competition is simulated directly — `--pool-entries` opposing
+brackets, drawn `--field-replicates` times so the answer does not depend on one
+arbitrary guess at who you are playing. That is exact for realistic pools and
+gets slow for pools of more than a few tens of thousands. Optimizing for first
+place also leans much harder on the rating model being right than maximizing
+expected score does.
 
 ## Installation
 
@@ -204,6 +270,7 @@ src/
 ├── picks.rs         # Compact bracket the optimizers work on: 63 winners + 63 bits
 ├── score.rs         # Scenario pool and the branchless SIMD scoring kernels
 ├── optimize.rs      # Portfolio construction: exact basis, greedy, coordinate ascent
+├── field.rs         # The rest of the pool: public pick rates and opponent sampling
 ├── ga.rs            # Genetic algorithm (MonteCarloScenarios, TeamRoundMutator, LockSet)
 ├── ingest.rs        # Data loading, field validation, team ratings
 ├── names.rs         # Deterministic team-name resolution

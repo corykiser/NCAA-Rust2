@@ -38,9 +38,61 @@ use crate::exact::{self, TeamLock};
 use crate::ga::LockSet;
 use crate::ingest::TournamentInfo;
 use crate::picks::{all_moves, Picks};
-use crate::score::{ScenarioPool, ScoredPicks};
+use crate::score::{Competition, ScenarioPool, ScoredPicks};
 use rayon::prelude::*;
 use std::collections::HashSet;
+
+/// What the portfolio search maximizes.
+///
+/// Both variants reduce a portfolio to one number per scenario — the best score
+/// any of its entries posts — and then differ only in what they do with it. That
+/// is what lets one search serve both: greedy selection and coordinate ascent
+/// never see the objective, only "score this candidate against this baseline".
+#[derive(Clone, Copy)]
+pub enum Objective<'a> {
+    /// Expected best-ball score. Correct when the payout is linear in points.
+    BestBall,
+    /// Expected share of first place against a sampled public field. Correct
+    /// when the pool pays the top finisher, and the only one of the two that
+    /// prices in being picked by everyone else.
+    FirstPlace(&'a Competition),
+}
+
+impl<'a> Objective<'a> {
+    /// Value of adding `candidate` to a portfolio whose per-scenario best is
+    /// `baseline`.
+    #[inline]
+    fn value(&self, pool: &ScenarioPool, candidate: &ScoredPicks, baseline: &[f32]) -> f64 {
+        match self {
+            Objective::BestBall => pool.mean_max_with(candidate, baseline),
+            Objective::FirstPlace(c) => pool.mean_win_share_with(candidate, baseline, c),
+        }
+    }
+
+    /// Value of a portfolio already reduced to its per-scenario best.
+    fn value_of_profile(&self, pool: &ScenarioPool, profile: &[f32]) -> f64 {
+        match self {
+            Objective::BestBall => {
+                profile.iter().map(|&v| v as f64).sum::<f64>() / profile.len() as f64
+            }
+            Objective::FirstPlace(c) => pool.mean_win_share(profile, c),
+        }
+    }
+
+    /// Value of a whole portfolio.
+    fn value_of(&self, pool: &ScenarioPool, entries: &[ScoredPicks]) -> f64 {
+        let mut profile = vec![0.0f32; pool.size()];
+        pool.best_ball_into(entries, &mut profile);
+        self.value_of_profile(pool, &profile)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Objective::BestBall => "best-ball score",
+            Objective::FirstPlace(_) => "P(finish first)",
+        }
+    }
+}
 
 /// A finished portfolio and how it was arrived at.
 pub struct PortfolioPlan {
@@ -53,7 +105,8 @@ pub struct PortfolioPlan {
     pub basis_size: usize,
     /// Improving sweeps the local search ran before it converged.
     pub sweeps: usize,
-    /// Improvement the local search added on top of the greedy selection.
+    /// What the local search added on top of the greedy selection. Never
+    /// negative: every accepted swap raises the objective by construction.
     pub polish_gain: f64,
 }
 
@@ -134,13 +187,14 @@ pub fn exact_basis(
     basis
 }
 
-/// Build a `k`-entry portfolio maximizing expected best-ball payout.
-pub fn optimize(
+/// Build a `k`-entry portfolio maximizing `objective`.
+pub fn optimize_for(
     tournament: &TournamentInfo,
     scoring: &ScoringConfig,
     pool: &ScenarioPool,
     locks: &LockSet,
     entries: usize,
+    objective: Objective<'_>,
     verbose: bool,
 ) -> PortfolioPlan {
     assert!(entries > 0, "a portfolio needs at least one entry");
@@ -165,13 +219,15 @@ pub fn optimize(
     let mut single_entry = 0.0;
 
     for slot in 0..entries.min(basis.len()) {
-        let (best, best_score) = argmax_against(pool, &prepared_basis, &baseline, &chosen);
+        let (best, best_score) =
+            argmax_against(pool, &prepared_basis, &baseline, &chosen, objective);
         chosen.push(best);
         pool.absorb_into(&prepared_basis[best], &mut baseline);
         if verbose {
             println!(
-                "  entry {}: best-ball {:.3} (+{:.3})",
+                "  entry {}: {} {:.5} (+{:.5})",
                 slot + 1,
+                objective.name(),
                 best_score,
                 best_score - score
             );
@@ -188,13 +244,13 @@ pub fn optimize(
     while portfolio.len() < entries {
         portfolio.push(basis[portfolio.len() % basis.len()]);
     }
-    let greedy_score = pool.par_best_ball_mean(&pool.prepare_all(&portfolio));
+    let greedy_score = objective.value_of(pool, &pool.prepare_all(&portfolio));
 
     // ---- Coordinate ascent ------------------------------------------------
     let (portfolio, sweeps) =
-        polish(tournament, pool, locks, portfolio, &basis, verbose);
+        polish(tournament, pool, locks, portfolio, &basis, objective, verbose);
 
-    let final_score = pool.par_best_ball_mean(&pool.prepare_all(&portfolio));
+    let final_score = objective.value_of(pool, &pool.prepare_all(&portfolio));
 
     PortfolioPlan {
         entries: portfolio,
@@ -213,12 +269,13 @@ fn argmax_against(
     candidates: &[ScoredPicks],
     baseline: &[f32],
     exclude: &[usize],
+    objective: Objective<'_>,
 ) -> (usize, f64) {
     let scored: Vec<(usize, f64)> = candidates
         .par_iter()
         .enumerate()
         .filter(|(i, _)| !exclude.contains(i))
-        .map(|(i, c)| (i, pool.mean_max_with(c, baseline)))
+        .map(|(i, c)| (i, objective.value(pool, c, baseline)))
         .collect();
 
     // Ties broken by index so the result does not depend on thread timing.
@@ -241,6 +298,7 @@ fn polish(
     locks: &LockSet,
     mut portfolio: Vec<Picks>,
     basis: &[Picks],
+    objective: Objective<'_>,
     verbose: bool,
 ) -> (Vec<Picks>, usize) {
     // Every accepted swap strictly raises best-ball and the objective is
@@ -248,7 +306,7 @@ fn polish(
     // floating-point cycle, not an expected exit.
     const MAX_SWEEPS: usize = 32;
 
-    let mut current = pool.par_best_ball_mean(&pool.prepare_all(&portfolio));
+    let mut current = objective.value_of(pool, &pool.prepare_all(&portfolio));
     let mut sweeps = 0;
     let mut baseline = vec![0.0f32; pool.size()];
 
@@ -293,7 +351,7 @@ fn polish(
 
             let best = candidates
                 .par_iter()
-                .map(|p| pool.mean_max_with(&pool.prepare(p), &baseline))
+                .map(|p| objective.value(pool, &pool.prepare(p), &baseline))
                 .enumerate()
                 // Ties go to the lowest index, so the answer does not depend on
                 // how rayon happened to schedule the work.
@@ -307,7 +365,7 @@ fn polish(
             if let Some((index, score)) = best {
                 // Accept only a real gain, so floating-point noise cannot make
                 // the sweep loop forever swapping equivalent brackets.
-                if score > current + 1e-9 {
+                if score > current + 1e-12 {
                     portfolio[slot] = candidates[index];
                     current = score;
                     improved = true;
@@ -320,7 +378,7 @@ fn polish(
         }
         sweeps = sweep + 1;
         if verbose {
-            println!("  sweep {}: best-ball {:.3}", sweeps, current);
+            println!("  sweep {}: {} {:.5}", sweeps, objective.name(), current);
         }
     }
 
@@ -386,7 +444,7 @@ mod tests {
 
         let mut previous = 0.0;
         for k in 1..=4 {
-            let plan = optimize(&t, &scoring, &p, &locks, k, false);
+            let plan = optimize_for(&t, &scoring, &p, &locks, k, Objective::BestBall, false);
             assert_eq!(plan.entries.len(), k);
             assert!(
                 plan.best_ball >= previous - 1e-9,
@@ -408,7 +466,7 @@ mod tests {
         let scoring = ScoringConfig::default();
         let p = pool(&t, &scoring);
 
-        let plan = optimize(&t, &scoring, &p, &LockSet::default(), 1, false);
+        let plan = optimize_for(&t, &scoring, &p, &LockSet::default(), 1, Objective::BestBall, false);
         let exact_best = exact::solve(&t, &scoring, &[]).unwrap();
         let sampled_optimum = p.par_mean_score(
             &p.prepare(&Picks::from_winners(&t, &exact_best.bracket.winner_indices())),
@@ -426,7 +484,7 @@ mod tests {
         let t = tournament();
         let scoring = ScoringConfig::default();
         let p = pool(&t, &scoring);
-        let plan = optimize(&t, &scoring, &p, &LockSet::default(), 5, false);
+        let plan = optimize_for(&t, &scoring, &p, &LockSet::default(), 5, Objective::BestBall, false);
         assert!(
             plan.polish_gain >= -1e-9,
             "local search lost {:.6}",
@@ -439,14 +497,124 @@ mod tests {
         let t = tournament();
         let scoring = ScoringConfig::default();
         let p = pool(&t, &scoring);
-        let first = optimize(&t, &scoring, &p, &LockSet::default(), 4, false);
+        let first = optimize_for(&t, &scoring, &p, &LockSet::default(), 4, Objective::BestBall, false);
         for _ in 0..3 {
-            let again = optimize(&t, &scoring, &p, &LockSet::default(), 4, false);
+            let again = optimize_for(&t, &scoring, &p, &LockSet::default(), 4, Objective::BestBall, false);
             let a: Vec<u64> = first.entries.iter().map(|e| e.bits()).collect();
             let b: Vec<u64> = again.entries.iter().map(|e| e.bits()).collect();
             assert_eq!(a, b);
             assert_eq!(first.best_ball, again.best_ball);
         }
+    }
+
+    fn competition(
+        t: &TournamentInfo,
+        pool: &ScenarioPool,
+        opponents: usize,
+    ) -> crate::score::Competition {
+        use rand::rngs::SmallRng;
+        use rand::SeedableRng;
+        let public = crate::field::PickPopularity::chalk(t, 1.6);
+        pool.competition(4, opponents, |replicate, i| {
+            let mut rng = SmallRng::seed_from_u64((replicate as u64) << 32 | i as u64);
+            public.sample_entry(t, &mut rng)
+        })
+    }
+
+    #[test]
+    fn win_probability_is_a_probability_and_grows_with_entries() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let p = pool(&t, &scoring);
+        let field = competition(&t, &p, 50);
+        let locks = LockSet::default();
+
+        let mut previous = 0.0;
+        for k in 1..=4 {
+            let plan = optimize_for(
+                &t,
+                &scoring,
+                &p,
+                &locks,
+                k,
+                Objective::FirstPlace(&field),
+                false,
+            );
+            assert!(
+                plan.best_ball > 0.0 && plan.best_ball <= 1.0,
+                "{} entries gave P(win) = {}",
+                k,
+                plan.best_ball
+            );
+            assert!(
+                plan.best_ball >= previous - 1e-12,
+                "{} entries won less often ({:.5}) than {} ({:.5})",
+                k,
+                plan.best_ball,
+                k - 1,
+                previous
+            );
+            previous = plan.best_ball;
+        }
+    }
+
+    #[test]
+    fn one_entry_against_one_opponent_is_near_a_coin_flip() {
+        // Sanity anchor on the units: a single entry facing a single opponent
+        // drawn from a field close to the rating model wins about half the
+        // time, and cannot win more than all of it.
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let p = pool(&t, &scoring);
+        let field = competition(&t, &p, 1);
+        let plan = optimize_for(
+            &t,
+            &scoring,
+            &p,
+            &LockSet::default(),
+            1,
+            Objective::FirstPlace(&field),
+            false,
+        );
+        assert!(
+            plan.best_ball > 0.4 && plan.best_ball < 0.95,
+            "P(beat one opponent) = {:.4}",
+            plan.best_ball
+        );
+    }
+
+    #[test]
+    fn optimizing_for_first_place_beats_the_ev_bracket_at_winning() {
+        // The whole point of the objective: against a public field, the bracket
+        // that maximizes expected score is not the bracket that most often
+        // finishes first, because it is the one everyone else also submitted.
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let p = pool(&t, &scoring);
+        let field = competition(&t, &p, 200);
+
+        let contrarian = optimize_for(
+            &t,
+            &scoring,
+            &p,
+            &LockSet::default(),
+            1,
+            Objective::FirstPlace(&field),
+            false,
+        );
+
+        let ev_best = exact::solve(&t, &scoring, &[]).unwrap();
+        let ev_picks = Picks::from_winners(&t, &ev_best.bracket.winner_indices());
+        let mut profile = vec![0.0f32; p.size()];
+        p.best_ball_into(&[p.prepare(&ev_picks)], &mut profile);
+        let ev_win_rate = p.mean_win_share(&profile, &field);
+
+        assert!(
+            contrarian.best_ball >= ev_win_rate,
+            "optimizing P(win) gave {:.5}, the EV bracket gets {:.5}",
+            contrarian.best_ball,
+            ev_win_rate
+        );
     }
 
     #[test]
@@ -461,7 +629,7 @@ mod tests {
             wins_required: 6,
         }]);
 
-        let plan = optimize(&t, &scoring, &p, &locks, 4, false);
+        let plan = optimize_for(&t, &scoring, &p, &locks, 4, Objective::BestBall, false);
         for entry in &plan.entries {
             assert_eq!(
                 entry.champion(),
@@ -478,7 +646,7 @@ mod tests {
         let t = tournament();
         let scoring = ScoringConfig::default();
         let p = pool(&t, &scoring);
-        let plan = optimize(&t, &scoring, &p, &LockSet::default(), 5, false);
+        let plan = optimize_for(&t, &scoring, &p, &LockSet::default(), 5, Objective::BestBall, false);
 
         let distinct: HashSet<u64> = plan.entries.iter().map(|e| e.bits()).collect();
         assert_eq!(distinct.len(), 5, "portfolio contains duplicate brackets");

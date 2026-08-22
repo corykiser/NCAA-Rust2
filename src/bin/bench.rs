@@ -17,6 +17,7 @@ use std::time::Instant;
 #[path = "../config.rs"] mod config;
 #[path = "../elo.rs"] mod elo;
 #[path = "../exact.rs"] mod exact;
+#[path = "../field.rs"] mod field;
 #[path = "../ga.rs"] mod ga;
 #[path = "../game_result.rs"] mod game_result;
 #[path = "../ingest.rs"] mod ingest;
@@ -170,6 +171,106 @@ fn main() {
     if b.filter.as_deref() == Some("hedge") {
         hedge_experiment(&t, &scoring);
     }
+    if b.filter.as_deref() == Some("contrarian") {
+        contrarian_experiment(&t, &scoring);
+    }
+}
+
+/// How should pool size change what you enter?
+///
+/// Scores three portfolios by how often they finish first against the real 2023
+/// ESPN public field, across pool sizes: the exact expected-score optimum, a
+/// best-ball-optimized portfolio, and one optimized for first place directly.
+fn contrarian_experiment(t: &TournamentInfo, scoring: &ScoringConfig) {
+    const SCENARIOS: usize = 40_000;
+    const REPLICATES: usize = 8;
+
+    let pool = ScenarioPool::new(t, SCENARIOS, scoring, 1);
+    let locks = ga::LockSet::default();
+
+    let public = match field::fetch_espn(2023, "./data")
+        .and_then(|f| field::PickPopularity::from_file(&f, t))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("no ESPN pick data ({}); using the chalk fallback", e);
+            field::PickPopularity::chalk(t, 1.6)
+        }
+    };
+    let (fav, share) = public.favourite();
+    println!(
+        "\nPublic field: {} — most-picked champion {} at {:.1}%",
+        public.source,
+        t.teams[fav as usize].name,
+        share * 100.0
+    );
+
+    let exact_best = exact::solve(t, scoring, &[]).unwrap();
+    let ev_picks = Picks::from_winners(t, &exact_best.bracket.winner_indices());
+
+    println!("\nP(finish first), by what the portfolio was built to maximize:");
+    println!(
+        "\n{:>6}  {:>7}  {:>12}  {:>12}  {:>12}  {:>7}",
+        "pool", "entries", "EV-optimal", "best-ball", "first-place", "vs EV"
+    );
+    println!("{}", "-".repeat(70));
+
+    for (entrants, entries) in [(20usize, 1usize), (100, 1), (100, 3), (1_000, 3), (10_000, 3)] {
+        let opponents = entrants.saturating_sub(entries).max(1);
+        let competition = pool.competition(REPLICATES, opponents, |replicate, i| {
+            let mut rng = SmallRng::seed_from_u64(
+                0xF1E1D_u64 ^ ((replicate as u64) << 40) ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15),
+            );
+            public.sample_entry(t, &mut rng)
+        });
+
+        // The EV-optimal bracket, repeated to fill the entry slots it is
+        // allowed — the naive multi-entry version of "just play the best one".
+        let ev_entries = vec![ev_picks; entries];
+        let mut profile = vec![0.0f32; pool.size()];
+        pool.best_ball_into(&pool.prepare_all(&ev_entries), &mut profile);
+        let ev_win = pool.mean_win_share(&profile, &competition);
+
+        let bb = optimize::optimize_for(
+            t, scoring, &pool, &locks, entries, optimize::Objective::BestBall, false,
+        );
+        pool.best_ball_into(&pool.prepare_all(&bb.entries), &mut profile);
+        let bb_win = pool.mean_win_share(&profile, &competition);
+
+        let fp = optimize::optimize_for(
+            t,
+            scoring,
+            &pool,
+            &locks,
+            entries,
+            optimize::Objective::FirstPlace(&competition),
+            false,
+        );
+
+        println!(
+            "{:>6}  {:>7}  {:>11.3}%  {:>11.3}%  {:>11.3}%   {:>5.2}x",
+            entrants,
+            entries,
+            ev_win * 100.0,
+            bb_win * 100.0,
+            fp.best_ball * 100.0,
+            fp.best_ball / ev_win,
+        );
+
+        let champions: Vec<String> = fp
+            .entries
+            .iter()
+            .map(|p| {
+                let b = Bracket::from_picks(t, p, Some(scoring));
+                format!(
+                    "{} (EV {:+.0})",
+                    b.winner.name,
+                    exact::expected_value(t, &b, scoring) - exact_best.expected_value
+                )
+            })
+            .collect();
+        println!("          first-place entries: {}", champions.join(", "));
+    }
 }
 
 /// Does the EV-optimal bracket belong in a multi-entry portfolio?
@@ -196,7 +297,7 @@ fn hedge_experiment(t: &TournamentInfo, scoring: &ScoringConfig) {
     println!("{}", "-".repeat(78));
 
     for k in [2usize, 3, 5, 10] {
-        let free = optimize::optimize(t, scoring, &train, &locks, k, false);
+        let free = optimize::optimize_for(t, scoring, &train, &locks, k, optimize::Objective::BestBall, false);
         let pinned = pinned_portfolio(t, scoring, &train, &locks, k, optimum);
 
         let free_held = optimize::holdout_score(t, scoring, &free.entries, HOLDOUT, 999);
@@ -320,7 +421,7 @@ fn quality_shootout(t: &TournamentInfo, scoring: &ScoringConfig) {
         let mut rows: Vec<(String, f64, f64, Duration)> = Vec::new();
 
         let start = Instant::now();
-        let plan = optimize::optimize(t, scoring, &train, &locks, entries, false);
+        let plan = optimize::optimize_for(t, scoring, &train, &locks, entries, optimize::Objective::BestBall, false);
         let elapsed = start.elapsed();
         let held = optimize::holdout_score(t, scoring, &plan.entries, HOLDOUT, 999);
         rows.push(("exact-basis".into(), plan.best_ball, held, elapsed));

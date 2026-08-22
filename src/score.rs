@@ -404,6 +404,158 @@ impl ScenarioPool {
     }
 }
 
+/// What the rest of the pool scores, scenario by scenario.
+///
+/// For a pool that pays the top finisher, a portfolio's value is
+/// `P(one of my entries finishes first)`, which needs the competition's scores
+/// as well as your own. Reduced to what the objective actually reads, that is
+/// two numbers per scenario: the best score anyone else posted, and how many of
+/// them posted it — the second because finishing level with `n` other entries
+/// is worth `1/(n+1)` of first place, and that tie penalty is the entire reason
+/// picking the same champion as a fifth of the field is expensive.
+///
+/// The field is drawn several times over. Your real pool is one fixed set of
+/// entries that you cannot see, so a single draw would optimize against one
+/// arbitrary guess at it; averaging over replicates prices in the fact that you
+/// do not know who you are playing.
+pub struct Competition {
+    /// `best[replicate * size + scenario]`.
+    best: Vec<f32>,
+    /// Opponents tied at `best`, same indexing.
+    ties: Vec<u32>,
+    size: usize,
+    replicates: usize,
+    /// Opposing entries per replicate. Reported, not read by the kernel.
+    #[allow(dead_code)]
+    pub opponents: usize,
+}
+
+impl Competition {
+    /// Share of first place a score of `mine` takes in one scenario.
+    #[inline(always)]
+    fn share(&self, scenario: usize, mine: f32) -> f64 {
+        let mut total = 0.0f64;
+        for replicate in 0..self.replicates {
+            let i = replicate * self.size + scenario;
+            let best = self.best[i];
+            total += if mine > best {
+                1.0
+            } else if mine == best {
+                1.0 / (1.0 + self.ties[i] as f64)
+            } else {
+                0.0
+            };
+        }
+        total / self.replicates as f64
+    }
+
+    /// Mean top opponent score, for reporting.
+    pub fn mean_top_score(&self) -> f64 {
+        self.best.iter().map(|&v| v as f64).sum::<f64>() / self.best.len() as f64
+    }
+}
+
+impl ScenarioPool {
+    /// Score a sampled public field down to per-scenario order statistics.
+    ///
+    /// `draw(replicate, index)` supplies one opposing entry. Cost is
+    /// `replicates * opponents * scenarios` row scores, paid once — after which
+    /// every candidate evaluation is `O(replicates)` per scenario, the same
+    /// shape as the best-ball baseline.
+    pub fn competition(
+        &self,
+        replicates: usize,
+        opponents: usize,
+        mut draw: impl FnMut(usize, usize) -> Picks,
+    ) -> Competition {
+        assert!(replicates > 0 && opponents > 0);
+
+        let mut best = vec![f32::NEG_INFINITY; replicates * self.size];
+        let mut ties = vec![0u32; replicates * self.size];
+
+        for replicate in 0..replicates {
+            let field: Vec<ScoredPicks> = (0..opponents)
+                .map(|i| self.prepare(&draw(replicate, i)))
+                .collect();
+
+            let offset = replicate * self.size;
+            let rows = chunk_rows(self.size);
+            best[offset..offset + self.size]
+                .par_chunks_mut(rows)
+                .zip(ties[offset..offset + self.size].par_chunks_mut(rows))
+                .enumerate()
+                .for_each(|(block, (best_block, ties_block))| {
+                    let first = block * rows;
+                    for (i, (top, count)) in
+                        best_block.iter_mut().zip(ties_block.iter_mut()).enumerate()
+                    {
+                        let row = self.row(first + i);
+                        let mut high = f32::NEG_INFINITY;
+                        let mut seen = 0u32;
+                        for entry in &field {
+                            let s = row_score(entry, row);
+                            if s > high {
+                                high = s;
+                                seen = 1;
+                            } else if s == high {
+                                seen += 1;
+                            }
+                        }
+                        *top = high;
+                        *count = seen;
+                    }
+                });
+        }
+
+        Competition {
+            best,
+            ties,
+            size: self.size,
+            replicates,
+            opponents,
+        }
+    }
+
+    /// Expected share of first place for a portfolio already reduced to its
+    /// per-scenario best.
+    pub fn mean_win_share(&self, mine_best: &[f32], competition: &Competition) -> f64 {
+        debug_assert_eq!(mine_best.len(), self.size);
+        let total: f64 = mine_best
+            .iter()
+            .enumerate()
+            .map(|(s, &mine)| competition.share(s, mine))
+            .sum();
+        total / self.size as f64
+    }
+
+    /// Expected share of first place once `candidate` joins a portfolio whose
+    /// per-scenario best is `baseline`.
+    ///
+    /// Same incremental trick as `mean_max_with`: the frozen entries collapse
+    /// to one number per scenario, so trying a replacement costs one bracket's
+    /// scoring rather than the portfolio's.
+    pub fn mean_win_share_with(
+        &self,
+        candidate: &ScoredPicks,
+        baseline: &[f32],
+        competition: &Competition,
+    ) -> f64 {
+        debug_assert_eq!(baseline.len(), self.size);
+        let mut total = 0.0f64;
+        for (scenario, (row, &base)) in self
+            .rows
+            .chunks_exact(PADDED_GAMES)
+            .map(as_row)
+            .zip(baseline.iter())
+            .enumerate()
+        {
+            let mine = row_score(candidate, row).max(base);
+            total += competition.share(scenario, mine);
+        }
+        total / self.size as f64
+    }
+}
+
 /// View one stride of the pool as a fixed-size scenario row.
 #[inline(always)]
 fn as_row(chunk: &[u8]) -> &[u8; PADDED_GAMES] {

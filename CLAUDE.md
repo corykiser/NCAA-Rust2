@@ -24,6 +24,10 @@ cargo run --release -- --source csv     # FiveThirtyEight CSV
 
 # Generate portfolio of diverse brackets
 cargo run --release -- --portfolio 5 --portfolio-strategy exact-basis
+
+# Optimize P(finish first) against the real public field instead of raw points
+cargo run --release -- --portfolio 3 --objective first-place \
+    --fetch-picks 2024 --pool-entries 200
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-whole
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-sequential
 cargo run --release -- --portfolio 5 --portfolio-strategy annealing
@@ -43,6 +47,8 @@ cargo test
 cargo run --release --bin bench
 cargo run --release --bin bench -- score/        # filter to one group
 cargo run --release --bin bench -- quality       # portfolio quality shootout
+cargo run --release --bin bench -- hedge         # is the EV optimum a good entry?
+cargo run --release --bin bench -- contrarian    # objective vs pool size
 
 # Run single test
 cargo test test_expected_score
@@ -83,6 +89,12 @@ scanning. Parallelism is kept to **one level** — see `src/score.rs`.
 | `--batch-size` | 1000 | Monte Carlo simulations per scoring (legacy mode) |
 | `--portfolio` | - | Number of brackets to generate |
 | `--portfolio-strategy` | exact-basis | Strategy: exact-basis, ga-whole, ga-sequential, annealing, champion, diverse |
+| `--objective` | best-ball | What to maximize: best-ball, first-place (exact-basis only) |
+| `--pool-entries` | 100 | Total entries in your pool, including yours |
+| `--field-replicates` | 8 | Independent draws of the opposing field to average over |
+| `--fetch-picks` | - | Pull ESPN pick rates for a tournament year and cache them |
+| `--pick-popularity` | - | JSON file of public pick rates |
+| `--chalk-tilt` | 1.6 | Favourite bias of the fallback public model |
 | `--diversity-weight` | 5.0 | Weight for bracket diversity (legacy strategies) |
 | `--lock-team` | - | Lock team to round (repeatable) |
 | `--score-r1` through `--score-r6` | 1,2,4,8,16,32 | Points per round |
@@ -241,6 +253,51 @@ every portfolio size.
 `holdout_score` re-scores a finished portfolio on an independently seeded pool.
 Report it: some of any in-sample gain is fitting the sample.
 
+## Objectives (`Objective` in `src/optimize.rs`)
+
+Two, and the difference is the whole ballgame for a real pool.
+
+- `BestBall` — expected best-ball score. Right only when the payout is linear
+  in points.
+- `FirstPlace` — expected share of first place against a sampled public field.
+  Right when the pool pays the top finisher.
+
+Both reduce a portfolio to one number per scenario (its best entry's score) and
+differ only in what they do with it, so greedy selection and coordinate ascent
+never see the objective — they only ask "value of this candidate against this
+baseline". Adding a third objective means adding a variant, not a search.
+
+Ties are what make `FirstPlace` interesting: finishing level with `n` other
+entries is worth `1/(n+1)`, so a champion a fifth of the field also picked is
+heavily discounted. Dropping the tie term collapses the whole contrarian effect.
+
+## The Opposing Field (`src/field.rs`)
+
+ESPN's Tournament Challenge publishes, per round and per team, the share of
+entries picking that team to survive — `fetch_espn` pulls all six rounds and
+caches to `data/picks_{year}.json`. In 2023, 18.9% of 18.9M entries picked
+Alabama to win it all.
+
+Those are **marginals**, not a joint distribution. `sample_entry` reconstructs
+one: walking the bracket, an entry advances a team with probability
+proportional to its *conditional* advance rate (`reach[r] / reach[r-1]`),
+normalized against the opponent it actually faces. A test checks that 20,000
+sampled entries reproduce the published marginals to within 0.05.
+
+`chalk` is the no-data fallback. It tilts each *game* probability toward the
+favourite and runs the advancement recurrence, rather than tilting marginals
+and renormalizing — a favourite's round-1 share clamps at 1.0, the clamped mass
+disappears, and the round stops summing to its number of survivors.
+
+**Joining pick data to the field is by `(region, seed)`, not by name.** The pick
+source says "FAU", "UConn", "Texas A&M-CC"; the ratings source says "Florida
+Atlantic", "Connecticut", "Texas A&M-Corpus Christi" — 11 of 64 mismatched in
+2023 and an alias table would rot every year. Instead `resolve_teams` resolves
+the names that are unambiguous *within their seed* (only 4-6 candidates), lets
+those vote on which source region is which tournament region, and then places
+every remaining team exactly. Do not replace this with fuzzy name matching; a
+silent wrong match corrupts the opponent model invisibly.
+
 ## Binary Encoding
 
 Each bracket is 63 booleans. A bit is `true` when the numerically lower seed
@@ -292,6 +349,12 @@ effect.
 - **Portfolio monotonicity**: more entries never score worse, a one-entry
   portfolio is the exact optimum, the local search never loses ground, and the
   result is identical across repeated runs.
+- **Win probability**: it stays in `[0, 1]`, rises with entries, sits near a
+  coin flip against a single opponent, and optimizing it beats the
+  expected-score bracket at actually finishing first.
+- **Opponent field**: sampled public entries are legal brackets and reproduce
+  the marginals they were built from; each round's marginals sum to its number
+  of survivors and never rise with round.
 
 ## Benchmarking
 
@@ -310,3 +373,4 @@ buried in worker-thread spin.
 API responses are cached in `./data/` directory:
 - `games_{season}.json`: Season game results (6-hour staleness)
 - `bracket_{year}.json`: Tournament bracket teams
+- `picks_{year}.json`: ESPN public pick rates (see `src/field.rs`)

@@ -89,6 +89,28 @@ impl ProbabilityCache {
     pub fn get(&self, team_a_idx: u8, team_b_idx: u8) -> f64 {
         self.probs[team_a_idx as usize][team_b_idx as usize]
     }
+
+    /// The same matchups with every probability pushed toward the favourite.
+    ///
+    /// `tilt > 1` makes the stronger team win more often than the model says.
+    /// Used to stand in for a public that picks more chalk than the ratings
+    /// justify: running the advancement recurrence over a tilted cache gives
+    /// marginals that are automatically consistent, which renormalizing a set
+    /// of tilted marginals is not.
+    pub fn tilted(&self, tilt: f64) -> ProbabilityCache {
+        let mut probs = [[0.5f64; NUM_TEAMS]; NUM_TEAMS];
+        for a in 0..NUM_TEAMS {
+            for b in 0..NUM_TEAMS {
+                if a == b {
+                    continue;
+                }
+                let p = self.probs[a][b];
+                let (hi, lo) = (p.powf(tilt), (1.0 - p).powf(tilt));
+                probs[a][b] = if hi + lo > 0.0 { hi / (hi + lo) } else { p };
+            }
+        }
+        ProbabilityCache { probs }
+    }
 }
 
 #[derive(Debug)]

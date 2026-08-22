@@ -5,6 +5,7 @@ mod bracket;
 mod config;
 mod elo;
 mod exact;
+mod field;
 mod ga;
 mod game_result;
 mod ingest;
@@ -23,7 +24,9 @@ use ga::{
     GeneticAlgorithm, HybridOptimizer, LockSet, MonteCarloScenarios, SequentialPortfolioOptimizer,
     WholePortfolioGA,
 };
+use field::PickPopularity;
 use portfolio::{AdvancementRound, BracketConstraint, BracketPortfolio, ConstrainedBracketBuilder};
+use rand::SeedableRng;
 use std::process::ExitCode;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -51,6 +54,14 @@ enum PortfolioStrategy {
     GaWhole,
     /// Sequential: optimize bracket 1, freeze, optimize bracket 2 for marginal contribution, etc.
     GaSequential,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+enum ObjectiveArg {
+    /// Expected best-ball score — right when the payout is linear in points
+    BestBall,
+    /// P(one of my entries finishes first) against the rest of the pool
+    FirstPlace,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -124,6 +135,32 @@ struct Args {
     /// Strategy for portfolio generation
     #[arg(long, value_enum, default_value = "exact-basis")]
     portfolio_strategy: PortfolioStrategy,
+
+    /// What the portfolio search maximizes (exact-basis strategy only)
+    #[arg(long, value_enum, default_value = "best-ball")]
+    objective: ObjectiveArg,
+
+    /// Total entries in your pool, including yours. Sets how much competition
+    /// `--objective first-place` optimizes against.
+    #[arg(long, default_value = "100")]
+    pool_entries: usize,
+
+    /// Independent draws of the opposing field to average over
+    #[arg(long, default_value = "8")]
+    field_replicates: usize,
+
+    /// JSON file of public pick rates (see --fetch-picks)
+    #[arg(long)]
+    pick_popularity: Option<String>,
+
+    /// Fetch published pick rates from ESPN for this tournament year and cache them
+    #[arg(long)]
+    fetch_picks: Option<i32>,
+
+    /// Fallback bias toward favourites when no pick data is available.
+    /// 1.0 is the rating model itself; above that is a chalkier public.
+    #[arg(long, default_value = "1.6")]
+    chalk_tilt: f64,
 
     /// Number of steps for annealing strategy
     #[arg(long, default_value = "10000")]
@@ -297,6 +334,7 @@ fn run() -> Result<(), String> {
             args.anneal_steps,
             &scoring_config,
             &app_config,
+            &args,
             args.verbose,
         );
     } else {
@@ -718,6 +756,32 @@ fn report_against_optimum(
     }
 }
 
+/// Resolve where the public's picks come from: an explicit file, a fetch from
+/// ESPN, a previously cached fetch, or — failing all of those — a chalk model
+/// standing in for data we do not have.
+fn load_pick_popularity(
+    tournamentinfo: &ingest::TournamentInfo,
+    args: &Args,
+) -> Result<PickPopularity, String> {
+    if let Some(path) = &args.pick_popularity {
+        return PickPopularity::load(path, tournamentinfo);
+    }
+
+    if let Some(year) = args.fetch_picks {
+        let file = field::fetch_espn(year, &args.cache_dir)?;
+        return PickPopularity::from_file(&file, tournamentinfo);
+    }
+
+    eprintln!(
+        "No public pick data given (--pick-popularity or --fetch-picks); \n\
+         falling back to a chalk model with tilt {:.2}. How concentrated the \n\
+         public actually is on the favourite is the single biggest input to \n\
+         this objective, so the real numbers are worth fetching.",
+        args.chalk_tilt
+    );
+    Ok(PickPopularity::chalk(tournamentinfo, args.chalk_tilt))
+}
+
 /// Run portfolio mode - generate multiple diverse brackets
 fn run_portfolio_mode(
     tournamentinfo: &ingest::TournamentInfo,
@@ -729,6 +793,7 @@ fn run_portfolio_mode(
     anneal_steps: usize,
     scoring_config: &ScoringConfig,
     app_config: &Config,
+    args: &Args,
     verbose: bool,
 ) {
     println!();
@@ -740,11 +805,6 @@ fn run_portfolio_mode(
     let brackets: Vec<bracket::Bracket> = match strategy {
         PortfolioStrategy::ExactBasis => {
             println!("Mode: exact conditional basis + coordinate ascent");
-            println!(
-                "Fitness: best-ball score against {} scenarios",
-                app_config.simulation.pool_size
-            );
-            println!();
 
             let pool = score::ScenarioPool::new(
                 tournamentinfo,
@@ -753,38 +813,115 @@ fn run_portfolio_mode(
                 ga::DEFAULT_POOL_SEED,
             );
 
-            let plan = optimize::optimize(
+            // The competition, if we are optimizing against it. Sampling the
+            // field and reducing it to per-scenario order statistics is the
+            // only up-front cost; after that an entry is evaluated at the same
+            // price as under best-ball.
+            let competition = match args.objective {
+                ObjectiveArg::BestBall => None,
+                ObjectiveArg::FirstPlace => {
+                    let public = match load_pick_popularity(tournamentinfo, args) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
+                            return;
+                        }
+                    };
+                    let (favourite, share) = public.favourite();
+                    println!("Public picks:  {}", public.source);
+                    if let Some(n) = public.sample_size {
+                        println!("Entries seen:  {}", n);
+                    }
+                    println!(
+                        "Most-picked champion: {} ({:.1}% of entries)",
+                        tournamentinfo.teams[favourite as usize].name,
+                        share * 100.0
+                    );
+
+                    let opponents = args.pool_entries.saturating_sub(num_brackets).max(1);
+                    println!(
+                        "Competition:   {} opposing entries, averaged over {} draws of the field",
+                        opponents, args.field_replicates
+                    );
+                    println!();
+
+                    Some(pool.competition(
+                        args.field_replicates.max(1),
+                        opponents,
+                        |replicate, i| {
+                            let mut rng = rand::rngs::SmallRng::seed_from_u64(
+                                ga::DEFAULT_POOL_SEED
+                                    ^ ((replicate as u64) << 40)
+                                    ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                            );
+                            public.sample_entry(tournamentinfo, &mut rng)
+                        },
+                    ))
+                }
+            };
+
+            let objective = match &competition {
+                Some(c) => optimize::Objective::FirstPlace(c),
+                None => optimize::Objective::BestBall,
+            };
+            println!("Maximizing:    {}", objective.name());
+            println!(
+                "Estimated against {} sampled tournaments",
+                app_config.simulation.pool_size
+            );
+            println!();
+
+            let plan = optimize::optimize_for(
                 tournamentinfo,
                 scoring_config,
                 &pool,
                 locks,
                 num_brackets,
+                objective,
                 verbose,
-            );
-
-            // Optimizing against a finite sample always flatters itself a
-            // little. A second, independently drawn pool says how much of the
-            // gain survives outside the sample it was fitted to.
-            let holdout = optimize::holdout_score(
-                tournamentinfo,
-                scoring_config,
-                &plan.entries,
-                app_config.simulation.pool_size.max(50_000),
-                ga::DEFAULT_POOL_SEED ^ 0xFFFF_FFFF,
             );
 
             println!("\n=== Portfolio Optimization Complete ===");
             println!("Conditionally optimal brackets considered: {}", plan.basis_size);
             println!("Coordinate-ascent sweeps to convergence:   {}", plan.sweeps);
-            println!("Best single entry:        {:.2}", plan.single_entry);
-            println!("Best-ball, in-sample:     {:.2}", plan.best_ball);
-            println!("Best-ball, held out:      {:.2}", holdout);
-            println!(
-                "Gain from {} entries over 1: {:+.2}  ({:+.2} of it from the polish)",
-                num_brackets,
-                plan.best_ball - plan.single_entry,
-                plan.polish_gain
-            );
+
+            match &competition {
+                None => {
+                    // Optimizing against a finite sample always flatters
+                    // itself; a second, independently drawn pool says how much
+                    // of the gain survives outside the sample it was fitted to.
+                    let holdout = optimize::holdout_score(
+                        tournamentinfo,
+                        scoring_config,
+                        &plan.entries,
+                        app_config.simulation.pool_size.max(50_000),
+                        ga::DEFAULT_POOL_SEED ^ 0xFFFF_FFFF,
+                    );
+                    println!("Best single entry:        {:.2}", plan.single_entry);
+                    println!("Best-ball, in-sample:     {:.2}", plan.best_ball);
+                    println!("Best-ball, held out:      {:.2}", holdout);
+                    println!("Added by the local search: {:+.2}", plan.polish_gain);
+                }
+                Some(c) => {
+                    println!("Top opposing score, average: {:.1}", c.mean_top_score());
+                    println!(
+                        "P(finish first) with 1 entry:  {:.3}%",
+                        plan.single_entry * 100.0
+                    );
+                    println!(
+                        "P(finish first) with {} entries: {:.3}%  ({:+.3}% from the local search)",
+                        num_brackets,
+                        plan.best_ball * 100.0,
+                        plan.polish_gain * 100.0
+                    );
+                    let fair = num_brackets as f64 / args.pool_entries.max(1) as f64;
+                    println!(
+                        "A random entrant's share would be {:.3}%, so this is {:.2}x fair",
+                        fair * 100.0,
+                        plan.best_ball / fair
+                    );
+                }
+            }
             if num_brackets > 1 {
                 println!(
                     "Entries differ on {:.0} of 63 games on average",

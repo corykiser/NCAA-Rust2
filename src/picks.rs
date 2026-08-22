@@ -105,6 +105,31 @@ impl Picks {
         p
     }
 
+    /// Build a bracket game by game from an arbitrary choice rule.
+    ///
+    /// `advance(game, a, b)` returns the probability that `a` beats `b` in that
+    /// game. `sample` is this with the rating model's probabilities; the
+    /// opponent-field sampler in [`crate::field`] supplies the public's pick
+    /// rates instead, so both produce legal brackets through one code path.
+    pub fn sample_with(
+        t: &TournamentInfo,
+        rng: &mut impl Rng,
+        mut advance: impl FnMut(usize, u8, u8) -> f32,
+    ) -> Picks {
+        let mut p = Picks {
+            winners: [PAD; PADDED_GAMES],
+            bits: 0,
+        };
+        for game in 0..NUM_GAMES {
+            let (a, b) = p.participants(t, game);
+            let w = if rng.gen::<f32>() < advance(game, a, b) { a } else { b };
+            let loser = if w == a { b } else { a };
+            p.winners[game] = w;
+            p.set_bit(game, t.winner_bit(w, loser));
+        }
+        p
+    }
+
     /// The two teams playing `game`, given the winners already decided below it.
     #[inline(always)]
     fn participants(&self, t: &TournamentInfo, game: usize) -> (u8, u8) {
