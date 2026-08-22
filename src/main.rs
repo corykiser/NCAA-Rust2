@@ -9,8 +9,11 @@ mod ga;
 mod game_result;
 mod ingest;
 mod names;
+mod optimize;
+mod picks;
 mod pool;
 mod portfolio;
+mod score;
 mod tree;
 
 use bracket::{ScoringConfig, SeedScoring};
@@ -35,6 +38,9 @@ enum DataSourceArg {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum PortfolioStrategy {
+    /// Greedy selection over exactly-optimal conditional brackets, then
+    /// coordinate-ascent polish. Deterministic and strongest by best-ball.
+    ExactBasis,
     /// Each bracket bets on a different championship winner (legacy)
     Champion,
     /// Greedily maximize EV while penalizing similarity (legacy)
@@ -116,7 +122,7 @@ struct Args {
     diversity_weight: f64,
 
     /// Strategy for portfolio generation
-    #[arg(long, value_enum, default_value = "ga-whole")]
+    #[arg(long, value_enum, default_value = "exact-basis")]
     portfolio_strategy: PortfolioStrategy,
 
     /// Number of steps for annealing strategy
@@ -732,6 +738,62 @@ fn run_portfolio_mode(
     println!();
 
     let brackets: Vec<bracket::Bracket> = match strategy {
+        PortfolioStrategy::ExactBasis => {
+            println!("Mode: exact conditional basis + coordinate ascent");
+            println!(
+                "Fitness: best-ball score against {} scenarios",
+                app_config.simulation.pool_size
+            );
+            println!();
+
+            let pool = score::ScenarioPool::new(
+                tournamentinfo,
+                app_config.simulation.pool_size,
+                scoring_config,
+                ga::DEFAULT_POOL_SEED,
+            );
+
+            let plan = optimize::optimize(
+                tournamentinfo,
+                scoring_config,
+                &pool,
+                locks,
+                num_brackets,
+                verbose,
+            );
+
+            // Optimizing against a finite sample always flatters itself a
+            // little. A second, independently drawn pool says how much of the
+            // gain survives outside the sample it was fitted to.
+            let holdout = optimize::holdout_score(
+                tournamentinfo,
+                scoring_config,
+                &plan.entries,
+                app_config.simulation.pool_size.max(50_000),
+                ga::DEFAULT_POOL_SEED ^ 0xFFFF_FFFF,
+            );
+
+            println!("\n=== Portfolio Optimization Complete ===");
+            println!("Conditionally optimal brackets considered: {}", plan.basis_size);
+            println!("Coordinate-ascent sweeps to convergence:   {}", plan.sweeps);
+            println!("Best single entry:        {:.2}", plan.single_entry);
+            println!("Best-ball, in-sample:     {:.2}", plan.best_ball);
+            println!("Best-ball, held out:      {:.2}", holdout);
+            println!(
+                "Gain from {} entries over 1: {:+.2}  ({:+.2} of it from the polish)",
+                num_brackets,
+                plan.best_ball - plan.single_entry,
+                plan.polish_gain
+            );
+            if num_brackets > 1 {
+                println!(
+                    "Entries differ on {:.0} of 63 games on average",
+                    plan.mean_spread()
+                );
+            }
+
+            plan.brackets(tournamentinfo, scoring_config)
+        }
         PortfolioStrategy::Champion => {
             let portfolio =
                 BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config);

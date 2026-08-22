@@ -1,4 +1,5 @@
 use crate::ingest::{RcTeam, TournamentInfo};
+use crate::picks::Picks;
 use crate::tree::{NUM_GAMES, ROUND_GAMES, ROUND_OF, ROUND_START};
 use rand::Rng;
 use std::sync::Arc;
@@ -225,7 +226,19 @@ impl Bracket {
         winners: &[u8; NUM_GAMES],
         config: &ScoringConfig,
     ) -> Bracket {
-        let table = ScoreTable::new(config);
+        Self::assemble_with(tournamentinfo, winners, &ScoreTable::new(config))
+    }
+
+    /// `assemble` against an already-built score table.
+    ///
+    /// Rebuilding the 6x17 table per bracket was 102 divisions and branches
+    /// before a single game was looked at; callers that construct brackets in
+    /// bulk build it once.
+    fn assemble_with(
+        tournamentinfo: &TournamentInfo,
+        winners: &[u8; NUM_GAMES],
+        table: &ScoreTable,
+    ) -> Bracket {
         let mut games: Vec<Game> = Vec::with_capacity(NUM_GAMES);
         let mut binary: Vec<bool> = Vec::with_capacity(NUM_GAMES);
 
@@ -310,6 +323,48 @@ impl Bracket {
 
         let winners = tournamentinfo.decode_winners(binary_slice);
         Self::assemble(tournamentinfo, &winners, config)
+    }
+
+    /// Build a bracket from its 63-bit `u64` encoding.
+    pub fn new_from_binary_bits(
+        tournamentinfo: &TournamentInfo,
+        bits: u64,
+        config: Option<&ScoringConfig>,
+    ) -> Bracket {
+        Self::from_picks(
+            tournamentinfo,
+            &Picks::from_bits(tournamentinfo, bits),
+            config,
+        )
+    }
+
+    /// Materialise the full display bracket from the optimizers' compact form.
+    ///
+    /// This is the one place the two representations meet: everything that
+    /// searches works on `Picks`, and exactly one `Bracket` per reported result
+    /// is built here.
+    pub fn from_picks(
+        tournamentinfo: &TournamentInfo,
+        picks: &Picks,
+        config: Option<&ScoringConfig>,
+    ) -> Bracket {
+        let default_config = ScoringConfig::default();
+        let config = config.unwrap_or(&default_config);
+        Self::assemble(tournamentinfo, picks.winners(), config)
+    }
+
+    /// `from_picks` against an already-built score table.
+    pub fn from_picks_with(
+        tournamentinfo: &TournamentInfo,
+        picks: &Picks,
+        table: &ScoreTable,
+    ) -> Bracket {
+        Self::assemble_with(tournamentinfo, picks.winners(), table)
+    }
+
+    /// The compact form the optimizers work on.
+    pub fn picks(&self, tournamentinfo: &TournamentInfo) -> Picks {
+        Picks::from_winners(tournamentinfo, &self.winner_indices())
     }
 
     /// Winning team index of every game.

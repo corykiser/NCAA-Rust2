@@ -23,6 +23,7 @@ cargo run --release -- --source ncaa    # NCAA API
 cargo run --release -- --source csv     # FiveThirtyEight CSV
 
 # Generate portfolio of diverse brackets
+cargo run --release -- --portfolio 5 --portfolio-strategy exact-basis
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-whole
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-sequential
 cargo run --release -- --portfolio 5 --portfolio-strategy annealing
@@ -38,6 +39,11 @@ cargo run --release -- --lock-team "Duke:FinalFour" --lock-team "UConn:Winner"
 # Run tests
 cargo test
 
+# Benchmark the hot paths (synthetic-free: uses the shipped 2023 field)
+cargo run --release --bin bench
+cargo run --release --bin bench -- score/        # filter to one group
+cargo run --release --bin bench -- quality       # portfolio quality shootout
+
 # Run single test
 cargo test test_expected_score
 ```
@@ -49,18 +55,21 @@ cargo test test_expected_score
 2. **ELO Calculation** (`elo.rs`): Process games chronologically to calculate team ratings with margin-of-victory adjustments
 3. **Tournament Setup** (`ingest.rs`): Create `TournamentInfo` with 64 teams organized by region and seed
 4. **Bracket Simulation** (`bracket.rs`): Generate brackets using Monte Carlo simulation with probability-weighted outcomes
-5. **Optimization** (`pool.rs`, `anneal.rs`): Evolve brackets using genetic algorithms or simulated annealing to maximize expected value
-6. **Portfolio Generation** (`portfolio.rs`): Create diverse bracket portfolios with different champion strategies
+5. **Optimization** (`exact.rs`, `ga.rs`, `anneal.rs`, `pool.rs`): the single bracket is solved exactly; the heuristics remain for portfolios and for comparison
+6. **Portfolio Generation** (`optimize.rs`, `portfolio.rs`): build multi-entry portfolios that maximize expected best-ball payout
 
 ### Key Structs
 
 - **`TournamentInfo`**: Holds 64 teams with `RcTeam` (Arc<Team>) for efficient sharing, plus the derived tables the optimizers need (`seed_of`, `region_rank`, `r1_teams`, `r1_game_of_team`, `advancement`). The field is validated on construction — duplicate `(region, seed)` slots, duplicate names, and out-of-range seeds are rejected rather than silently overwriting each other.
-- **`Bracket`**: 63 games stored as flat vector (R1: 0-31, R2: 32-47, R3: 48-55, R4: 56-59, R5: 60-61, R6: 62), uses binary representation for mutations
+- **`Bracket`**: 63 games stored as flat vector (R1: 0-31, R2: 32-47, R3: 48-55, R4: 56-59, R5: 60-61, R6: 62), uses binary representation for mutations. This is the *display* form — the optimizers work on `Picks` (see below) and materialise a `Bracket` once, at the end.
+- **`Picks`** (`src/picks.rs`): the same bracket in 72 bytes of `Copy` data — 63 winner indices plus the 63-bit encoding, no allocation and no reference counting.
+- **`ScenarioPool`** (`src/score.rs`): sampled tournaments as flat bytes, with the branchless SIMD kernels that score candidates against them.
 - **`Game`**: Single matchup with win probabilities calculated via logistic function: `1 / (1 + 10^(-rating_diff * 30.464 / 400))`
 - **`ScoringConfig`**: Configurable round scoring with seed bonuses (Add, Multiply, or None per round)
 
 ### Parallel Processing
-Uses `rayon` for parallel bracket generation and scoring. Teams use `Arc<Team>` for thread-safe reference counting without data cloning.
+Uses `rayon` for scenario generation, population evaluation, and candidate
+scanning. Parallelism is kept to **one level** — see `src/score.rs`.
 
 ## CLI Arguments Reference
 
@@ -73,7 +82,7 @@ Uses `rayon` for parallel bracket generation and scoring. Teams use `Arc<Team>` 
 | `--generations` | 200 | Genetic algorithm generations |
 | `--batch-size` | 1000 | Monte Carlo simulations per scoring (legacy mode) |
 | `--portfolio` | - | Number of brackets to generate |
-| `--portfolio-strategy` | ga-whole | Strategy: ga-whole, ga-sequential, annealing, champion, diverse |
+| `--portfolio-strategy` | exact-basis | Strategy: exact-basis, ga-whole, ga-sequential, annealing, champion, diverse |
 | `--diversity-weight` | 5.0 | Weight for bracket diversity (legacy strategies) |
 | `--lock-team` | - | Lock team to round (repeatable) |
 | `--score-r1` through `--score-r6` | 1,2,4,8,16,32 | Points per round |
@@ -170,6 +179,68 @@ games are in **seed order** (`1v16, 2v15, 3v14, ...`), which is not tree order �
 the `1v16` winner plays the `8v9` winner. `CHILDREN`, `PARENT`, and `ROUND_OF`
 encode this; nothing else should re-derive it.
 
+## Compact Representation (`src/picks.rs`)
+
+`Bracket` carries three `Arc<Team>` handles and a probability triple per game —
+189 atomic refcount bumps and two allocations per construction. That is right
+for printing a result and wrong for an inner loop that builds millions of
+candidates.
+
+`Picks` is 72 bytes of `Copy` data: the 63 game winners and the 63-bit encoding,
+kept in step by construction. Every optimizer works on `Picks`;
+`Bracket::from_picks` materialises the display form once, at the end.
+
+`Picks::force_to_round` walks only the twelve games a move can reach (the team's
+path up, then the ancestors above it) rather than re-decoding all 63.
+
+## Scoring (`src/score.rs`)
+
+A `ScenarioPool` is a flat `Vec<u8>`, 64 bytes of winner indices per scenario.
+Storing sampled tournaments as `Bracket`s instead cost ~75 MB and two million
+atomics for a 10,000-scenario pool.
+
+The kernel is branchless. Spelled `if winners match { acc += points }`, LLVM
+emits a branch per game, and a pick matching a sampled tournament is close to a
+coin flip — sixty mispredictions per scenario, which was most of the cost. The
+SSE2 path compares sixteen games at once and masks the payouts; there is a
+branchless scalar fallback for other architectures. `cargo test` checks the
+kernel against the original `FastBracket::score_against` pick for pick.
+
+Rules for anything touching this file:
+
+- **Parallelism is one level.** Score a population across threads with the
+  scenario loop serial inside, or score one candidate across threads — never
+  both. Nested rayon was a quarter of total run time in the callgrind profile.
+- **Per-scenario scores are `f32`, means are `f64`.** A row score is a sum of at
+  most 63 table entries and is exact in `f32` for integer scoring rules;
+  accumulating 100,000 of them is not.
+- **Reduction order is fixed**, so results are reproducible run to run.
+
+## Portfolio Optimization (`src/optimize.rs`)
+
+Best-ball payout `E_s[max_i score(b_i, s)]` has a maximum inside an expectation:
+no closed form, and none of the linearity the single-bracket DP exploits. Two
+structural facts do most of the work anyway.
+
+**Conditional optimality.** The reason to enter a second bracket is to cover an
+outcome the first one misses, and the best cover for "team X wins it all" is the
+exact optimum given that lock. Sweeping 64 teams by 6 depths is 384 solves —
+milliseconds — and gives a basis of a few hundred brackets, each optimal for the
+bet it represents.
+
+**Separability under freezing.** With every entry but one fixed, their
+per-scenario best is a constant vector, so evaluating a replacement costs one
+bracket's scoring rather than the portfolio's. That makes an exhaustive
+coordinate sweep affordable, and every accepted swap raises best-ball by
+construction, so it converges.
+
+This is a strong local optimum, not the global one — nothing tractable gives the
+global optimum here. It is deterministic, and beats the GAs on held-out score at
+every portfolio size.
+
+`holdout_score` re-scores a finished portfolio on an independently seeded pool.
+Report it: some of any in-sample gain is fitting the sample.
+
 ## Binary Encoding
 
 Each bracket is 63 booleans. A bit is `true` when the numerically lower seed
@@ -213,7 +284,26 @@ effect.
 - **Local optimality**: no single bit flip and no forced team-round move beats
   the exact solution.
 - **Calibration**: the exact expected value agrees with a 40,000-trial Monte
-  Carlo estimate.
+  Carlo estimate, and a bracket's mean score over a 200,000-scenario pool agrees
+  with its exact expected value.
+- **Kernel equivalence**: the SIMD scoring kernel matches the original
+  straightforward `f64` scorer on every pair in a sample, and the parallel and
+  serial reductions agree to the last bit.
+- **Portfolio monotonicity**: more entries never score worse, a one-entry
+  portfolio is the exact optimum, the local search never loses ground, and the
+  result is identical across repeated runs.
+
+## Benchmarking
+
+`src/bin/bench.rs` times the hot paths against the shipped 2023 FiveThirtyEight
+field. Use the real field, not invented ratings: a wide rating spread makes
+every game close to decided, which collapses the search space and flatters any
+optimizer — and it hides the branch-misprediction cost that a realistic field
+exposes.
+
+Profile with callgrind (`valgrind --tool=callgrind --cache-sim=no`); `perf` is
+not available in the container. Set `RAYON_NUM_THREADS=1` so the profile is not
+buried in worker-thread spin.
 
 ## Data Caching
 
