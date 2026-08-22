@@ -1,7 +1,10 @@
 # NCAA-Rust2 — Improvement Proposals
 
 Review of the codebase at `e48c0a0`, with behavior verified by running the release
-binary against `--source csv`. Ordered by impact. Nothing here is implemented.
+binary against `--source csv`. Ordered by impact.
+
+> **Status.** Tier 0 (§0.1-0.5) and §1.1, plus §2.5 and part of §2.1, are
+> **implemented**. Each is marked below. Everything else stands as proposed.
 
 ---
 
@@ -10,7 +13,7 @@ binary against `--source csv`. Ordered by impact. Nothing here is implemented.
 These are the priority: each one produces confident, plausible-looking output that
 is wrong. No error, no warning.
 
-### 0.1 `--lock-team` produces impossible brackets and the lock is not honored
+### 0.1 `--lock-team` produces impossible brackets and the lock is not honored — **FIXED**
 
 `ConstrainedBracketBuilder::apply_constraint` (`src/portfolio.rs:180`) overwrites
 `bracket.games[idx].winner` in place. It does **not** propagate the new winner into
@@ -50,7 +53,12 @@ propagation automatic and the result legal by construction. `apply_constraint_to
 round 1 only; its own comment admits the limitation. Finish that function and delete
 `apply_constraint`.
 
-### 0.2 The constrained optimizer's accept test can never fire
+*Implemented. `ConstrainedBracketBuilder` now edits the bit vector via `LockSet`
+and rebuilds, and verifies the constraints before returning. `LockSet::repair` is
+applied to every candidate the optimizers produce, so locks also survive mutation
+and crossover — they previously did not.*
+
+### 0.2 The constrained optimizer's accept test can never fire — **FIXED**
 
 `src/main.rs:683`:
 
@@ -75,7 +83,12 @@ Expected Value: 276.1133386173198   <- final, unchanged
 `--generations` in constrained mode burns CPU and does nothing. It should compare
 against the incumbent's own batch score.
 
-### 0.3 Smart mutation does not force the team to advance
+*Implemented. The separate constrained path is gone; locks now flow into whichever
+optimizer runs, and the hill climber compares against the incumbent's own batch
+score. It now improves 217 -> 235 over 100 generations where it previously moved
+not at all.*
+
+### 0.3 Smart mutation does not force the team to advance — **FIXED**
 
 `TeamRoundMutator::force_team_to_round` is the core operator — it is used by every
 mutation and every crossover in `GeneticAlgorithm`, `WholePortfolioGA`, and
@@ -108,7 +121,11 @@ directed move. This is why the search is so flat (see 1.2).
 **Fix:** see §2.1 — the encoding change makes this function trivially correct
 instead of trying to patch it.
 
-### 0.4 ELO team-name matching is a substring search over a `HashMap`
+*Implemented as `TeamRoundMutator::force_index_to_round`, which walks the team's
+actual path up the parent chain and computes each bit against the real opponent.
+Verified for all 64 teams at all 6 depths.*
+
+### 0.4 ELO team-name matching is a substring search over a `HashMap` — **FIXED**
 
 `EloSystem::find_team_by_name` (`src/elo.rs:243`):
 
@@ -135,7 +152,15 @@ name only, and `team_lookup` is keyed by `(region, seed)`, duplicate names break
 fail loudly with the candidate list instead of guessing. Assert 64 distinct
 `(region, seed)` pairs and 64 distinct names at ingest.
 
-### 0.5 A total data-fetch failure degrades into a uniform-random optimizer
+*Implemented as `src/names.rs`: normalization (including `St` -> Saint at the front
+but State at the end), a built-in alias table, and three match tiers where the
+first tier to produce any match decides — one hit resolves, more than one is an
+error naming the candidates. Field validation now rejects duplicate slots, duplicate
+names, and out-of-range seeds. The sample field's duplicated "Texas" is corrected.
+With four Texas schools in the 2023 field, `Texas` and `Texas A&M` each resolve to
+exactly the right one.*
+
+### 0.5 A total data-fetch failure degrades into a uniform-random optimizer — **FIXED**
 
 `src/main.rs`, ESPN/NCAA path: if `fetch_season` errors, it prints a warning and
 substitutes `Vec::new()`. Zero games means every team keeps `DEFAULT_RATING = 1500.0`,
@@ -151,11 +176,15 @@ staleness window then serves that truncated season for the rest of the day.
 Record per-day fetch status in the cache and refuse to mark a season complete with
 missing days.
 
+*Implemented. `fetch_games_for_range` returns its failed days, `fetch_season` errors
+rather than caching a partial season, and a fetch failure or an empty game set is a
+hard error with a non-zero exit. `--allow-partial-data` opts out explicitly.*
+
 ---
 
 ## Tier 1 — Modeling and statistical soundness
 
-### 1.1 The single-bracket objective is exactly solvable; the GA is unnecessary for it
+### 1.1 The single-bracket objective is exactly solvable; the GA is unnecessary for it — **IMPLEMENTED**
 
 This is the largest single improvement available.
 
@@ -191,6 +220,21 @@ What this buys:
 
 Monte Carlo is still needed for portfolio best-ball (max over brackets is nonlinear)
 and for variance/percentile reporting. That's the right division of labor.
+
+*Implemented as `src/exact.rs` (+ `src/advancement.rs`), and `--optimization-mode
+exact` is now the default. ~3 ms including data loading, deterministic, and locks
+drop into the same recurrence. The heuristic modes now print their gap to the
+optimum. Verified against exhaustive enumeration: with the last two rounds scored
+at zero the regions decouple, and the DP's answer matches brute force over all
+2^15 outcomes of each region to 1e-9.*
+
+Two things fell out of this. The old `expected_value` field multiplied each pick's
+points by its probability of winning that game *given the matchup happened*, not
+the unconditional probability — it reported ~300 for brackets whose true expected
+score was ~228. It is now the real expected value and agrees with a 40,000-trial
+Monte Carlo estimate. And the GA turns out to land within 0.2-0.3% of the optimum,
+so the search was working; it just had no way to say so, and cost 11 s and a
+different champion each run to get there.
 
 ### 1.2 The GA is currently fitting Monte Carlo noise, not signal
 
@@ -295,7 +339,7 @@ Smaller, but each is a known source of rating error:
 
 ## Tier 2 — Representation and architecture
 
-### 2.1 Replace the `lower_seed_won` encoding with a positional one
+### 2.1 Replace the `lower_seed_won` encoding with a positional one — **PARTIALLY ADDRESSED**
 
 The 63-bit encoding stores, per game, "did the numerically lower seed win — or for
 cross-region games, the alphabetically earlier region". This is the root cause of
@@ -319,6 +363,13 @@ Consequences:
 
 This is a contained change — `Game::new_from_binary*`, `Bracket::new_from_binary`, the
 mutators, and `portfolio.rs`'s index helpers — and it removes more code than it adds.
+
+*Partially addressed. The encoding itself is unchanged, but its definition now
+lives in exactly one place (`TournamentInfo::bit_true_winner`), the bracket
+structure lives in `src/tree.rs` instead of being re-derived per round in each
+constructor, and `decode_winners` / `binary_from_winners` are the only encode and
+decode paths. That was enough to make the mutator correct without changing the
+representation. The positional encoding is still the better long-term shape.*
 
 ### 2.2 `Game` carries five fields nobody reads
 
@@ -346,7 +397,7 @@ mode is dispatched inline. The five bracket-printing loops in `run_portfolio_mod
 are copy-pasted. Extract an `Optimizer` trait with one method, and a single reporting
 function.
 
-### 2.5 Two independent scoring configs are live at once
+### 2.5 Two independent scoring configs are live at once — **FIXED**
 
 `main.rs` builds `ScoringConfig` from the `--score-r*` / `--seed-r*` CLI flags. But
 `SequentialPortfolioOptimizer::new` and `HybridOptimizer::new` call
@@ -356,7 +407,7 @@ So `--score-r6 100` is honored under `--portfolio-strategy ga-whole` and silentl
 ignored under `--portfolio-strategy ga-sequential` or `--optimization-mode hybrid`.
 Worse, the banner prints the CLI values in both cases.
 
-**Fix:** one resolution point — defaults ← YAML ← CLI — producing one `ScoringConfig`
+**Fix:** one resolution point — defaults <- YAML <- CLI — producing one `ScoringConfig`
 threaded everywhere. Clap's `ArgMatches::value_source` distinguishes "user passed it"
 from "default", which is what makes correct layering possible.
 
@@ -545,3 +596,42 @@ current; `CLAUDE.md` is not.
 5. **§1.4** (probability calibration) — everything downstream inherits this error.
 6. **§1.3** (opponent model) — the change that makes the output decision-useful.
 7. **§3.1–3.3**, then **§2.3–2.7**, **§4.2–4.6** as cleanup.
+
+
+---
+
+## Addendum: what shipped
+
+Implemented in this branch:
+
+| Item | Change |
+|---|---|
+| §0.1 | Constraints applied to the bit vector and rebuilt; `LockSet` repairs every optimizer candidate; result verified before return |
+| §0.2 | Separate constrained path removed; hill climber compares against the incumbent's own score |
+| §0.3 | `force_index_to_round` walks the team's real path; the seed-only and region-only heuristics are gone |
+| §0.4 | `src/names.rs` — normalization, aliases, tiered matching, ambiguity as an error; field validation at ingest |
+| §0.5 | Failed or partial fetches are hard errors; partial seasons are never cached |
+| §1.1 | `src/exact.rs` + `src/advancement.rs`; `--optimization-mode exact` is the default; heuristics report their gap |
+| §2.5 | One layered `ScoringConfig`: defaults <- YAML <- CLI |
+| §2.1 | Partial: structure centralized in `src/tree.rs`, one encode/decode path |
+
+Also fixed along the way:
+
+- `Bracket::expected_value` was not an expected value (§1.1 addendum).
+- `Team` equality compared names, so two teams sharing a name were equal. It now
+  compares index.
+- `pretty_print`'s headings named the round just played, so `--lock-team
+  X:FinalFour` listed X under a heading reading "Elite 8" and looked ignored.
+  Headings now name the round the listed teams advance to.
+- Bad `--seed-r*` values warned and silently fell back to `none`; now an error.
+- The `unsafe get_unchecked` in `ScoreTable::get` on a data-derived seed is gone
+  (§3.5); seeds are validated at ingest instead.
+
+Test count went from 7 to 54, covering bracket legality across every construction
+path, encoding round-trip, the mutation operator's postcondition, lock durability
+under mutation, exhaustive verification of the DP, and local optimality of its
+result.
+
+Still open: §1.2 (overfitting / hold-out validation), §1.3 (opponent model),
+§1.4 (probability calibration), §1.5 (ELO gaps), §2.2-2.4, §2.6-2.7, §3.1-3.4,
+§4.1-4.6.

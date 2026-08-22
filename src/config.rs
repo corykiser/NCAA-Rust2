@@ -79,19 +79,20 @@ impl Config {
         Ok(())
     }
 
-    /// Convert scoring settings to ScoringConfig
-    pub fn to_scoring_config(&self) -> ScoringConfig {
-        ScoringConfig {
-            round_scores: self.scoring.round_scores,
-            round_seed_scoring: [
-                parse_seed_scoring(&self.scoring.seed_scoring[0]),
-                parse_seed_scoring(&self.scoring.seed_scoring[1]),
-                parse_seed_scoring(&self.scoring.seed_scoring[2]),
-                parse_seed_scoring(&self.scoring.seed_scoring[3]),
-                parse_seed_scoring(&self.scoring.seed_scoring[4]),
-                parse_seed_scoring(&self.scoring.seed_scoring[5]),
-            ],
+    /// Convert scoring settings to ScoringConfig.
+    ///
+    /// A seed mode that does not parse is an error rather than a warning that
+    /// silently turns seed bonuses off — that changes which bracket wins.
+    pub fn to_scoring_config(&self) -> Result<ScoringConfig, String> {
+        let mut round_seed_scoring = [SeedScoring::None; 6];
+        for (round, mode) in self.scoring.seed_scoring.iter().enumerate() {
+            round_seed_scoring[round] = parse_seed_scoring(mode)
+                .ok_or_else(|| format!("scoring.seed_scoring[{}]: {}", round, mode))?;
         }
+        Ok(ScoringConfig {
+            round_scores: self.scoring.round_scores,
+            round_seed_scoring,
+        })
     }
 }
 
@@ -240,15 +241,12 @@ fn default_num_brackets() -> usize { 5 }
 fn default_best_ball() -> bool { true }
 
 /// Parse seed scoring string to enum
-fn parse_seed_scoring(s: &str) -> SeedScoring {
+pub fn parse_seed_scoring(s: &str) -> Option<SeedScoring> {
     match s.to_lowercase().as_str() {
-        "add" => SeedScoring::Add,
-        "multiply" | "mult" => SeedScoring::Multiply,
-        "none" | "off" => SeedScoring::None,
-        _ => {
-            eprintln!("Warning: Unknown seed scoring mode '{}', defaulting to None", s);
-            SeedScoring::None
-        }
+        "add" => Some(SeedScoring::Add),
+        "multiply" | "mult" => Some(SeedScoring::Multiply),
+        "none" | "off" => Some(SeedScoring::None),
+        _ => None,
     }
 }
 
@@ -333,9 +331,19 @@ simulation:
     #[test]
     fn test_scoring_config_conversion() {
         let config = Config::default();
-        let scoring = config.to_scoring_config();
+        let scoring = config.to_scoring_config().unwrap();
         assert_eq!(scoring.round_scores[0], 1.0);
         assert_eq!(scoring.round_seed_scoring[0], SeedScoring::Add);
         assert_eq!(scoring.round_seed_scoring[5], SeedScoring::Multiply);
+    }
+
+    #[test]
+    fn an_unparseable_seed_mode_is_an_error() {
+        // It used to warn and fall back to "none", quietly changing which
+        // bracket the optimizer considers best.
+        let mut config = Config::default();
+        config.scoring.seed_scoring[2] = "mutliply".to_string();
+        let err = config.to_scoring_config().unwrap_err();
+        assert!(err.contains("seed_scoring[2]"), "{}", err);
     }
 }

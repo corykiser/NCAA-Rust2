@@ -1,10 +1,11 @@
 // Portfolio generation for diverse bracket strategies
 // Supports constrained bracket building and champion-stratified portfolios
 
-use crate::bracket::{Bracket, ScoringConfig, SeedScoring};
-use crate::ingest::{Team, RcTeam, TournamentInfo};
 use crate::anneal::{self, AnnealingConfig};
-use std::sync::Arc;
+use crate::bracket::{Bracket, ScoringConfig};
+use crate::exact::{self, TeamLock};
+use crate::ga::LockSet;
+use crate::ingest::{RcTeam, TournamentInfo};
 use serde::{Deserialize, Serialize};
 
 /// Specifies how far a team must advance
@@ -59,18 +60,31 @@ impl BracketConstraint {
 }
 
 /// Builds brackets with constraints
+/// Builds a bracket that satisfies a set of team-advancement constraints.
+///
+/// This used to write winners directly into `bracket.games[i].winner` without
+/// touching the games downstream, the 63-bit representation, or the win
+/// probabilities. The result was a bracket whose Elite 8 and Final Four
+/// disagreed — a team could appear in the Final Four having won no Elite 8
+/// game — and whose `binary` still described the pre-constraint bracket, so the
+/// constraint vanished the first time anything mutated it.
+///
+/// Constraints are now applied to the bit vector and the bracket is rebuilt
+/// from it, which makes propagation automatic and the result legal by
+/// construction. The build is verified against the constraints before it is
+/// returned.
 pub struct ConstrainedBracketBuilder<'a> {
     tournament: &'a TournamentInfo,
-    constraints: Vec<BracketConstraint>,
     scoring_config: &'a ScoringConfig,
+    constraints: Vec<BracketConstraint>,
 }
 
 impl<'a> ConstrainedBracketBuilder<'a> {
     pub fn new(tournament: &'a TournamentInfo, scoring_config: &'a ScoringConfig) -> Self {
         ConstrainedBracketBuilder {
             tournament,
-            constraints: Vec::new(),
             scoring_config,
+            constraints: Vec::new(),
         }
     }
 
@@ -87,297 +101,68 @@ impl<'a> ConstrainedBracketBuilder<'a> {
         self.with_constraint(BracketConstraint::final_four(team_name))
     }
 
-    /// Find a team by name in the tournament
-    /// Returns a clone of the RcTeam (cheap - just increments ref count)
-    fn find_team(&self, name: &str) -> Option<RcTeam> {
-        let name_lower = name.to_lowercase();
-        self.tournament.teams.iter().find(|t| {
-            t.name.to_lowercase() == name_lower ||
-            t.name.to_lowercase().contains(&name_lower)
-        }).map(Arc::clone)
-    }
-
-    /// Get the region index for a team
-    fn get_region_index(&self, team: &Team) -> usize {
-        match team.region.as_str() {
-            "East" => 0,
-            "West" => 1,
-            "South" => 2,
-            "Midwest" => 3,
-            _ => 0,
+    /// Resolve the constraints to team locks, rejecting names that do not
+    /// identify exactly one team and locks that cannot hold together.
+    pub fn locks(&self) -> Result<LockSet, String> {
+        let mut locks = Vec::with_capacity(self.constraints.len());
+        for constraint in &self.constraints {
+            let team = self
+                .tournament
+                .find_team(&constraint.team_name)
+                .map_err(|e| e.to_string())?;
+            locks.push(TeamLock {
+                team_index: team.team_index,
+                wins_required: constraint.must_reach.wins_required(),
+            });
         }
+
+        // Surfaces "both of these teams must win the same game" before the
+        // caller spends a run discovering only one of them made it.
+        exact::forced_winners(self.tournament, &locks).map_err(|e| e.to_string())?;
+
+        Ok(LockSet::new(locks))
     }
 
-    /// Build a bracket respecting all constraints
-    /// Constrained games are set deterministically, others use probability
+    /// Build a bracket satisfying the constraints, with the unconstrained games
+    /// sampled from the rating model.
     pub fn build(&self) -> Result<Bracket, String> {
-        // First, generate a random bracket as base
-        let mut bracket = Bracket::new(self.tournament, Some(self.scoring_config));
-
-        // Apply each constraint
-        for constraint in &self.constraints {
-            let team = self.find_team(&constraint.team_name)
-                .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
-
-            self.apply_constraint(&mut bracket, &team, &constraint.must_reach)?;
-        }
-
-        // Recalculate bracket stats
-        self.recalculate_bracket_stats(&mut bracket);
-
+        let locks = self.locks()?;
+        let base = Bracket::new(self.tournament, Some(self.scoring_config));
+        let bracket = locks.repair(base, self.tournament, self.scoring_config);
+        self.verify(&bracket)?;
         Ok(bracket)
     }
 
-    /// Build bracket optimized for EV while respecting constraints
-    /// Uses expected value to decide unconstrained games
+    /// Build the expected-value-maximizing bracket satisfying the constraints.
+    ///
+    /// Exact, not a search: see `crate::exact`.
     pub fn build_optimal(&self) -> Result<Bracket, String> {
-        // Start with a fresh bracket using probability-based picks
-        let mut binary = self.generate_optimal_binary()?;
+        let locks = self.locks()?;
+        let solution = exact::solve(self.tournament, self.scoring_config, &locks.locks)
+            .map_err(|e| e.to_string())?;
+        self.verify(&solution.bracket)?;
+        Ok(solution.bracket)
+    }
 
-        // Apply constraints to the binary representation
+    /// Confirm every constraint actually holds. A failure here is a bug in the
+    /// constraint machinery, not bad user input, so it reports loudly rather
+    /// than returning a bracket that quietly ignores what was asked for.
+    fn verify(&self, bracket: &Bracket) -> Result<(), String> {
         for constraint in &self.constraints {
-            let team = self.find_team(&constraint.team_name)
-                .ok_or_else(|| format!("Team '{}' not found", constraint.team_name))?;
-
-            self.apply_constraint_to_binary(&mut binary, &team, &constraint.must_reach)?;
-        }
-
-        // Build bracket from binary (pass slice instead of Vec)
-        let bracket = Bracket::new_from_binary(self.tournament, &binary, Some(self.scoring_config));
-        Ok(bracket)
-    }
-
-    /// Generate binary representation that maximizes expected value
-    fn generate_optimal_binary(&self) -> Result<Vec<bool>, String> {
-        let mut binary = Vec::with_capacity(63);
-
-        // For each game, pick the higher probability winner
-        // Round 1: 32 games - use O(1) lookups
-        for region in &["East", "West", "South", "Midwest"] {
-            for matchup in self.tournament.round1 {
-                let team1 = self.tournament.get_team(region, matchup[0]);
-                let team2 = self.tournament.get_team(region, matchup[1]);
-
-                // Pick higher rated team (lower seed usually)
-                let pick_first = team1.rating >= team2.rating;
-                // lower_seed_won = true means lower seed wins
-                let lower_seed_first = team1.seed < team2.seed;
-                binary.push(pick_first == lower_seed_first);
+            let team = self
+                .tournament
+                .find_team(&constraint.team_name)
+                .map_err(|e| e.to_string())?;
+            let wins = bracket.wins_for(team.team_index);
+            let required = constraint.must_reach.wins_required();
+            if wins < required {
+                return Err(format!(
+                    "constraint not satisfied: {} wins {} game(s) but must win {} to reach {:?}",
+                    team.name, wins, required, constraint.must_reach
+                ));
             }
         }
-
-        // For later rounds, we need to simulate forward
-        // This is a simplification - just pick favorites
-        // Round 2-6: add remaining bits based on probability
-        for _ in 32..63 {
-            binary.push(true); // Favor lower seeds / earlier alphabet
-        }
-
-        Ok(binary)
-    }
-
-    /// Apply a constraint to a bracket
-    fn apply_constraint(
-        &self,
-        bracket: &mut Bracket,
-        team: &RcTeam,
-        must_reach: &AdvancementRound,
-    ) -> Result<(), String> {
-        let wins_needed = must_reach.wins_required();
-        let region_idx = self.get_region_index(team);
-
-        // Round 1: Ensure team wins their first game
-        if wins_needed >= 1 {
-            let r1_idx = self.find_round1_game_index(team, region_idx);
-            if let Some(idx) = r1_idx {
-                bracket.games[idx].winner = Arc::clone(team);
-            }
-        }
-
-        // Round 2: Ensure team wins
-        if wins_needed >= 2 {
-            let r2_idx = self.find_round2_game_index(team, region_idx);
-            if let Some(idx) = r2_idx {
-                bracket.games[32 + idx].winner = Arc::clone(team);
-            }
-        }
-
-        // Sweet 16 (Round 3)
-        if wins_needed >= 3 {
-            let r3_idx = self.find_round3_game_index(team, region_idx);
-            if let Some(idx) = r3_idx {
-                bracket.games[48 + idx].winner = Arc::clone(team);
-            }
-        }
-
-        // Elite 8 (Round 4)
-        if wins_needed >= 4 {
-            let r4_idx = region_idx; // One Elite 8 game per region
-            bracket.games[56 + r4_idx].winner = Arc::clone(team);
-        }
-
-        // Final Four (Round 5)
-        if wins_needed >= 5 {
-            // Final Four: South/Midwest play each other, East/West play each other
-            let r5_idx = if region_idx == 2 || region_idx == 3 { 0 } else { 1 };
-            bracket.games[60 + r5_idx].winner = Arc::clone(team);
-        }
-
-        // Championship (Round 6)
-        if wins_needed >= 6 {
-            bracket.games[62].winner = Arc::clone(team);
-            bracket.winner = Arc::clone(team);
-        }
-
         Ok(())
-    }
-
-    /// Apply constraint to binary representation
-    fn apply_constraint_to_binary(
-        &self,
-        binary: &mut Vec<bool>,
-        team: &RcTeam,
-        must_reach: &AdvancementRound,
-    ) -> Result<(), String> {
-        let wins_needed = must_reach.wins_required();
-        let region_idx = self.get_region_index(team);
-
-        // Calculate binary indices for this team's games
-        // Round 1: 8 games per region, starting at region_idx * 8
-        if wins_needed >= 1 {
-            let base = region_idx * 8;
-            let game_in_region = self.seed_to_round1_game(team.seed);
-            let idx = base + game_in_region;
-            if idx < 32 {
-                // Set to make team win (depends on seed position)
-                binary[idx] = team.seed < 9; // Lower seeds are "true" in lower_seed_won
-            }
-        }
-
-        // For later rounds, the logic is more complex because game indices
-        // depend on who won earlier. We'll handle this by rebuilding the bracket
-        // and then extracting the binary representation.
-        // This is a limitation of the current approach.
-
-        Ok(())
-    }
-
-    /// Find the Round 1 game index for a team
-    fn find_round1_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
-        let base = region_idx * 8;
-        let game_in_region = self.seed_to_round1_game(team.seed);
-        Some(base + game_in_region)
-    }
-
-    /// Map seed to round 1 game within region (0-7)
-    fn seed_to_round1_game(&self, seed: i32) -> usize {
-        match seed {
-            1 | 16 => 0,
-            8 | 9 => 1,
-            5 | 12 => 2,
-            4 | 13 => 3,
-            6 | 11 => 4,
-            3 | 14 => 5,
-            7 | 10 => 6,
-            2 | 15 => 7,
-            _ => 0,
-        }
-    }
-
-    /// Find Round 2 game index
-    fn find_round2_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
-        let base = region_idx * 4;
-        let game_in_region = match team.seed {
-            1 | 16 | 8 | 9 => 0,
-            5 | 12 | 4 | 13 => 1,
-            6 | 11 | 3 | 14 => 2,
-            7 | 10 | 2 | 15 => 3,
-            _ => 0,
-        };
-        Some(base + game_in_region)
-    }
-
-    /// Find Round 3 (Sweet 16) game index
-    fn find_round3_game_index(&self, team: &Team, region_idx: usize) -> Option<usize> {
-        let base = region_idx * 2;
-        let game_in_region = match team.seed {
-            1 | 16 | 8 | 9 | 5 | 12 | 4 | 13 => 0,
-            6 | 11 | 3 | 14 | 7 | 10 | 2 | 15 => 1,
-            _ => 0,
-        };
-        Some(base + game_in_region)
-    }
-
-    /// Recalculate bracket statistics after modifications
-    /// Uses the scoring config helper from Bracket
-    fn recalculate_bracket_stats(&self, bracket: &mut Bracket) {
-        let mut prob = 1.0;
-        let mut score = 0.0;
-        let mut expected_value = 0.0;
-        let config = self.scoring_config;
-
-        // Round 1
-        for game in &bracket.games[0..32] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(0, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        // Round 2
-        for game in &bracket.games[32..48] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(1, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        // Round 3
-        for game in &bracket.games[48..56] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(2, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        // Round 4
-        for game in &bracket.games[56..60] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(3, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        // Round 5
-        for game in &bracket.games[60..62] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(4, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        // Round 6
-        for game in &bracket.games[62..63] {
-            prob *= game.winnerprob;
-            let win_score = self.calculate_win_score(5, game.winner.seed, config);
-            score += win_score;
-            expected_value += game.winnerprob * win_score;
-        }
-
-        bracket.prob = prob;
-        bracket.score = score;
-        bracket.expected_value = expected_value;
-    }
-
-    // Helper to calculate score - duplicating logic from Bracket to avoid making Bracket::calculate_win_score public if it isn't
-    // Actually, I can just copy the logic here, it's simple enough
-    fn calculate_win_score(&self, round_idx: usize, seed: i32, config: &ScoringConfig) -> f64 {
-        let base_score = config.round_scores[round_idx];
-        match config.round_seed_scoring[round_idx] {
-            SeedScoring::Add => base_score + seed as f64,
-            SeedScoring::Multiply => base_score * seed as f64,
-            SeedScoring::None => base_score,
-        }
     }
 }
 
@@ -645,6 +430,110 @@ fn fitness_with_diversity(bracket: &Bracket, existing: &[Bracket], diversity_wei
 
     // Higher distance = more diverse = better
     ev + diversity_weight * min_distance
+}
+
+#[cfg(test)]
+mod constrained_tests {
+    use super::*;
+    use crate::bracket::tests::assert_legal;
+    use crate::ingest::tests::tournament;
+
+    #[test]
+    fn a_constrained_bracket_is_internally_consistent() {
+        // This is the regression for the bug where applying a constraint
+        // overwrote a game's winner without updating the games it feeds. The
+        // Elite 8 said one team and the Final Four showed another that had won
+        // nothing — an impossible bracket, printed as if it were real.
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+
+        for seed in [1, 4, 8, 12, 16] {
+            for round in [
+                AdvancementRound::Round2,
+                AdvancementRound::Sweet16,
+                AdvancementRound::Elite8,
+                AdvancementRound::FinalFour,
+                AdvancementRound::Championship,
+                AdvancementRound::Winner,
+            ] {
+                let team = t.teams.iter().find(|x| x.seed == seed).unwrap().clone();
+                let bracket = ConstrainedBracketBuilder::new(&t, &scoring)
+                    .with_constraint(BracketConstraint::new(&team.name, round))
+                    .build()
+                    .unwrap_or_else(|e| panic!("{} to {:?}: {}", team.name, round, e));
+
+                assert_legal(&bracket);
+                assert!(
+                    bracket.wins_for(team.team_index) >= round.wins_required(),
+                    "{} reached only {} wins, needed {} for {:?}",
+                    team.name,
+                    bracket.wins_for(team.team_index),
+                    round.wins_required(),
+                    round
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_binary_representation_agrees_with_the_games() {
+        // The constraint used to be written into `games` but not `binary`, so
+        // rebuilding from the bits threw it away.
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let team = t.teams.iter().find(|x| x.seed == 10).unwrap().clone();
+
+        let bracket = ConstrainedBracketBuilder::new(&t, &scoring)
+            .with_final_four(&team.name)
+            .build()
+            .unwrap();
+
+        let rebuilt = Bracket::new_from_binary(&t, &bracket.binary, Some(&scoring));
+        assert_eq!(rebuilt.winner_indices(), bracket.winner_indices());
+        assert!(rebuilt.wins_for(team.team_index) >= 4);
+    }
+
+    #[test]
+    fn the_optimal_constrained_bracket_beats_a_sampled_one() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let team = t.teams.iter().find(|x| x.seed == 9).unwrap().clone();
+        let builder = ConstrainedBracketBuilder::new(&t, &scoring).with_champion(&team.name);
+
+        let optimal = builder.build_optimal().unwrap();
+        assert_legal(&optimal);
+        assert_eq!(optimal.winner.team_index, team.team_index);
+
+        for _ in 0..25 {
+            let sampled = builder.build().unwrap();
+            assert!(sampled.expected_value <= optimal.expected_value + 1e-9);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_ambiguous_team_is_an_error() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        assert!(ConstrainedBracketBuilder::new(&t, &scoring)
+            .with_champion("Nowhere Polytechnic")
+            .build()
+            .is_err());
+    }
+
+    #[test]
+    fn conflicting_constraints_are_rejected() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let a = t.teams.iter().find(|x| x.seed == 1).unwrap().clone();
+        let b = t.teams.iter().find(|x| x.seed == 16).unwrap().clone();
+        // Same round-1 game; they cannot both win it.
+        let err = ConstrainedBracketBuilder::new(&t, &scoring)
+            .with_constraint(BracketConstraint::new(&a.name, AdvancementRound::Round2))
+            .with_constraint(BracketConstraint::new(&b.name, AdvancementRound::Round2))
+            .build()
+            .unwrap_err();
+        assert!(err.contains("cannot both win"), "{}", err);
+    }
 }
 
 #[cfg(test)]
