@@ -167,6 +167,136 @@ fn main() {
     if b.filter.as_deref() == Some("quality") {
         quality_shootout(&t, &scoring);
     }
+    if b.filter.as_deref() == Some("hedge") {
+        hedge_experiment(&t, &scoring);
+    }
+}
+
+/// Does the EV-optimal bracket belong in a multi-entry portfolio?
+///
+/// Compares two ways of building one: pin the exact single-bracket optimum as
+/// entry 1 and hedge around it, versus letting every entry move freely.
+fn hedge_experiment(t: &TournamentInfo, scoring: &ScoringConfig) {
+    const TRAIN: usize = 50_000;
+    const HOLDOUT: usize = 200_000;
+
+    let train = ScenarioPool::new(t, TRAIN, scoring, 1);
+    let locks = ga::LockSet::default();
+    let exact_best = exact::solve(t, scoring, &[]).unwrap();
+    let optimum = Picks::from_winners(t, &exact_best.bracket.winner_indices());
+
+    println!(
+        "\nExact single-bracket optimum: EV {:.2}, champion {}",
+        exact_best.expected_value, exact_best.bracket.winner.name
+    );
+    println!(
+        "\n{:<8} {:>14} {:>14} {:>10} {:>26}",
+        "entries", "pinned", "free", "free gain", "optimum still an entry?"
+    );
+    println!("{}", "-".repeat(78));
+
+    for k in [2usize, 3, 5, 10] {
+        let free = optimize::optimize(t, scoring, &train, &locks, k, false);
+        let pinned = pinned_portfolio(t, scoring, &train, &locks, k, optimum);
+
+        let free_held = optimize::holdout_score(t, scoring, &free.entries, HOLDOUT, 999);
+        let pinned_held = optimize::holdout_score(t, scoring, &pinned, HOLDOUT, 999);
+        let kept = free.entries.iter().any(|e| e.bits() == optimum.bits());
+
+        println!(
+            "{:<8} {:>14.3} {:>14.3} {:>+10.3} {:>26}",
+            k,
+            pinned_held,
+            free_held,
+            free_held - pinned_held,
+            if kept { "yes" } else { "no" }
+        );
+
+        if k == 5 {
+            println!("\n  the five free entries, against the exact optimum:");
+            println!(
+                "  {:<4} {:<16} {:>10} {:>12} {:>14}",
+                "#", "champion", "solo EV", "EV given up", "games differing"
+            );
+            for (i, e) in free.entries.iter().enumerate() {
+                let b = Bracket::from_picks(t, e, Some(scoring));
+                let ev = exact::expected_value(t, &b, scoring);
+                println!(
+                    "  {:<4} {:<16} {:>10.2} {:>12.2} {:>14}",
+                    i + 1,
+                    b.winner.name,
+                    ev,
+                    ev - exact_best.expected_value,
+                    e.disagreements(&optimum)
+                );
+            }
+            println!();
+        }
+    }
+}
+
+/// Greedy selection plus coordinate ascent, with slot 0 frozen to `pinned`.
+fn pinned_portfolio(
+    t: &TournamentInfo,
+    scoring: &ScoringConfig,
+    pool: &ScenarioPool,
+    locks: &ga::LockSet,
+    entries: usize,
+    pinned: Picks,
+) -> Vec<Picks> {
+    let basis = optimize::exact_basis(t, scoring, locks);
+    let prepared: Vec<_> = basis.iter().map(|p| pool.prepare(p)).collect();
+
+    let mut portfolio = vec![pinned];
+    let mut baseline = vec![0.0f32; pool.size()];
+    pool.absorb_into(&pool.prepare(&pinned), &mut baseline);
+
+    while portfolio.len() < entries {
+        let best = prepared
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, pool.mean_max_with(c, &baseline)))
+            .fold((0usize, f64::NEG_INFINITY), |b, n| if n.1 > b.1 { n } else { b });
+        pool.absorb_into(&prepared[best.0], &mut baseline);
+        portfolio.push(basis[best.0]);
+    }
+
+    // Coordinate ascent over slots 1.. only; slot 0 never moves.
+    let mut current = pool.par_best_ball_mean(&pool.prepare_all(&portfolio));
+    for _ in 0..32 {
+        let mut improved = false;
+        for slot in 1..portfolio.len() {
+            let others: Vec<_> = portfolio
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != slot)
+                .map(|(_, p)| pool.prepare(p))
+                .collect();
+            let mut base = vec![0.0f32; pool.size()];
+            pool.best_ball_into(&others, &mut base);
+
+            let incumbent = portfolio[slot];
+            let mut candidates: Vec<Picks> = basis.clone();
+            for (team, wins) in picks::all_moves() {
+                candidates.push(incumbent.forced_to_round(t, team, wins));
+            }
+            let best = candidates
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, pool.mean_max_with(&pool.prepare(p), &base)))
+                .fold((0usize, f64::NEG_INFINITY), |b, n| if n.1 > b.1 { n } else { b });
+
+            if best.1 > current + 1e-9 {
+                portfolio[slot] = candidates[best.0];
+                current = best.1;
+                improved = true;
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    portfolio
 }
 
 /// Head-to-head on the thing that actually matters: for a fixed budget, which
