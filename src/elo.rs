@@ -2,6 +2,7 @@
 // ELO ratings are calculated from historical game results and used to predict future matchups
 
 use crate::game_result::GameResult;
+use crate::names;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -239,12 +240,21 @@ impl EloSystem {
         (60.0 + normalized * 40.0) as f32
     }
 
-    /// Find team by name (case-insensitive partial match)
-    pub fn find_team_by_name(&self, name: &str) -> Option<&EloRating> {
-        let name_lower = name.to_lowercase();
-        self.ratings.values().find(|r| {
-            r.team_name.to_lowercase().contains(&name_lower)
-        })
+    /// Find a rated team by name.
+    ///
+    /// This used to be a `.contains()` scan over `self.ratings.values()`. Two
+    /// problems: "Texas" matched "Texas A&M" and "Texas Tech" as readily as
+    /// "Texas", and `HashMap` iteration order is unspecified, so which one it
+    /// returned varied between runs of the same binary. Resolution now goes
+    /// through `names::resolve`, which prefers exact matches and reports an
+    /// error instead of picking arbitrarily among equally good candidates.
+    pub fn find_team_by_name(&self, name: &str) -> Result<&EloRating, names::NameError> {
+        let mut rated: Vec<&EloRating> = self.ratings.values().collect();
+        // Deterministic order in, deterministic error messages out.
+        rated.sort_by(|a, b| a.team_id.cmp(&b.team_id));
+
+        let candidates: Vec<String> = rated.iter().map(|r| r.team_name.clone()).collect();
+        names::resolve(name, &candidates).map(|i| rated[i])
     }
 }
 

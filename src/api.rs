@@ -50,10 +50,13 @@ pub struct ApiClient {
     client: reqwest::blocking::Client,
     source: DataSource,
     cache_dir: String,
+    /// Accept and cache a season whose fetch had gaps. Off by default: a season
+    /// missing days produces ratings that look normal and are quietly wrong.
+    allow_partial: bool,
 }
 
 impl ApiClient {
-    pub fn new(source: DataSource, cache_dir: &str) -> Self {
+    pub fn new(source: DataSource, cache_dir: &str, allow_partial: bool) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("NCAA-Bracket-Optimizer/1.0")
@@ -67,6 +70,7 @@ impl ApiClient {
             client,
             source,
             cache_dir: cache_dir.to_string(),
+            allow_partial,
         }
     }
 
@@ -320,13 +324,17 @@ impl ApiClient {
         })
     }
 
-    /// Fetch all games for a date range
+    /// Fetch all games for a date range, reporting which days failed.
+    ///
+    /// Failures used to be printed as warnings and then forgotten, and the
+    /// truncated result was cached as though it were the complete season.
     pub fn fetch_games_for_range(
         &self,
         start_date: NaiveDate,
         end_date: NaiveDate,
-    ) -> Result<Vec<GameResult>, String> {
+    ) -> (Vec<GameResult>, Vec<(NaiveDate, String)>) {
         let mut all_games = Vec::new();
+        let mut failures = Vec::new();
         let mut current_date = start_date;
         let total_days = (end_date - start_date).num_days() + 1;
         let mut days_processed = 0;
@@ -336,15 +344,12 @@ impl ApiClient {
         while current_date <= end_date {
             match self.fetch_games_for_date(current_date) {
                 Ok(games) => {
-                    let game_count = games.len();
-                    all_games.extend(games);
-                    if game_count > 0 {
+                    if !games.is_empty() {
                         print!(".");
                     }
+                    all_games.extend(games);
                 }
-                Err(e) => {
-                    eprintln!("\nWarning: Failed to fetch games for {}: {}", current_date, e);
-                }
+                Err(e) => failures.push((current_date, e)),
             }
 
             days_processed += 1;
@@ -356,7 +361,7 @@ impl ApiClient {
         }
 
         println!("\nFetched {} games total", all_games.len());
-        Ok(all_games)
+        (all_games, failures)
     }
 
     /// Fetch all games for a college basketball season
@@ -386,9 +391,47 @@ impl ApiClient {
         }
 
         // Fetch fresh data
-        let games = self.fetch_games_for_range(start_date, end_date)?;
+        let (games, failures) = self.fetch_games_for_range(start_date, end_date);
 
-        // Save to cache
+        if !failures.is_empty() {
+            let sample: Vec<String> = failures
+                .iter()
+                .take(5)
+                .map(|(date, err)| format!("  {}: {}", date, err))
+                .collect();
+            let message = format!(
+                "{} of {} days failed to fetch:\n{}{}",
+                failures.len(),
+                (end_date - start_date).num_days() + 1,
+                sample.join("\n"),
+                if failures.len() > sample.len() {
+                    format!("\n  ... and {} more", failures.len() - sample.len())
+                } else {
+                    String::new()
+                }
+            );
+
+            if !self.allow_partial {
+                return Err(format!(
+                    "{}\nRatings from an incomplete season look normal and are wrong. \
+                     Retry, or pass --allow-partial-data to accept the gaps.",
+                    message
+                ));
+            }
+            eprintln!("Warning: {}", message);
+            eprintln!("Proceeding with incomplete data (--allow-partial-data). Not caching.");
+            return Ok(games);
+        }
+
+        if games.is_empty() {
+            return Err(format!(
+                "no games returned for season {} ({} to {})",
+                season, start_date, end_date
+            ));
+        }
+
+        // Only a complete fetch is worth caching; a partial one would be served
+        // back as authoritative for the rest of the staleness window.
         self.save_cache(&cache_path, season, &games)?;
 
         Ok(games)

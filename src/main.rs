@@ -1,20 +1,27 @@
-mod ingest;
-mod bracket;
-mod pool;
-mod elo;
-mod api;
-mod game_result;
-mod portfolio;
+mod advancement;
 mod anneal;
+mod api;
+mod bracket;
 mod config;
+mod elo;
+mod exact;
 mod ga;
+mod game_result;
+mod ingest;
+mod names;
+mod pool;
+mod portfolio;
+mod tree;
 
-use clap::{Parser, ValueEnum};
-use rand::Rng;
-use portfolio::{BracketPortfolio, BracketConstraint, AdvancementRound, ConstrainedBracketBuilder};
 use bracket::{ScoringConfig, SeedScoring};
+use clap::{Parser, ValueEnum};
 use config::Config;
-use ga::{GeneticAlgorithm, SequentialPortfolioOptimizer, HybridOptimizer, MonteCarloScenarios, WholePortfolioGA};
+use ga::{
+    GeneticAlgorithm, HybridOptimizer, LockSet, MonteCarloScenarios, SequentialPortfolioOptimizer,
+    WholePortfolioGA,
+};
+use portfolio::{AdvancementRound, BracketConstraint, BracketPortfolio, ConstrainedBracketBuilder};
+use std::process::ExitCode;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
@@ -42,6 +49,8 @@ enum PortfolioStrategy {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum OptimizationMode {
+    /// Exact dynamic-programming solve — provably optimal expected value
+    Exact,
     /// Legacy hill-climbing optimization
     Legacy,
     /// Population-based Genetic Algorithm
@@ -130,8 +139,14 @@ struct Args {
     generate_config: bool,
 
     /// Optimization mode for single bracket
-    #[arg(long, value_enum, default_value = "ga")]
+    #[arg(long, value_enum, default_value = "exact")]
     optimization_mode: OptimizationMode,
+
+    /// Continue even when game data is missing or incomplete.
+    /// Without this, an empty or partial season is a hard error rather than a
+    /// run against uniform 1500 ratings that looks the same as a real one.
+    #[arg(long, default_value = "false")]
+    allow_partial_data: bool,
 
     /// GA population size (overrides config)
     #[arg(long)]
@@ -150,274 +165,348 @@ struct Args {
     verbose: bool,
 
     // Scoring Configuration
+    //
+    // These override the `scoring:` section of the config file, which in turn
+    // overrides the built-in defaults. They are Options so that "not passed"
+    // is distinguishable from "passed the default value" — otherwise a config
+    // file's scoring section can never take effect.
 
-    /// Points for Round 1
-    #[arg(long, default_value = "1.0")]
-    score_r1: f64,
-    /// Points for Round 2
-    #[arg(long, default_value = "2.0")]
-    score_r2: f64,
-    /// Points for Round 3 (Sweet 16)
-    #[arg(long, default_value = "4.0")]
-    score_r3: f64,
-    /// Points for Round 4 (Elite 8)
-    #[arg(long, default_value = "8.0")]
-    score_r4: f64,
-    /// Points for Round 5 (Final Four)
-    #[arg(long, default_value = "16.0")]
-    score_r5: f64,
-    /// Points for Round 6 (Championship)
-    #[arg(long, default_value = "32.0")]
-    score_r6: f64,
+    /// Points for Round 1 [default: 1]
+    #[arg(long)]
+    score_r1: Option<f64>,
+    /// Points for Round 2 [default: 2]
+    #[arg(long)]
+    score_r2: Option<f64>,
+    /// Points for Round 3 / Sweet 16 [default: 4]
+    #[arg(long)]
+    score_r3: Option<f64>,
+    /// Points for Round 4 / Elite 8 [default: 8]
+    #[arg(long)]
+    score_r4: Option<f64>,
+    /// Points for Round 5 / Final Four [default: 16]
+    #[arg(long)]
+    score_r5: Option<f64>,
+    /// Points for Round 6 / Championship [default: 32]
+    #[arg(long)]
+    score_r6: Option<f64>,
 
-    /// Seed scoring mode for R1 (add, multiply, none)
-    #[arg(long, default_value = "add")]
-    seed_r1: String,
-    /// Seed scoring mode for R2
-    #[arg(long, default_value = "add")]
-    seed_r2: String,
-    /// Seed scoring mode for R3
-    #[arg(long, default_value = "add")]
-    seed_r3: String,
-    /// Seed scoring mode for R4
-    #[arg(long, default_value = "multiply")]
-    seed_r4: String,
-    /// Seed scoring mode for R5
-    #[arg(long, default_value = "multiply")]
-    seed_r5: String,
-    /// Seed scoring mode for R6
-    #[arg(long, default_value = "multiply")]
-    seed_r6: String,
+    /// Seed scoring mode for R1: add, multiply, or none [default: add]
+    #[arg(long)]
+    seed_r1: Option<String>,
+    /// Seed scoring mode for R2 [default: add]
+    #[arg(long)]
+    seed_r2: Option<String>,
+    /// Seed scoring mode for R3 [default: add]
+    #[arg(long)]
+    seed_r3: Option<String>,
+    /// Seed scoring mode for R4 [default: multiply]
+    #[arg(long)]
+    seed_r4: Option<String>,
+    /// Seed scoring mode for R5 [default: multiply]
+    #[arg(long)]
+    seed_r5: Option<String>,
+    /// Seed scoring mode for R6 [default: multiply]
+    #[arg(long)]
+    seed_r6: Option<String>,
 }
 
-fn parse_seed_mode(s: &str) -> SeedScoring {
+fn parse_seed_mode(s: &str) -> Result<SeedScoring, String> {
     match s.to_lowercase().as_str() {
-        "add" => SeedScoring::Add,
-        "multiply" | "mult" => SeedScoring::Multiply,
-        "none" | "off" => SeedScoring::None,
-        _ => {
-            eprintln!("Warning: Unknown seed mode '{}', defaulting to None", s);
-            SeedScoring::None
+        "add" => Ok(SeedScoring::Add),
+        "multiply" | "mult" => Ok(SeedScoring::Multiply),
+        "none" | "off" => Ok(SeedScoring::None),
+        other => Err(format!(
+            "unknown seed scoring mode '{}'. Expected add, multiply, or none",
+            other
+        )),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("\nError: {}", message);
+            ExitCode::FAILURE
         }
     }
 }
 
-fn main() {
+fn run() -> Result<(), String> {
     let args = Args::parse();
 
-    // Handle generate_config flag
     if args.generate_config {
-        let sample = config::generate_sample_config();
-        println!("{}", sample);
+        println!("{}", config::generate_sample_config());
         println!("\n# Save this to config.yaml and customize as needed");
-        return;
+        return Ok(());
     }
 
     println!("NCAA Bracket Optimizer");
     println!("======================");
     println!();
 
-    // Load configuration from YAML (or use defaults)
     let mut app_config = Config::load_or_default(args.config.as_deref());
-
-    // Apply CLI overrides to config
     if let Some(pop_size) = args.population_size {
         app_config.ga.population_size = pop_size;
     }
     if let Some(pool_size) = args.pool_size {
         app_config.simulation.pool_size = pool_size;
     }
-    if let Some(smart_mut) = args.smart_mutation {
-        app_config.ga.smart_mutation = smart_mut;
-    }
     app_config.ga.generations = args.generations as usize;
 
-    // Construct ScoringConfig from args
-    let scoring_config = ScoringConfig {
-        round_scores: [
-            args.score_r1,
-            args.score_r2,
-            args.score_r3,
-            args.score_r4,
-            args.score_r5,
-            args.score_r6,
-        ],
-        round_seed_scoring: [
-            parse_seed_mode(&args.seed_r1),
-            parse_seed_mode(&args.seed_r2),
-            parse_seed_mode(&args.seed_r3),
-            parse_seed_mode(&args.seed_r4),
-            parse_seed_mode(&args.seed_r5),
-            parse_seed_mode(&args.seed_r6),
-        ],
+    let scoring_config = scoring_from_args(&args, &app_config)?;
+    print_scoring(&scoring_config);
+
+    let tournamentinfo = match load_tournament(&args)? {
+        Some(t) => t,
+        None => return Ok(()), // --elo-only
     };
 
-    // Print config if not default
-    let default_config = ScoringConfig::default();
-    // Simple check - in a real app might implement PartialEq properly
-    // but here we just show it if user provided any flags that differ from current defaults
-    println!("Scoring Configuration:");
-    println!("  R1: {} ({:?})", scoring_config.round_scores[0], scoring_config.round_seed_scoring[0]);
-    println!("  R2: {} ({:?})", scoring_config.round_scores[1], scoring_config.round_seed_scoring[1]);
-    println!("  R3: {} ({:?})", scoring_config.round_scores[2], scoring_config.round_seed_scoring[2]);
-    println!("  R4: {} ({:?})", scoring_config.round_scores[3], scoring_config.round_seed_scoring[3]);
-    println!("  R5: {} ({:?})", scoring_config.round_scores[4], scoring_config.round_seed_scoring[4]);
-    println!("  R6: {} ({:?})", scoring_config.round_scores[5], scoring_config.round_seed_scoring[5]);
-    println!();
+    let constraints = parse_lock_constraints(&args.lock_team)?;
 
-    let tournamentinfo = match args.source {
-        DataSourceArg::Csv => {
-            println!("Loading data from CSV file: {}", args.csv_path);
-            ingest::TournamentInfo::initialize(&args.csv_path)
-        }
-        DataSourceArg::Espn | DataSourceArg::Ncaa => {
-            let source = match args.source {
-                DataSourceArg::Espn => api::DataSource::ESPN,
-                DataSourceArg::Ncaa => api::DataSource::NCAA,
-                _ => unreachable!(),
-            };
+    // Resolve constraints once, up front. A misspelled or ambiguous team name
+    // and a pair of locks that cannot both hold are both errors here rather
+    // than surprises after an optimization run.
+    let mut builder = ConstrainedBracketBuilder::new(&tournamentinfo, &scoring_config);
+    for constraint in &constraints {
+        builder = builder.with_constraint(constraint.clone());
+        println!(
+            "Locking {} to reach {:?}",
+            constraint.team_name, constraint.must_reach
+        );
+    }
+    let locks = builder.locks()?;
+    if !constraints.is_empty() {
+        println!();
+    }
 
-            println!("Source: {:?}", source);
-            println!("Season: {}", args.season);
-            println!();
-
-            // Initialize API client
-            let client = api::ApiClient::new(source, &args.cache_dir);
-
-            // Fetch games for the season
-            println!("Fetching game data...");
-            let mut games = match client.fetch_season(&args.season) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("Error fetching games: {}", e);
-                    eprintln!("Falling back to sample bracket with default ratings...");
-                    Vec::new()
-                }
-            };
-
-            // Calculate ELO ratings
-            println!();
-            println!("Calculating ELO ratings from {} games...", games.len());
-            let mut elo_system = elo::EloSystem::new(args.season.clone());
-            elo_system.process_games(&mut games);
-
-            // Show top teams
-            elo_system.print_top_teams(args.show_top);
-
-            if args.elo_only {
-                println!();
-                println!("ELO-only mode: Skipping bracket optimization.");
-                return;
-            }
-
-            // Get bracket teams - try multiple sources in order:
-            // 1. Local bracket file (if provided)
-            // 2. Fetch from API (if tournament_year provided)
-            // 3. Fall back to sample data
-            println!();
-            let bracket_teams = if let Some(ref bracket_path) = args.bracket_file {
-                println!("Loading bracket from file: {}", bracket_path);
-                match api::load_bracket_from_file(bracket_path) {
-                    Ok(teams) => {
-                        println!("Loaded {} teams from bracket file", teams.len());
-                        teams
-                    }
-                    Err(e) => {
-                        eprintln!("Error loading bracket file: {}", e);
-                        eprintln!("Falling back to sample bracket...");
-                        ingest::TournamentInfo::sample_bracket_teams()
-                    }
-                }
-            } else if let Some(year) = args.tournament_year {
-                println!("Fetching {} tournament bracket...", year);
-                match client.fetch_tournament_bracket(year) {
-                    Ok(teams) => teams,
-                    Err(e) => {
-                        eprintln!("Error fetching bracket: {}", e);
-                        eprintln!("Falling back to sample bracket...");
-                        ingest::TournamentInfo::sample_bracket_teams()
-                    }
-                }
-            } else {
-                // Derive tournament year from season
-                let parts: Vec<&str> = args.season.split('-').collect();
-                if parts.len() == 2 {
-                    if let Ok(year) = parts[1].parse::<i32>() {
-                        println!("Fetching {} tournament bracket (derived from season)...", year);
-                        match client.fetch_tournament_bracket(year) {
-                            Ok(teams) => teams,
-                            Err(e) => {
-                                eprintln!("Note: {}", e);
-                                println!("Using sample bracket teams");
-                                ingest::TournamentInfo::sample_bracket_teams()
-                            }
-                        }
-                    } else {
-                        println!("Using sample bracket teams");
-                        ingest::TournamentInfo::sample_bracket_teams()
-                    }
-                } else {
-                    println!("Using sample bracket teams");
-                    ingest::TournamentInfo::sample_bracket_teams()
-                }
-            };
-
-            // Create tournament info with calculated ELO ratings
-            ingest::TournamentInfo::from_elo_ratings(&elo_system, bracket_teams)
-        }
-    };
-
-    // Parse any team lock constraints
-    let constraints = parse_lock_constraints(&args.lock_team);
-
-    // Check if we should run in portfolio mode
     if let Some(num_brackets) = args.portfolio {
         run_portfolio_mode(
             &tournamentinfo,
             num_brackets,
             args.diversity_weight,
             &args.portfolio_strategy,
-            &constraints,
+            &locks,
             args.generations,
             args.anneal_steps,
             &scoring_config,
             &app_config,
             args.verbose,
         );
-    } else if !constraints.is_empty() {
-        // Run single bracket with constraints
-        run_constrained_optimization(&tournamentinfo, &constraints, args.generations, args.batch_size, &scoring_config);
     } else {
-        // Run bracket optimization with selected mode
         match args.optimization_mode {
-            OptimizationMode::Legacy => {
-                run_optimization(&tournamentinfo, args.generations, args.batch_size, &scoring_config);
+            OptimizationMode::Exact => {
+                run_exact_optimization(&tournamentinfo, &locks, &scoring_config)?
             }
+            OptimizationMode::Legacy => run_legacy_optimization(
+                &tournamentinfo,
+                &locks,
+                args.generations,
+                args.batch_size,
+                &scoring_config,
+            ),
             OptimizationMode::Ga => {
-                run_ga_optimization(&tournamentinfo, &app_config, &scoring_config, args.verbose);
+                run_ga_optimization(&tournamentinfo, &app_config, &scoring_config, &locks, args.verbose)
             }
-            OptimizationMode::Hybrid => {
-                run_hybrid_optimization(&tournamentinfo, &app_config, args.verbose);
+            OptimizationMode::Hybrid => run_hybrid_optimization(
+                &tournamentinfo,
+                &app_config,
+                &scoring_config,
+                &locks,
+                args.verbose,
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve scoring from built-in defaults, then the config file, then the CLI.
+///
+/// There used to be two of these live at once: `main` built one from the CLI
+/// flags while the sequential-portfolio and hybrid optimizers built their own
+/// from the YAML file. `--score-r6 100` therefore changed the answer in some
+/// modes and was silently ignored in others.
+fn scoring_from_args(args: &Args, app_config: &Config) -> Result<ScoringConfig, String> {
+    let base = app_config
+        .to_scoring_config()
+        .map_err(|e| format!("invalid scoring in config file: {}", e))?;
+
+    let cli_scores = [
+        args.score_r1,
+        args.score_r2,
+        args.score_r3,
+        args.score_r4,
+        args.score_r5,
+        args.score_r6,
+    ];
+    let cli_modes = [
+        &args.seed_r1,
+        &args.seed_r2,
+        &args.seed_r3,
+        &args.seed_r4,
+        &args.seed_r5,
+        &args.seed_r6,
+    ];
+
+    let mut resolved = base;
+    for round in 0..6 {
+        if let Some(points) = cli_scores[round] {
+            resolved.round_scores[round] = points;
+        }
+        if let Some(mode) = cli_modes[round] {
+            resolved.round_seed_scoring[round] = parse_seed_mode(mode)?;
+        }
+    }
+
+    for (round, points) in resolved.round_scores.iter().enumerate() {
+        if !points.is_finite() || *points < 0.0 {
+            return Err(format!(
+                "round {} score must be a non-negative number, got {}",
+                round + 1,
+                points
+            ));
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn print_scoring(scoring_config: &ScoringConfig) {
+    println!("Scoring Configuration:");
+    for round in 0..6 {
+        println!(
+            "  R{}: {} ({:?})",
+            round + 1,
+            scoring_config.round_scores[round],
+            scoring_config.round_seed_scoring[round]
+        );
+    }
+    println!();
+}
+
+/// Load the tournament field, or `None` if `--elo-only` handled the run.
+fn load_tournament(args: &Args) -> Result<Option<ingest::TournamentInfo>, String> {
+    match args.source {
+        DataSourceArg::Csv => {
+            println!("Loading data from CSV file: {}", args.csv_path);
+            Ok(Some(ingest::TournamentInfo::initialize(&args.csv_path)?))
+        }
+        DataSourceArg::Espn | DataSourceArg::Ncaa => {
+            let source = match args.source {
+                DataSourceArg::Espn => api::DataSource::ESPN,
+                DataSourceArg::Ncaa => api::DataSource::NCAA,
+                DataSourceArg::Csv => unreachable!(),
+            };
+
+            println!("Source: {:?}", source);
+            println!("Season: {}", args.season);
+            println!();
+
+            let client = api::ApiClient::new(source, &args.cache_dir, args.allow_partial_data);
+
+            println!("Fetching game data...");
+            // A failed fetch used to fall back to an empty game list, which left
+            // every team at the default 1500 rating. Every matchup then became a
+            // coin flip and the optimizer produced confident-looking output from
+            // pure noise, indistinguishable from a real run.
+            let mut games = client.fetch_season(&args.season).map_err(|e| {
+                format!(
+                    "could not fetch game data: {}\n\
+                     Ratings cannot be computed without games. Retry, or run \
+                     `--source csv` to use the bundled FiveThirtyEight ratings.",
+                    e
+                )
+            })?;
+
+            println!();
+            println!("Calculating ELO ratings from {} games...", games.len());
+            let mut elo_system = elo::EloSystem::new(args.season.clone());
+            elo_system.process_games(&mut games);
+
+            if elo_system.games_processed == 0 && !args.allow_partial_data {
+                return Err(format!(
+                    "no completed games found for season {}. Ratings would all be \
+                     the 1500 default, making every matchup a coin flip.\n\
+                     Check the season string, or pass --allow-partial-data to proceed anyway.",
+                    args.season
+                ));
             }
+
+            elo_system.print_top_teams(args.show_top);
+
+            if args.elo_only {
+                println!();
+                println!("ELO-only mode: Skipping bracket optimization.");
+                return Ok(None);
+            }
+
+            println!();
+            let bracket_teams = load_bracket_teams(args, &client)?;
+
+            Ok(Some(ingest::TournamentInfo::from_elo_ratings(
+                &elo_system,
+                bracket_teams,
+            )?))
         }
     }
 }
 
-/// Parse team lock constraints from CLI arguments
-/// Format: "TeamName:Round" where Round is one of:
-/// Round2, Sweet16, Elite8, FinalFour, Championship, Winner
-fn parse_lock_constraints(lock_args: &[String]) -> Vec<BracketConstraint> {
+fn load_bracket_teams(
+    args: &Args,
+    client: &api::ApiClient,
+) -> Result<Vec<game_result::BracketTeam>, String> {
+    if let Some(ref bracket_path) = args.bracket_file {
+        println!("Loading bracket from file: {}", bracket_path);
+        let teams = api::load_bracket_from_file(bracket_path)?;
+        println!("Loaded {} teams from bracket file", teams.len());
+        return Ok(teams);
+    }
+
+    // An explicit --tournament-year is a request for that specific bracket, so
+    // failing to get it is an error. A year merely derived from the season is a
+    // guess, and falling back to the sample field is reasonable there.
+    if let Some(year) = args.tournament_year {
+        println!("Fetching {} tournament bracket...", year);
+        return client.fetch_tournament_bracket(year);
+    }
+
+    let derived_year = args
+        .season
+        .split('-')
+        .nth(1)
+        .and_then(|y| y.parse::<i32>().ok());
+
+    match derived_year {
+        Some(year) => {
+            println!("Fetching {} tournament bracket (derived from season)...", year);
+            match client.fetch_tournament_bracket(year) {
+                Ok(teams) => Ok(teams),
+                Err(e) => {
+                    eprintln!("Note: {}", e);
+                    println!("Using sample bracket teams");
+                    Ok(ingest::TournamentInfo::sample_bracket_teams())
+                }
+            }
+        }
+        None => {
+            println!("Using sample bracket teams");
+            Ok(ingest::TournamentInfo::sample_bracket_teams())
+        }
+    }
+}
+
+/// Parse team lock constraints from CLI arguments.
+/// Format: "TeamName:Round".
+fn parse_lock_constraints(lock_args: &[String]) -> Result<Vec<BracketConstraint>, String> {
     let mut constraints = Vec::new();
 
     for arg in lock_args {
-        let parts: Vec<&str> = arg.split(':').collect();
-        if parts.len() != 2 {
-            eprintln!("Warning: Invalid lock format '{}', expected 'TeamName:Round'", arg);
-            continue;
-        }
+        let (team_name, round_text) = arg
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid --lock-team '{}', expected 'TeamName:Round'", arg))?;
 
-        let team_name = parts[0].trim();
-        let round = match parts[1].trim().to_lowercase().as_str() {
+        let round = match round_text.trim().to_lowercase().as_str() {
             "round2" | "r2" | "32" => AdvancementRound::Round2,
             "sweet16" | "s16" | "16" => AdvancementRound::Sweet16,
             "elite8" | "e8" | "8" => AdvancementRound::Elite8,
@@ -425,16 +514,202 @@ fn parse_lock_constraints(lock_args: &[String]) -> Vec<BracketConstraint> {
             "championship" | "finals" | "2" => AdvancementRound::Championship,
             "winner" | "champion" | "1" => AdvancementRound::Winner,
             other => {
-                eprintln!("Warning: Unknown round '{}', skipping", other);
-                continue;
+                return Err(format!(
+                    "unknown round '{}' in --lock-team '{}'. Expected one of: \
+                     Round2, Sweet16, Elite8, FinalFour, Championship, Winner",
+                    other, arg
+                ))
             }
         };
 
-        constraints.push(BracketConstraint::new(team_name, round));
-        println!("Locking {} to reach {:?}", team_name, round);
+        constraints.push(BracketConstraint::new(team_name.trim(), round));
     }
 
-    constraints
+    Ok(constraints)
+}
+
+/// Solve exactly for the highest-expected-value bracket.
+fn run_exact_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    locks: &LockSet,
+    scoring_config: &ScoringConfig,
+) -> Result<(), String> {
+    println!();
+    println!("=== Exact Optimization ===");
+    println!("Maximizing expected score by dynamic programming over the bracket tree.");
+    if !locks.is_empty() {
+        println!("Subject to {} team lock(s).", locks.locks.len());
+    }
+    println!();
+
+    let solution =
+        exact::solve(tournamentinfo, scoring_config, &locks.locks).map_err(|e| e.to_string())?;
+
+    solution.bracket.pretty_print();
+    println!(
+        "Optimal expected score: {:.2}  (no legal bracket scores higher under these rules)",
+        solution.expected_value
+    );
+
+    Ok(())
+}
+
+/// Run GA-based single bracket optimization
+fn run_ga_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    app_config: &Config,
+    scoring_config: &ScoringConfig,
+    locks: &LockSet,
+    verbose: bool,
+) {
+    println!();
+    println!("=== Genetic Algorithm Optimization ===");
+    println!("Population size: {}", app_config.ga.population_size);
+    println!("Generations: {}", app_config.ga.generations);
+    println!("Simulation pool size: {}", app_config.simulation.pool_size);
+    println!();
+
+    let pool = MonteCarloScenarios::new(
+        tournamentinfo,
+        app_config.simulation.pool_size,
+        scoring_config,
+    );
+
+    let mut ga = GeneticAlgorithm::new(tournamentinfo, app_config.ga.clone(), *scoring_config)
+        .with_locks(locks.clone(), tournamentinfo);
+
+    let best_bracket = ga.run(tournamentinfo, &pool, verbose);
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+    best_bracket.pretty_print();
+
+    report_against_optimum(tournamentinfo, &best_bracket, scoring_config, locks);
+}
+
+/// Run hybrid SA+GA single bracket optimization
+fn run_hybrid_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    app_config: &Config,
+    scoring_config: &ScoringConfig,
+    locks: &LockSet,
+    verbose: bool,
+) {
+    println!();
+    println!("=== Hybrid SA+GA Optimization ===");
+    println!("Generations: {}", app_config.ga.generations);
+    println!("Simulation pool size: {}", app_config.simulation.pool_size);
+    println!();
+
+    let optimizer = HybridOptimizer::new(app_config.clone(), *scoring_config, locks.clone());
+    let best_bracket = optimizer.optimize_single(tournamentinfo, verbose);
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+    best_bracket.pretty_print();
+
+    report_against_optimum(tournamentinfo, &best_bracket, scoring_config, locks);
+}
+
+/// Legacy hill-climbing: keep a champion bracket, mutate it, keep improvements.
+fn run_legacy_optimization(
+    tournamentinfo: &ingest::TournamentInfo,
+    locks: &LockSet,
+    generations: u32,
+    batch_size: i32,
+    scoring_config: &ScoringConfig,
+) {
+    println!();
+    println!("=== Legacy Hill-Climbing Optimization ===");
+    println!();
+
+    let mut best = locks.repair(
+        bracket::Bracket::new(tournamentinfo, Some(scoring_config)),
+        tournamentinfo,
+        scoring_config,
+    );
+
+    let mut batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
+    // The incumbent's fitness, measured the same way as every challenger's.
+    // This used to be compared against `bracket.score` — the bracket's *perfect*
+    // score, a constant several times larger than any batch average — so the
+    // comparison never succeeded and the loop never accepted anything.
+    let mut best_score = batch.score_against_ref(&best);
+
+    let num_children = 63;
+    let mut mutation_rate = 5.0 / 63.0;
+
+    println!(
+        "Starting {} generations, {} children per generation, initial mutation rate {:.4}",
+        generations, num_children, mutation_rate
+    );
+    println!("Generation 0 score: {:.2}", best_score);
+
+    for i in 0..generations {
+        let children = best
+            .create_n_children(tournamentinfo, num_children, mutation_rate, Some(scoring_config))
+            .into_iter()
+            .map(|c| locks.repair(c, tournamentinfo, scoring_config));
+
+        for child in children {
+            let score = batch.score_against_ref(&child);
+            if score > best_score {
+                best_score = score;
+                best = child;
+            }
+        }
+
+        let progress = i as f64 / generations as f64;
+        if progress > 0.50 {
+            mutation_rate = 1.0 / 63.0;
+        } else if progress > 0.25 {
+            mutation_rate = 2.0 / 63.0;
+        }
+
+        if i % 25 == 0 {
+            println!(
+                "{}: score {:.2}, std dev {:.2}, EV {:.2}",
+                i, best_score, batch.batch_score_std_dev, best.expected_value
+            );
+        }
+    }
+
+    println!();
+    println!("Optimization complete!");
+    println!();
+    best.pretty_print();
+
+    report_against_optimum(tournamentinfo, &best, scoring_config, locks);
+}
+
+/// Show how far a search-based result falls short of the exact optimum.
+///
+/// The exact solve is cheap enough to run alongside any other mode, so there is
+/// no reason to report a heuristic's score without the number it should be
+/// compared against.
+fn report_against_optimum(
+    tournamentinfo: &ingest::TournamentInfo,
+    bracket: &bracket::Bracket,
+    scoring_config: &ScoringConfig,
+    locks: &LockSet,
+) {
+    let found = exact::expected_value(tournamentinfo, bracket, scoring_config);
+    println!("Expected score of this bracket: {:.2}", found);
+
+    match exact::solve(tournamentinfo, scoring_config, &locks.locks) {
+        Ok(solution) => {
+            let gap = solution.expected_value - found;
+            println!(
+                "Exact optimum:                  {:.2}  (gap {:.2}, {:.1}% of optimum)",
+                solution.expected_value,
+                gap,
+                100.0 * found / solution.expected_value
+            );
+        }
+        Err(e) => eprintln!("Could not compute the exact optimum: {}", e),
+    }
 }
 
 /// Run portfolio mode - generate multiple diverse brackets
@@ -443,7 +718,7 @@ fn run_portfolio_mode(
     num_brackets: usize,
     diversity_weight: f64,
     strategy: &PortfolioStrategy,
-    constraints: &[BracketConstraint],
+    locks: &LockSet,
     generations: u32,
     anneal_steps: usize,
     scoring_config: &ScoringConfig,
@@ -452,26 +727,17 @@ fn run_portfolio_mode(
 ) {
     println!();
     println!("=== Portfolio Mode ===");
-    println!("Generating {} diverse brackets...", num_brackets);
+    println!("Generating {} brackets...", num_brackets);
     println!("Strategy: {:?}", strategy);
-
-    if !constraints.is_empty() {
-        println!("Base constraints:");
-        for c in constraints {
-            println!("  - {} must reach {:?}", c.team_name, c.must_reach);
-        }
-    }
     println!();
 
-    match strategy {
+    let brackets: Vec<bracket::Bracket> = match strategy {
         PortfolioStrategy::Champion => {
-            let portfolio = BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config);
+            let portfolio =
+                BracketPortfolio::generate_champion_stratified(tournamentinfo, num_brackets, scoring_config);
             portfolio.print_summary_with_config(Some(scoring_config));
             portfolio.print_pairwise_distances(scoring_config);
-            for (i, bracket) in portfolio.brackets.iter().enumerate() {
-                println!("\n=== Bracket {} ===", i + 1);
-                bracket.pretty_print();
-            }
+            portfolio.brackets
         }
         PortfolioStrategy::Diverse => {
             println!("Diversity weight: {:.2}", diversity_weight);
@@ -484,14 +750,14 @@ fn run_portfolio_mode(
             );
             portfolio.print_summary_with_config(Some(scoring_config));
             portfolio.print_pairwise_distances(scoring_config);
-            for (i, bracket) in portfolio.brackets.iter().enumerate() {
-                println!("\n=== Bracket {} ===", i + 1);
-                bracket.pretty_print();
-            }
+            portfolio.brackets
         }
         PortfolioStrategy::Annealing => {
             println!("Mode: Simulated Annealing (whole portfolio)");
-            println!("Fitness: Best-ball score against {} simulations", app_config.simulation.pool_size);
+            println!(
+                "Fitness: Best-ball score against {} simulations",
+                app_config.simulation.pool_size
+            );
             println!("Annealing steps: {}", anneal_steps);
             println!();
             let portfolio = BracketPortfolio::generate_annealing_diverse(
@@ -502,290 +768,67 @@ fn run_portfolio_mode(
                 scoring_config,
             );
             portfolio.print_summary_with_config(Some(scoring_config));
-            for (i, bracket) in portfolio.brackets.iter().enumerate() {
-                println!("\n=== Bracket {} ===", i + 1);
-                bracket.pretty_print();
-            }
+            portfolio.brackets
         }
         PortfolioStrategy::GaWhole => {
             println!("Mode: Genetic Algorithm (whole portfolio evolution)");
             println!("Population size: {} portfolios", app_config.ga.population_size);
             println!("Generations: {}", app_config.ga.generations);
-            println!("Fitness: Best-ball score against {} simulations", app_config.simulation.pool_size);
-            println!("Smart mutation: {}", app_config.ga.smart_mutation);
+            println!(
+                "Fitness: Best-ball score against {} simulations",
+                app_config.simulation.pool_size
+            );
             println!();
 
-            // Generate simulation pool
             let pool = MonteCarloScenarios::new(
                 tournamentinfo,
                 app_config.simulation.pool_size,
                 scoring_config,
             );
 
-            // Create and run whole portfolio GA
             let mut ga = WholePortfolioGA::new(
                 tournamentinfo,
                 num_brackets,
                 app_config.ga.clone(),
                 *scoring_config,
-            );
+            )
+            .with_locks(locks.clone(), tournamentinfo);
 
             let brackets = ga.run(tournamentinfo, &pool, verbose);
 
-            // Calculate final best-ball score
-            let final_score = pool.score_portfolio_best_ball(&brackets, scoring_config);
             println!("\n=== Portfolio Optimization Complete ===");
-            println!("Final best-ball score: {:.2}", final_score);
-
-            println!("\nPortfolio champions:");
-            for (i, bracket) in brackets.iter().enumerate() {
-                let individual_score = pool.score_bracket(bracket, scoring_config);
-                println!(
-                    "  Bracket {}: {} (seed {}) - Individual score: {:.2}, EV: {:.2}",
-                    i + 1,
-                    bracket.winner.name,
-                    bracket.winner.seed,
-                    individual_score,
-                    bracket.expected_value
-                );
-            }
-
-            for (i, bracket) in brackets.iter().enumerate() {
-                println!("\n=== Bracket {} ===", i + 1);
-                bracket.pretty_print();
-            }
+            println!(
+                "Final best-ball score: {:.2}",
+                pool.score_portfolio_best_ball(&brackets, scoring_config)
+            );
+            brackets
         }
         PortfolioStrategy::GaSequential => {
             println!("Mode: Sequential GA (freeze-and-optimize)");
             println!("Population size: {}", app_config.ga.population_size);
             println!("Generations per bracket: {}", app_config.ga.generations);
-            println!("Fitness: Marginal contribution to best-ball score");
             println!("Simulation pool size: {}", app_config.simulation.pool_size);
-            println!("Smart mutation: {}", app_config.ga.smart_mutation);
             println!();
 
-            let optimizer = SequentialPortfolioOptimizer::new(app_config.clone());
-            let brackets = optimizer.optimize(tournamentinfo, num_brackets, verbose);
-
-            println!();
-            for (i, bracket) in brackets.iter().enumerate() {
-                println!("\n=== Bracket {} ===", i + 1);
-                bracket.pretty_print();
-            }
+            let optimizer =
+                SequentialPortfolioOptimizer::new(app_config.clone(), *scoring_config, locks.clone());
+            optimizer.optimize(tournamentinfo, num_brackets, verbose)
         }
-    }
-}
+    };
 
-/// Run GA-based single bracket optimization
-fn run_ga_optimization(
-    tournamentinfo: &ingest::TournamentInfo,
-    app_config: &Config,
-    scoring_config: &ScoringConfig,
-    verbose: bool,
-) {
-    println!();
-    println!("=== Genetic Algorithm Optimization ===");
-    println!("Population size: {}", app_config.ga.population_size);
-    println!("Generations: {}", app_config.ga.generations);
-    println!("Simulation pool size: {}", app_config.simulation.pool_size);
-    println!("Smart mutation: {}", app_config.ga.smart_mutation);
-    println!();
-
-    // Generate simulation pool
-    let pool = MonteCarloScenarios::new(
-        tournamentinfo,
-        app_config.simulation.pool_size,
-        scoring_config,
-    );
-
-    // Create and run GA
-    let mut ga = GeneticAlgorithm::new(
-        tournamentinfo,
-        app_config.ga.clone(),
-        *scoring_config,
-    );
-
-    let best_bracket = ga.run(tournamentinfo, &pool, verbose);
-
-    println!();
-    println!("Optimization complete!");
-    println!();
-    best_bracket.pretty_print();
-
-    // Show score against simulation pool
-    let final_score = pool.score_bracket(&best_bracket, scoring_config);
-    println!("Average score against {} simulations: {:.2}", app_config.simulation.pool_size, final_score);
-}
-
-/// Run hybrid SA+GA single bracket optimization
-fn run_hybrid_optimization(
-    tournamentinfo: &ingest::TournamentInfo,
-    app_config: &Config,
-    verbose: bool,
-) {
-    println!();
-    println!("=== Hybrid SA+GA Optimization ===");
-    println!("Generations: {}", app_config.ga.generations);
-    println!("Simulation pool size: {}", app_config.simulation.pool_size);
-    println!("Smart mutation: {}", app_config.ga.smart_mutation);
-    println!();
-
-    let optimizer = HybridOptimizer::new(app_config.clone());
-    let best_bracket = optimizer.optimize_single(tournamentinfo, verbose);
-
-    println!();
-    println!("Optimization complete!");
-    println!();
-    best_bracket.pretty_print();
-}
-
-/// Run optimization with locked team constraints
-fn run_constrained_optimization(
-    tournamentinfo: &ingest::TournamentInfo,
-    constraints: &[BracketConstraint],
-    generations: u32,
-    batch_size: i32,
-    scoring_config: &ScoringConfig,
-) {
-    println!();
-    println!("=== Constrained Bracket Mode ===");
-    println!("Building bracket with {} constraints...", constraints.len());
-    println!();
-
-    // Build initial bracket with constraints
-    let mut builder = ConstrainedBracketBuilder::new(tournamentinfo, scoring_config);
-    for constraint in constraints {
-        builder = builder.with_constraint(constraint.clone());
+    println!("\nPortfolio champions:");
+    for (i, b) in brackets.iter().enumerate() {
+        println!(
+            "  Bracket {}: {} (seed {}) - expected score {:.2}",
+            i + 1,
+            b.winner.name,
+            b.winner.seed,
+            exact::expected_value(tournamentinfo, b, scoring_config)
+        );
     }
 
-    match builder.build() {
-        Ok(mut bracket) => {
-            println!("Initial constrained bracket built.");
-            println!("Champion: {} (seed {})", bracket.winner.name, bracket.winner.seed);
-            println!("Expected Value: {:.2}", bracket.expected_value);
-            println!();
-
-            // Now optimize around the constraints
-            println!("Optimizing bracket with constraints...");
-            let mut max_bracket = bracket.clone();
-            let mutation_rate = 1.0 / 63.0 * 3.0;
-
-            // Create batch for scoring
-            let mut batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
-
-            for i in 0..generations {
-                // Create mutated child
-                let child = max_bracket.mutate(tournamentinfo, mutation_rate, Some(scoring_config));
-
-                // Score against batch
-                batch.score_against_ref(&child);
-
-                if batch.batch_score > bracket.score {
-                    max_bracket = child;
-                }
-
-                if i % 50 == 0 {
-                    println!("Generation {}: EV = {:.2}", i, max_bracket.expected_value);
-                }
-            }
-
-            println!();
-            println!("Optimization complete!");
-            println!();
-            max_bracket.pretty_print();
-        }
-        Err(e) => {
-            eprintln!("Error building constrained bracket: {}", e);
-        }
+    for (i, b) in brackets.iter().enumerate() {
+        println!("\n=== Bracket {} ===", i + 1);
+        b.pretty_print();
     }
-}
-
-fn run_optimization(tournamentinfo: &ingest::TournamentInfo, generations: u32, batch_size: i32, scoring_config: &ScoringConfig) {
-    let mut random_63_bool: Vec<bool> = Vec::new();
-    for _i in 0..63 {
-        let mut rng = rand::thread_rng();
-        let rand_bool: bool = rng.gen();
-        random_63_bool.push(rand_bool);
-    }
-
-    // Start with a bracket that is a likely scenario
-    let generated_bracket = bracket::Bracket::new(tournamentinfo, Some(scoring_config));
-
-    let num_children = 63;
-    let mut mutation_rate = 1.0 / 63.0 * 5.0;
-
-    let mut max_score = 0.0;
-    let mut max_std_dev = 0.0;
-    let mut max_bracket = generated_bracket.clone();
-
-    // Create a batch of random brackets to score against
-    let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
-
-    // For tracking the moving average
-    let mut moving_average_tracker: Vec<f64> = Vec::new();
-
-    // For tracking if the fittest individual is changing from generation to generation
-    let _last_max_bracket = generated_bracket.clone();
-
-    println!();
-    println!("Starting bracket optimization...");
-    println!();
-
-    for i in 0..generations {
-        // Show the score of the random bracket before any optimization
-        if i == 0 {
-            println!("Starting {} generations of optimization, with {} children per generation, and a mutation rate of {:.4}",
-                     generations, num_children, mutation_rate);
-            println!();
-            generated_batch.score_against_ref(&generated_bracket);
-            println!("{}, The score of the original bracket is: {:.2} std_dev: {:.2}",
-                     i, generated_batch.batch_score, generated_batch.batch_score_std_dev);
-        }
-
-        // Create a batch of random brackets to score against for this round
-        let mut generated_batch = pool::Batch::new(tournamentinfo, batch_size, scoring_config);
-
-        // Score the batch against the generated bracket
-        let mut children = max_bracket.create_n_children(tournamentinfo, num_children, mutation_rate, Some(scoring_config));
-
-        let last_max_bracket = max_bracket.clone();
-
-        // Score each of the children against the batch, then select the best child
-        let mut fitness = 0.0;
-        for child in &mut children {
-            generated_batch.score_against_ref(child);
-            if generated_batch.batch_score > fitness {
-                fitness = generated_batch.batch_score;
-                max_score = generated_batch.batch_score;
-                max_std_dev = generated_batch.batch_score_std_dev;
-                max_bracket = child.clone();
-            }
-        }
-
-        // Test for change from generation to generation of the fittest individual
-        let same_flag = last_max_bracket == max_bracket;
-
-        // Mutation rate should decrease over time
-        if i as f64 / generations as f64 > 0.25 {
-            mutation_rate /= 2.0;
-        }
-        if i as f64 / generations as f64 > 0.50 {
-            mutation_rate = 1.0 / 63.0;
-        }
-
-        if i % 1 == 0 {
-            moving_average_tracker.push(max_score);
-            if moving_average_tracker.len() > 10 {
-                moving_average_tracker.remove(0);
-            }
-            let moving_average: f64 = moving_average_tracker.iter().sum::<f64>() / moving_average_tracker.len() as f64;
-            println!("{}, The average score so far is: {:.2}, std_dev: {:.2}, moving average: {:.2}, ev: {:.2}, same: {}",
-                     i, max_score, max_std_dev, moving_average, max_bracket.expected_value, same_flag);
-        }
-    }
-
-    println!();
-    println!("Optimization complete!");
-    println!();
-    max_bracket.pretty_print();
 }

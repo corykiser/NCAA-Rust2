@@ -1,9 +1,11 @@
 // Genetic Algorithm module for NCAA Bracket Optimization
 // Implements proper population-based GA with smart mutation and best-ball scoring
 
-use crate::bracket::{Bracket, ScoringConfig, ScoreTable, FastBracket};
+use crate::bracket::{Bracket, FastBracket, ScoreTable, ScoringConfig};
 use crate::config::{Config, GaSettings};
+use crate::exact::TeamLock;
 use crate::ingest::{RcTeam, TournamentInfo};
+use crate::tree::{NO_GAME, NUM_ROUNDS, PARENT};
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -136,13 +138,21 @@ impl MonteCarloScenarios {
     }
 }
 
-/// Smart mutation operator
-/// Instead of random bit flips, selects a team and forces them to reach a specific round
+/// Directed mutation: pick a team, pick a round, and make that team reach it.
+///
+/// The previous implementation decided each bit from the moving team's seed
+/// alone (`team.seed <= 8`), which ignores who the team is actually playing.
+/// The encoding bit means "the lower seed of *this matchup* advances", so a
+/// 6-seed needs a different bit against an 11-seed than against a 3-seed —
+/// roughly half of all "forced" advances did the opposite of what was intended,
+/// and the championship case was decided from one region index when it depends
+/// on both finalists. This walks the team's actual path instead, so the bit is
+/// always computed against the real opponent.
 pub struct TeamRoundMutator;
 
 impl TeamRoundMutator {
-    /// Perform a smart mutation on a bracket
-    /// Picks a random team and random round, forces that team to advance to that round
+    /// Pick a random team and force it to win a random number of games.
+    /// Earlier rounds are weighted more heavily because they move more picks.
     pub fn mutate(
         bracket: &Bracket,
         tournament: &TournamentInfo,
@@ -150,217 +160,136 @@ impl TeamRoundMutator {
     ) -> Bracket {
         let mut rng = rand::thread_rng();
 
-        // Pick a random team from the tournament
         let team_idx = rng.gen_range(0..tournament.teams.len());
         let team = &tournament.teams[team_idx];
 
-        // Pick a random round (1-6)
-        // Weight towards earlier rounds (more impactful changes)
-        let round: usize = {
-            let r: f64 = rng.gen();
-            if r < 0.4 { 1 }      // 40% chance R1
-            else if r < 0.65 { 2 } // 25% chance R2
-            else if r < 0.80 { 3 } // 15% chance Sweet 16
-            else if r < 0.90 { 4 } // 10% chance Elite 8
-            else if r < 0.97 { 5 } // 7% chance Final Four
-            else { 6 }             // 3% chance Championship
+        let r: f64 = rng.gen();
+        let wins: usize = if r < 0.40 {
+            1
+        } else if r < 0.65 {
+            2
+        } else if r < 0.80 {
+            3
+        } else if r < 0.90 {
+            4
+        } else if r < 0.97 {
+            5
+        } else {
+            6
         };
 
-        // Create a new binary representation with this team advancing to the target round
-        let new_binary = Self::force_team_to_round(
-            &bracket.binary,
-            tournament,
-            team,
-            round,
-        );
-
+        let new_binary = Self::force_team_to_round(&bracket.binary, tournament, team, wins);
         Bracket::new_from_binary(tournament, &new_binary, Some(scoring_config))
     }
 
-    /// Modify binary representation to force a team to reach a specific round
-    fn force_team_to_round(
+    /// Rewrite `binary` so that `team` wins its first `wins` games.
+    pub fn force_team_to_round(
         binary: &[bool],
         tournament: &TournamentInfo,
         team: &RcTeam,
-        target_round: usize,
+        wins: usize,
+    ) -> Vec<bool> {
+        Self::force_index_to_round(binary, tournament, team.team_index, wins)
+    }
+
+    /// As `force_team_to_round`, addressing the team by index.
+    ///
+    /// Walks up the single path from the team's round-1 game, setting each bit
+    /// against the opponent that the already-rewritten bits below actually
+    /// deliver. Games above `wins` keep their bits and are re-decoded by the
+    /// caller, so the result is always a legal bracket.
+    pub fn force_index_to_round(
+        binary: &[bool],
+        tournament: &TournamentInfo,
+        team_index: u8,
+        wins: usize,
     ) -> Vec<bool> {
         let mut new_binary = binary.to_vec();
-        let region_idx = Self::get_region_index(&team.region);
+        let mut winners = tournament.decode_winners(&new_binary);
 
-        // For each round up to target_round-1, ensure the team wins
-        for round in 1..=target_round {
-            if let Some((game_idx, should_win_lower_seed_won)) =
-                Self::get_game_info_for_team(tournament, team, round, region_idx, &new_binary)
-            {
-                new_binary[game_idx] = should_win_lower_seed_won;
+        let mut game = tournament.r1_game_of_team[team_index as usize];
+
+        for _ in 0..wins.min(NUM_ROUNDS) {
+            let (a, b) = tournament.participants(game, &winners);
+            let opponent = if a == team_index {
+                b
+            } else if b == team_index {
+                a
+            } else {
+                debug_assert!(
+                    false,
+                    "team {} is not a participant of game {}",
+                    team_index, game
+                );
+                break;
+            };
+
+            new_binary[game] = tournament.winner_bit(team_index, opponent);
+            winners[game] = team_index;
+
+            game = PARENT[game];
+            if game == NO_GAME {
+                break;
             }
         }
 
         new_binary
     }
+}
 
-    /// Get the game index and required lower_seed_won value for a team to win in a given round
-    fn get_game_info_for_team(
+/// Team-round requirements re-applied to every candidate.
+///
+/// Mutation and crossover are free to move any pick, so a lock that is only
+/// applied to the starting bracket is gone after one generation. Repairing
+/// each candidate keeps the constraint true of everything the optimizer ever
+/// scores.
+#[derive(Debug, Clone, Default)]
+pub struct LockSet {
+    pub locks: Vec<TeamLock>,
+}
+
+impl LockSet {
+    pub fn new(locks: Vec<TeamLock>) -> Self {
+        LockSet { locks }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.locks.is_empty()
+    }
+
+    /// Force every lock back into a bit vector.
+    pub fn repair_binary(&self, binary: Vec<bool>, tournament: &TournamentInfo) -> Vec<bool> {
+        let mut binary = binary;
+        for lock in &self.locks {
+            binary = TeamRoundMutator::force_index_to_round(
+                &binary,
+                tournament,
+                lock.team_index,
+                lock.wins_required,
+            );
+        }
+        binary
+    }
+
+    /// Force every lock back into a bracket, rebuilding only if something moved.
+    pub fn repair(
+        &self,
+        bracket: Bracket,
         tournament: &TournamentInfo,
-        team: &RcTeam,
-        round: usize,
-        region_idx: usize,
-        current_binary: &[bool],
-    ) -> Option<(usize, bool)> {
-        match round {
-            1 => {
-                // Round 1: Find the game based on seed
-                let game_in_region = Self::seed_to_r1_game(team.seed);
-                let game_idx = region_idx * 8 + game_in_region;
-
-                // lower_seed_won = true means lower seed wins
-                // Team should win, so lower_seed_won depends on whether team is lower seed
-                let matchup = tournament.round1[game_in_region];
-                let is_lower_seed = team.seed == matchup[0].min(matchup[1]);
-
-                Some((game_idx, is_lower_seed))
-            }
-            2 => {
-                // Round 2: 4 games per region, starting at index 32
-                let game_in_region = Self::seed_to_r2_game(team.seed);
-                let game_idx = 32 + region_idx * 4 + game_in_region;
-
-                // Need to determine if team is the "lower_seed_won" winner in this matchup
-                // This depends on who won Round 1
-                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, game_in_region, current_binary, tournament);
-
-                Some((game_idx, should_win))
-            }
-            3 => {
-                // Sweet 16: 2 games per region, starting at index 48
-                let game_in_region = Self::seed_to_r3_game(team.seed);
-                let game_idx = 48 + region_idx * 2 + game_in_region;
-
-                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, game_in_region, current_binary, tournament);
-
-                Some((game_idx, should_win))
-            }
-            4 => {
-                // Elite 8: 1 game per region, starting at index 56
-                let game_idx = 56 + region_idx;
-
-                let should_win = Self::should_be_lower_seed_won_winner(team, round, region_idx, 0, current_binary, tournament);
-
-                Some((game_idx, should_win))
-            }
-            5 => {
-                // Final Four: 2 games
-                // Game 60: South vs Midwest winners
-                // Game 61: East vs West winners
-                let game_idx = if region_idx == 2 || region_idx == 3 { 60 } else { 61 };
-
-                // For cross-region games, lower_seed_won is based on alphabetical region order
-                // East < Midwest < South < West
-                let should_win = Self::should_be_lower_seed_won_winner_cross_region(team, region_idx);
-
-                Some((game_idx, should_win))
-            }
-            6 => {
-                // Championship: Game 62
-                // South/Midwest winner vs East/West winner
-                // Need to determine based on region
-                let game_idx = 62;
-
-                // Alphabetically: East < Midwest < South < West
-                // Game 60 winner (South/Midwest) has regions 2,3
-                // Game 61 winner (East/West) has regions 0,1
-                // lower_seed_won = true means the "first" team wins
-                // The "first" team in championship is from game 60 (South/Midwest)
-                // since South < West and Midwest < West but South > East...
-                // Actually the ordering is: East(0) vs West(1) -> winner at 61
-                //                          South(2) vs Midwest(3) -> winner at 60
-                // In championship (62): compare regions alphabetically
-                let should_win = region_idx == 2 || region_idx == 3; // South/Midwest side
-                // But we need to check actual alphabetical order
-                // East < Midwest < South < West
-                // So if team is from South or Midwest, they're in game 60's bracket
-                // If team is from East or West, they're in game 61's bracket
-                // For lower_seed_won in championship: depends on which regions are playing
-
-                Some((game_idx, should_win))
-            }
-            _ => None,
+        scoring_config: &ScoringConfig,
+    ) -> Bracket {
+        if self.locks.is_empty() || self.is_satisfied(&bracket) {
+            return bracket;
         }
+        let repaired = self.repair_binary(bracket.binary.clone(), tournament);
+        Bracket::new_from_binary(tournament, &repaired, Some(scoring_config))
     }
 
-    /// Determine if team should be the lower_seed_won winner for a given round/game
-    fn should_be_lower_seed_won_winner(
-        team: &RcTeam,
-        _round: usize,
-        _region_idx: usize,
-        _game_in_region: usize,
-        _current_binary: &[bool],
-        _tournament: &TournamentInfo,
-    ) -> bool {
-        // Within a region, lower_seed_won is based on seed (lower seed = true)
-        // This is a simplification - in reality we'd need to trace through
-        // the bracket to see who the opponent is
-        team.seed <= 8
-    }
-
-    /// Determine lower_seed_won for cross-region games
-    fn should_be_lower_seed_won_winner_cross_region(team: &RcTeam, region_idx: usize) -> bool {
-        // Alphabetical order: East(0) < Midwest(3) < South(2) < West(1)
-        // Wait, that's not right. Let me fix:
-        // East, Midwest, South, West -> alphabetically: East < Midwest < South < West
-        // So region ordering should be: East(0)=0, Midwest(3)=1, South(2)=2, West(1)=3
-        // For Final Four game 60 (South vs Midwest): Midwest < South, so Midwest is "first"
-        // For Final Four game 61 (East vs West): East < West, so East is "first"
-        // lower_seed_won = true means the alphabetically first region wins
-
-        match region_idx {
-            0 => true,  // East is first vs West
-            1 => false, // West is second vs East
-            2 => false, // South is second vs Midwest
-            3 => true,  // Midwest is first vs South
-            _ => true,
-        }
-    }
-
-    fn get_region_index(region: &str) -> usize {
-        match region {
-            "East" => 0,
-            "West" => 1,
-            "South" => 2,
-            "Midwest" => 3,
-            _ => 0,
-        }
-    }
-
-    fn seed_to_r1_game(seed: i32) -> usize {
-        match seed {
-            1 | 16 => 0,
-            8 | 9 => 1,
-            5 | 12 => 2,
-            4 | 13 => 3,
-            6 | 11 => 4,
-            3 | 14 => 5,
-            7 | 10 => 6,
-            2 | 15 => 7,
-            _ => 0,
-        }
-    }
-
-    fn seed_to_r2_game(seed: i32) -> usize {
-        match seed {
-            1 | 16 | 8 | 9 => 0,
-            5 | 12 | 4 | 13 => 1,
-            6 | 11 | 3 | 14 => 2,
-            7 | 10 | 2 | 15 => 3,
-            _ => 0,
-        }
-    }
-
-    fn seed_to_r3_game(seed: i32) -> usize {
-        match seed {
-            1 | 16 | 8 | 9 | 5 | 12 | 4 | 13 => 0,
-            _ => 1,
-        }
+    /// Whether every lock already holds in `bracket`.
+    pub fn is_satisfied(&self, bracket: &Bracket) -> bool {
+        self.locks
+            .iter()
+            .all(|lock| bracket.wins_for(lock.team_index) >= lock.wins_required)
     }
 }
 
@@ -392,6 +321,8 @@ pub struct GeneticAlgorithm {
     pub generation: usize,
     pub best_fitness: f64,
     pub best_bracket: Option<Bracket>,
+    /// Re-applied to every candidate; see `LockSet`.
+    pub locks: LockSet,
 }
 
 impl GeneticAlgorithm {
@@ -413,7 +344,23 @@ impl GeneticAlgorithm {
             generation: 0,
             best_fitness: 0.0,
             best_bracket: None,
+            locks: LockSet::default(),
         }
+    }
+
+    /// Constrain the search: every candidate, starting with the initial
+    /// population, is repaired to satisfy these locks.
+    pub fn with_locks(mut self, locks: LockSet, tournament: &TournamentInfo) -> Self {
+        if !locks.is_empty() {
+            let scoring = self.scoring_config;
+            self.population = self
+                .population
+                .drain(..)
+                .map(|ind| Individual::new(locks.repair(ind.bracket, tournament, &scoring)))
+                .collect();
+        }
+        self.locks = locks;
+        self
     }
 
     /// Evaluate fitness for all individuals using simulation pool
@@ -581,6 +528,7 @@ impl GeneticAlgorithm {
                 child = TeamRoundMutator::mutate(&child, tournament, &self.scoring_config);
             }
 
+            let child = self.locks.repair(child, tournament, &self.scoring_config);
             new_population.push(Individual::new(child));
         }
 
@@ -678,6 +626,7 @@ impl GeneticAlgorithm {
 pub struct SequentialPortfolioOptimizer {
     pub config: Config,
     pub scoring_config: ScoringConfig,
+    pub locks: LockSet,
 }
 
 /// Portfolio Individual - represents an entire portfolio of N brackets
@@ -714,6 +663,8 @@ pub struct WholePortfolioGA {
     pub generation: usize,
     pub best_fitness: f64,
     pub best_portfolio: Option<Vec<Bracket>>,
+    /// Applied to every bracket of every portfolio.
+    pub locks: LockSet,
 }
 
 impl WholePortfolioGA {
@@ -737,7 +688,29 @@ impl WholePortfolioGA {
             generation: 0,
             best_fitness: 0.0,
             best_portfolio: None,
+            locks: LockSet::default(),
         }
+    }
+
+    /// Constrain every bracket in every portfolio to satisfy these locks.
+    pub fn with_locks(mut self, locks: LockSet, tournament: &TournamentInfo) -> Self {
+        if !locks.is_empty() {
+            let scoring = self.scoring_config;
+            self.population = self
+                .population
+                .drain(..)
+                .map(|ind| {
+                    PortfolioIndividual::new(
+                        ind.brackets
+                            .into_iter()
+                            .map(|b| locks.repair(b, tournament, &scoring))
+                            .collect(),
+                    )
+                })
+                .collect();
+        }
+        self.locks = locks;
+        self
     }
 
     /// Evaluate fitness for all portfolios using best-ball scoring
@@ -909,6 +882,17 @@ impl WholePortfolioGA {
                 child = Self::mutate(&child, tournament, &self.scoring_config, &mut rng);
             }
 
+            let child = if self.locks.is_empty() {
+                child
+            } else {
+                PortfolioIndividual::new(
+                    child
+                        .brackets
+                        .into_iter()
+                        .map(|b| self.locks.repair(b, tournament, &self.scoring_config))
+                        .collect(),
+                )
+            };
             new_population.push(child);
         }
 
@@ -952,11 +936,15 @@ impl WholePortfolioGA {
 }
 
 impl SequentialPortfolioOptimizer {
-    pub fn new(config: Config) -> Self {
-        let scoring_config = config.to_scoring_config();
+    /// `scoring_config` is passed in rather than re-derived from `config`.
+    /// Deriving it here meant this optimizer silently read the YAML scoring
+    /// section while the rest of the program used the `--score-r*` flags, so
+    /// the same flags changed the answer in some modes and not others.
+    pub fn new(config: Config, scoring_config: ScoringConfig, locks: LockSet) -> Self {
         SequentialPortfolioOptimizer {
             config,
             scoring_config,
+            locks,
         }
     }
 
@@ -984,7 +972,8 @@ impl SequentialPortfolioOptimizer {
                 tournament,
                 self.config.ga.clone(),
                 self.scoring_config,
-            );
+            )
+            .with_locks(self.locks.clone(), tournament);
 
             // Always optimize for best-ball contribution to portfolio
             // For first bracket, this is equivalent to EV, but keeps the fitness semantics consistent
@@ -1037,14 +1026,16 @@ impl SequentialPortfolioOptimizer {
 pub struct HybridOptimizer {
     pub config: Config,
     pub scoring_config: ScoringConfig,
+    pub locks: LockSet,
 }
 
 impl HybridOptimizer {
-    pub fn new(config: Config) -> Self {
-        let scoring_config = config.to_scoring_config();
+    /// See `SequentialPortfolioOptimizer::new` on why scoring is passed in.
+    pub fn new(config: Config, scoring_config: ScoringConfig, locks: LockSet) -> Self {
         HybridOptimizer {
             config,
             scoring_config,
+            locks,
         }
     }
 
@@ -1064,7 +1055,11 @@ impl HybridOptimizer {
         let mut rng = rand::thread_rng();
 
         // Start with a random bracket
-        let mut current = Bracket::new(tournament, Some(&self.scoring_config));
+        let mut current = self.locks.repair(
+            Bracket::new(tournament, Some(&self.scoring_config)),
+            tournament,
+            &self.scoring_config,
+        );
         let mut current_score = pool.score_bracket(&current, &self.scoring_config);
 
         let mut best = current.clone();
@@ -1079,7 +1074,11 @@ impl HybridOptimizer {
         for gen in 0..self.config.ga.generations {
             // Generate neighbor using Team-Round mutation (TeamRoundMutator)
             // Bit-flip mutation is semantically broken for brackets
-            let neighbor = TeamRoundMutator::mutate(&current, tournament, &self.scoring_config);
+            let neighbor = self.locks.repair(
+                TeamRoundMutator::mutate(&current, tournament, &self.scoring_config),
+                tournament,
+                &self.scoring_config,
+            );
 
             let neighbor_score = pool.score_bracket(&neighbor, &self.scoring_config);
 
@@ -1123,10 +1122,148 @@ impl HybridOptimizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bracket::tests::assert_legal;
+    use crate::ingest::tests::tournament;
 
-    // Tests would go here - skipping for brevity but would test:
-    // - MonteCarloScenarios generation and scoring
-    // - TeamRoundMutator producing valid brackets
-    // - GA selection, crossover, mutation
-    // - Sequential portfolio optimization
+    #[test]
+    fn forcing_a_team_to_a_round_actually_gets_it_there() {
+        // The old implementation set each bit from the moving team's own seed
+        // (`team.seed <= 8`), ignoring the opponent, so about half of these
+        // forced the team to lose instead. Check every team at every depth.
+        let t = tournament();
+        let start = Bracket::new(&t, None);
+
+        for team_index in 0..64u8 {
+            for wins in 1..=6usize {
+                let binary =
+                    TeamRoundMutator::force_index_to_round(&start.binary, &t, team_index, wins);
+                let bracket = Bracket::new_from_binary(&t, &binary, None);
+
+                assert_legal(&bracket);
+                assert_eq!(
+                    bracket.wins_for(team_index),
+                    wins.max(bracket.wins_for(team_index)),
+                    "team {} was asked for {} wins",
+                    team_index,
+                    wins
+                );
+                assert!(
+                    bracket.wins_for(team_index) >= wins,
+                    "team {} only won {} of the {} games it was forced to win",
+                    team_index,
+                    bracket.wins_for(team_index),
+                    wins
+                );
+                if wins == 6 {
+                    assert_eq!(bracket.winner.team_index, team_index);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forcing_a_champion_works_from_any_starting_bracket() {
+        let t = tournament();
+        for _ in 0..25 {
+            let start = Bracket::new(&t, None);
+            for team_index in [0u8, 15, 16, 31, 32, 47, 48, 63] {
+                let binary =
+                    TeamRoundMutator::force_index_to_round(&start.binary, &t, team_index, 6);
+                let bracket = Bracket::new_from_binary(&t, &binary, None);
+                assert_legal(&bracket);
+                assert_eq!(bracket.winner.team_index, team_index);
+            }
+        }
+    }
+
+    #[test]
+    fn forcing_is_idempotent() {
+        let t = tournament();
+        let start = Bracket::new(&t, None);
+        let once = TeamRoundMutator::force_index_to_round(&start.binary, &t, 20, 4);
+        let twice = TeamRoundMutator::force_index_to_round(&once, &t, 20, 4);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn forcing_only_touches_the_teams_own_path() {
+        // Games in the opposite half of the draw must be left alone.
+        let t = tournament();
+        let start = Bracket::new(&t, None);
+        let team_index = t.r1_teams[0][0];
+        let binary = TeamRoundMutator::force_index_to_round(&start.binary, &t, team_index, 4);
+
+        let mut path = vec![t.r1_game_of_team[team_index as usize]];
+        while let Some(&g) = path.last() {
+            if crate::tree::PARENT[g] == NO_GAME || path.len() >= 4 {
+                break;
+            }
+            path.push(crate::tree::PARENT[g]);
+        }
+
+        for game in 0..crate::tree::NUM_GAMES {
+            if !path.contains(&game) {
+                assert_eq!(
+                    binary[game], start.binary[game],
+                    "game {} changed but is not on the forced path {:?}",
+                    game, path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_always_produces_a_legal_bracket() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let mut bracket = Bracket::new(&t, Some(&scoring));
+        for _ in 0..300 {
+            bracket = TeamRoundMutator::mutate(&bracket, &t, &scoring);
+            assert_legal(&bracket);
+        }
+    }
+
+    #[test]
+    fn locks_survive_repeated_mutation() {
+        // A lock applied only to the starting bracket used to be discarded by
+        // the first mutation, because mutation rewrites the bit vector.
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let champion = t.teams.iter().find(|x| x.seed == 11).unwrap().team_index;
+        let dark_horse = t
+            .teams
+            .iter()
+            .find(|x| x.seed == 13 && t.region_rank[x.team_index as usize] != t.region_rank[champion as usize])
+            .unwrap()
+            .team_index;
+
+        let locks = LockSet::new(vec![
+            TeamLock { team_index: champion, wins_required: 6 },
+            TeamLock { team_index: dark_horse, wins_required: 3 },
+        ]);
+
+        let mut bracket = locks.repair(Bracket::new(&t, Some(&scoring)), &t, &scoring);
+        for _ in 0..200 {
+            bracket = locks.repair(
+                TeamRoundMutator::mutate(&bracket, &t, &scoring),
+                &t,
+                &scoring,
+            );
+            assert_legal(&bracket);
+            assert!(locks.is_satisfied(&bracket));
+            assert_eq!(bracket.winner.team_index, champion);
+        }
+    }
+
+    #[test]
+    fn crossover_children_are_legal() {
+        let t = tournament();
+        let scoring = ScoringConfig::default();
+        let mut rng = rand::thread_rng();
+        for _ in 0..100 {
+            let a = Bracket::new(&t, Some(&scoring));
+            let b = Bracket::new(&t, Some(&scoring));
+            assert_legal(&GeneticAlgorithm::crossover(&a, &b, &t, &scoring, &mut rng));
+        }
+    }
 }

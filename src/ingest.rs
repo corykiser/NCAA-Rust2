@@ -1,13 +1,20 @@
-// This file is used to ingest the data from the csv file that contains the 538 ratings and store it in a struct to be used later in other parts of the program
-// Also supports creating tournament info from custom ELO ratings calculated from live API data
+//! Tournament field construction.
+//!
+//! Two sources feed the same structure: the FiveThirtyEight forecast CSV, and a
+//! bracket listing whose ratings come from ELO computed on live game results.
+//! Both funnel through `TournamentInfo::from_teams`, which validates the field
+//! and precomputes everything the optimizers need.
 
-use serde::{Serialize, Deserialize};
-use csv;
-use csv::StringRecord;
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::advancement::AdvancementModel;
 use crate::elo::EloSystem;
 use crate::game_result::BracketTeam;
+use crate::names;
+use crate::tree::{CHILDREN, NUM_GAMES, NUM_TEAMS, R1_MATCHUPS, REGION_ORDER};
+use csv;
+use csv::StringRecord;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Atomically reference-counted Team for efficient sharing without cloning.
 /// Arc is used instead of Rc because it's thread-safe for parallel processing with rayon.
@@ -44,14 +51,11 @@ impl Team {
             team_index,
         }
     }
-    pub fn print(&self) {
-        println!("{:?}", self);
-    }
-
 }
+
 impl PartialEq for Team {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
+        self.team_index == other.team_index
     }
 }
 
@@ -60,21 +64,19 @@ impl PartialEq for Team {
 #[derive(Debug, Clone)]
 pub struct ProbabilityCache {
     /// probs[team_a_idx][team_b_idx] = probability that team_a beats team_b
-    probs: [[f64; 64]; 64],
+    probs: [[f64; NUM_TEAMS]; NUM_TEAMS],
 }
 
 impl ProbabilityCache {
     /// Create cache from team ratings
     pub fn new(teams: &[RcTeam]) -> Self {
-        let mut probs = [[0.5f64; 64]; 64];
+        let mut probs = [[0.5f64; NUM_TEAMS]; NUM_TEAMS];
 
         for (i, team_a) in teams.iter().enumerate() {
             for (j, team_b) in teams.iter().enumerate() {
                 if i != j {
                     let rating_diff = team_a.rating as f64 - team_b.rating as f64;
                     probs[i][j] = 1.0 / (1.0 + 10.0f64.powf(-rating_diff * 30.464 / 400.0));
-                } else {
-                    probs[i][j] = 0.5; // Same team
                 }
             }
         }
@@ -85,276 +87,574 @@ impl ProbabilityCache {
     /// Get win probability for team_a vs team_b (using team indices)
     #[inline(always)]
     pub fn get(&self, team_a_idx: u8, team_b_idx: u8) -> f64 {
-        unsafe {
-            *self.probs.get_unchecked(team_a_idx as usize).get_unchecked(team_b_idx as usize)
-        }
+        self.probs[team_a_idx as usize][team_b_idx as usize]
     }
 }
 
 #[derive(Debug)]
 pub struct TournamentInfo {
     pub teams: Vec<RcTeam>,
-    pub round1: [[i32; 2]; 8],
-    pub round2: [[i32; 4]; 4],
-    pub round3: [[i32; 8]; 2],
-    pub round4: [[i32; 16]; 1],
-    pub regions: Vec<Vec<RcTeam>>,
     /// Fast lookup map: (region, seed) -> RcTeam
-    /// This avoids O(n) filtering in bracket construction
     pub team_lookup: HashMap<(String, i32), RcTeam>,
     /// Pre-computed win probabilities for all team pairs
     pub prob_cache: ProbabilityCache,
+    /// Exact per-game advancement probabilities, derived from `prob_cache`.
+    pub advancement: AdvancementModel,
+    /// Seed of each team, indexed by `team_index`.
+    pub seed_of: [i32; NUM_TEAMS],
+    /// Alphabetical rank of each team's region (East=0, Midwest=1, South=2, West=3).
+    /// The binary encoding breaks cross-region ties by region name, so comparisons
+    /// go through this rather than through string comparison in a hot loop.
+    pub region_rank: [u8; NUM_TEAMS],
+    /// The two teams in each round-1 game, in game order.
+    pub r1_teams: [[u8; 2]; 32],
+    /// The round-1 game each team plays in, indexed by `team_index`.
+    pub r1_game_of_team: [usize; NUM_TEAMS],
 }
 
 impl TournamentInfo {
-    // Inititialize the vector of teams to be hold 64 teams
-    pub fn initialize(file_path: &str) -> TournamentInfo {
-        //structure of tournament: What seed plays the other seeds in each round?
-        let round1: [[i32; 2]; 8] = [
-            [1, 16],
-            [2, 15],
-            [3, 14],
-            [4, 13],
-            [5, 12],
-            [6, 11],
-            [7, 10],
-            [8, 9],
-        ];
-        let round2: [[i32; 4]; 4] = [
-            [1, 16, 8, 9],
-            [5, 12, 4, 13],
-            [6, 11, 3, 14],
-            [7, 10, 2, 15],
-        ];
-        let round3: [[i32; 8]; 2] = [[1, 16, 8, 9, 5, 12, 4, 13], [6, 11, 3, 14, 7, 10, 2, 15]];
-        let round4: [[i32; 16]; 1] = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]];
-
-        let mut teams: Vec<RcTeam> = Vec::with_capacity(64);
-        let mut team_lookup: HashMap<(String, i32), RcTeam> = HashMap::with_capacity(64);
-
-        //TODO check if file exists and download if it doesn't exist OR specify file path as an argument
-        //let file_path = "/Users/corydkiser/Documents/ncaa/fivethirtyeight_ncaa_forecasts.csv";
-        let mut rdr = csv::Reader::from_path(file_path).expect("file access error");
-        let mut mensrecords: Vec<StringRecord> = Vec::new(); //holds the csv records
-
-        // Loop over each record.
-        for result in rdr.records() {
-            let record = &result.unwrap();
-            if record[0].starts_with("mens")
-                && record[1].contains("2023-03-15")
-                //TODO find the latest date with the last exactly 64 teams (there are 64 record[3] entries that equal 1) to sort out the play in games
-                && record[3].contains("1.0")
-            {
-                mensrecords.push(record.clone());
-            }
-        }
-
-        //create containers
-        let mut rating: [f64; 64] = [0.0; 64];
-        let mut teamid: [u32; 64] = [0; 64];
-        let mut seed: [u32; 64] = [0; 64];
-        let mut name: Vec<String> = Vec::new();
-        let mut region: Vec<String> = Vec::new();
-
-        for i in 0..mensrecords.len() {
-            rating[i] = mensrecords[i][14].parse().unwrap(); //populate Team Ratings array
-            teamid[i] = mensrecords[i][12].parse().unwrap(); //populate team id array
-            name.push(mensrecords[i][13].to_string()); //populate team name array
-            region.push(mensrecords[i][15].to_string()); //populate regions array
-            //below removes non ascii digits "a" and "b" from team seeds
-            //let test = "12b3as>";
-            //let test2: String = test.to_string().chars().filter(|x| x.is_ascii_digit()).collect();
-            if mensrecords[i][16].ends_with("a") || mensrecords[i][16].ends_with("b") {
-                //let length = mensrecords[i][16].len();
-                let mut tempstring = mensrecords[i][16].to_string();
-                tempstring.pop();
-                seed[i] = tempstring.parse().unwrap(); //populate team seed array
-            } else {
-                seed[i] = mensrecords[i][16].parse().unwrap();
-            }
-            //add team to the vector as Arc<Team> with team_index
-            let team = Arc::new(Team::with_index(
-                name[i].clone(),
-                seed[i] as i32,
-                region[i].clone(),
-                rating[i] as f32,
-                i as u8,  // team_index
+    /// Build a tournament from a complete 64-team field.
+    ///
+    /// The field is validated here rather than trusted: a duplicated
+    /// `(region, seed)` pair silently overwrote an entry in the lookup map,
+    /// and a duplicated team name made two distinct teams compare equal.
+    pub fn from_teams(mut teams: Vec<RcTeam>) -> Result<TournamentInfo, String> {
+        if teams.len() != NUM_TEAMS {
+            return Err(format!(
+                "expected {} teams in the field, got {}",
+                NUM_TEAMS,
+                teams.len()
             ));
-            team_lookup.insert((region[i].clone(), seed[i] as i32), Arc::clone(&team));
-            teams.push(team);
         }
-        assert!(teams.len() == 64, "There are not 64 teams in the tournament");
 
-        // Create probability cache from teams
+        // `team_index` must agree with position, since it indexes every derived table.
+        for (i, team) in teams.iter_mut().enumerate() {
+            if team.team_index as usize != i {
+                let mut fixed = (**team).clone();
+                fixed.team_index = i as u8;
+                *team = Arc::new(fixed);
+            }
+        }
+
+        validate_field(&teams)?;
+
+        let mut team_lookup = HashMap::with_capacity(NUM_TEAMS);
+        let mut seed_of = [0i32; NUM_TEAMS];
+        let mut region_rank = [0u8; NUM_TEAMS];
+
+        let mut region_names: Vec<&str> = REGION_ORDER.to_vec();
+        region_names.sort_unstable();
+
+        for team in &teams {
+            team_lookup.insert((team.region.clone(), team.seed), Arc::clone(team));
+            seed_of[team.team_index as usize] = team.seed;
+            region_rank[team.team_index as usize] = region_names
+                .iter()
+                .position(|r| *r == team.region)
+                .expect("region validated above") as u8;
+        }
+
+        let mut r1_teams = [[0u8; 2]; 32];
+        let mut r1_game_of_team = [usize::MAX; NUM_TEAMS];
+
+        for (region_position, region) in REGION_ORDER.iter().enumerate() {
+            for (slot, matchup) in R1_MATCHUPS.iter().enumerate() {
+                let game = region_position * 8 + slot;
+                for (side, &seed) in matchup.iter().enumerate() {
+                    let team = team_lookup
+                        .get(&(region.to_string(), seed))
+                        .ok_or_else(|| format!("no team for region {} seed {}", region, seed))?;
+                    r1_teams[game][side] = team.team_index;
+                    r1_game_of_team[team.team_index as usize] = game;
+                }
+            }
+        }
+
         let prob_cache = ProbabilityCache::new(&teams);
+        let advancement = AdvancementModel::new(&r1_teams, &prob_cache);
 
-        // Build region vectors using Arc::clone (cheap atomic reference counting, no data copy)
-        let east: Vec<RcTeam> = teams.iter()
-            .filter(|x| x.region == "East")
-            .map(Arc::clone)
-            .collect();
-
-        let west: Vec<RcTeam> = teams.iter()
-            .filter(|x| x.region == "West")
-            .map(Arc::clone)
-            .collect();
-
-        let south: Vec<RcTeam> = teams.iter()
-            .filter(|x| x.region == "South")
-            .map(Arc::clone)
-            .collect();
-
-        let midwest: Vec<RcTeam> = teams.iter()
-            .filter(|x| x.region == "Midwest")
-            .map(Arc::clone)
-            .collect();
-
-        let regions = vec![east, west, south, midwest];
-
-        TournamentInfo {
+        Ok(TournamentInfo {
             teams,
-            round1,
-            round2,
-            round3,
-            round4,
-            regions,
             team_lookup,
             prob_cache,
-        }
-    }
-    pub fn print(&self) {
-        println!("{:?}", self);
+            advancement,
+            seed_of,
+            region_rank,
+            r1_teams,
+            r1_game_of_team,
+        })
     }
 
     /// Get a team by region and seed using O(1) lookup
     /// Returns an Arc clone (cheap atomic reference count increment)
     #[inline]
     pub fn get_team(&self, region: &str, seed: i32) -> RcTeam {
-        Arc::clone(self.team_lookup.get(&(region.to_string(), seed))
-            .unwrap_or_else(|| panic!("Team not found: region={}, seed={}", region, seed)))
+        Arc::clone(
+            self.team_lookup
+                .get(&(region.to_string(), seed))
+                .unwrap_or_else(|| panic!("Team not found: region={}, seed={}", region, seed)),
+        )
     }
 
-    /// Create TournamentInfo from ELO ratings and bracket team information
-    /// This allows using custom-calculated ELO ratings from live API data
-    /// instead of the FiveThirtyEight CSV file
-    pub fn from_elo_ratings(elo_system: &EloSystem, bracket_teams: Vec<BracketTeam>) -> TournamentInfo {
-        // Tournament structure (same as initialize)
-        let round1: [[i32; 2]; 8] = [
-            [1, 16], [2, 15], [3, 14], [4, 13],
-            [5, 12], [6, 11], [7, 10], [8, 9],
-        ];
-        let round2: [[i32; 4]; 4] = [
-            [1, 16, 8, 9], [5, 12, 4, 13],
-            [6, 11, 3, 14], [7, 10, 2, 15],
-        ];
-        let round3: [[i32; 8]; 2] = [
-            [1, 16, 8, 9, 5, 12, 4, 13],
-            [6, 11, 3, 14, 7, 10, 2, 15],
-        ];
-        let round4: [[i32; 16]; 1] = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]];
+    /// Resolve a team name to its index, refusing to guess between candidates.
+    pub fn find_team(&self, name: &str) -> Result<RcTeam, names::NameError> {
+        let candidates: Vec<String> = self.teams.iter().map(|t| t.name.clone()).collect();
+        names::resolve(name, &candidates).map(|i| Arc::clone(&self.teams[i]))
+    }
 
-        let mut teams: Vec<RcTeam> = Vec::with_capacity(64);
-        let mut team_lookup: HashMap<(String, i32), RcTeam> = HashMap::with_capacity(64);
-
-        // Convert bracket teams to Team structs with ELO ratings
-        for (idx, bracket_team) in bracket_teams.iter().enumerate() {
-            // Look up the team's ELO rating
-            let rating = if let Some(elo_rating) = elo_system.find_team_by_name(&bracket_team.team_name) {
-                elo_system.to_538_scale(&elo_rating.team_id)
+    /// Which of two teams advances when a game's bit is `true`.
+    ///
+    /// Within a region that is the numerically lower seed; across regions (the
+    /// Final Four and the final) it is the alphabetically earlier region. This
+    /// is the single definition of the encoding — everything that reads or
+    /// writes a bracket bit goes through here or through `winner_bit`.
+    #[inline]
+    pub fn bit_true_winner(&self, a: u8, b: u8) -> u8 {
+        let (ra, rb) = (self.region_rank[a as usize], self.region_rank[b as usize]);
+        if ra == rb {
+            if self.seed_of[a as usize] < self.seed_of[b as usize] {
+                a
             } else {
-                // If team not found in ELO system, use a default rating
-                // This might happen for play-in game teams with limited data
-                println!("Warning: No ELO rating found for '{}', using default", bracket_team.team_name);
-                75.0 // Middle-of-the-road default
+                b
+            }
+        } else if ra < rb {
+            a
+        } else {
+            b
+        }
+    }
+
+    /// The bit value that makes `winner` beat `loser`.
+    #[inline]
+    pub fn winner_bit(&self, winner: u8, loser: u8) -> bool {
+        self.bit_true_winner(winner, loser) == winner
+    }
+
+    /// Decode a 63-bit bracket into the winning team index of each game.
+    ///
+    /// Cheaper than building a full `Bracket` when only the winners are needed —
+    /// no `Game` structs and no reference counting.
+    pub fn decode_winners(&self, binary: &[bool]) -> [u8; NUM_GAMES] {
+        debug_assert_eq!(binary.len(), NUM_GAMES);
+        let mut winners = [0u8; NUM_GAMES];
+
+        for game in 0..NUM_GAMES {
+            let (a, b) = self.participants(game, &winners);
+            let bit_true = self.bit_true_winner(a, b);
+            winners[game] = if binary[game] {
+                bit_true
+            } else if bit_true == a {
+                b
+            } else {
+                a
+            };
+        }
+
+        winners
+    }
+
+    /// The two teams playing in `game`, given the winners of everything below it.
+    #[inline]
+    pub fn participants(&self, game: usize, winners: &[u8; NUM_GAMES]) -> (u8, u8) {
+        if game < 32 {
+            (self.r1_teams[game][0], self.r1_teams[game][1])
+        } else {
+            let [c0, c1] = CHILDREN[game];
+            (winners[c0], winners[c1])
+        }
+    }
+
+    /// Encode a full set of game winners back into the 63-bit representation.
+    pub fn binary_from_winners(&self, winners: &[u8; NUM_GAMES]) -> Vec<bool> {
+        (0..NUM_GAMES)
+            .map(|game| {
+                let (a, b) = self.participants(game, winners);
+                let winner = winners[game];
+                debug_assert!(
+                    winner == a || winner == b,
+                    "game {} winner {} is not a participant ({}, {})",
+                    game,
+                    winner,
+                    a,
+                    b
+                );
+                let loser = if winner == a { b } else { a };
+                self.winner_bit(winner, loser)
+            })
+            .collect()
+    }
+
+    /// Load the tournament field from the FiveThirtyEight forecast CSV.
+    pub fn initialize(file_path: &str) -> Result<TournamentInfo, String> {
+        let mut rdr =
+            csv::Reader::from_path(file_path).map_err(|e| format!("{}: {}", file_path, e))?;
+
+        let mut records: Vec<StringRecord> = Vec::new();
+        for result in rdr.records() {
+            let record = result.map_err(|e| format!("{}: {}", file_path, e))?;
+            if record[0].starts_with("mens")
+                && record[1].contains("2023-03-15")
+                && record[3].contains("1.0")
+            {
+                records.push(record);
+            }
+        }
+
+        let mut teams: Vec<RcTeam> = Vec::with_capacity(NUM_TEAMS);
+        for (i, record) in records.iter().enumerate() {
+            let rating: f64 = record[14]
+                .parse()
+                .map_err(|_| format!("row {}: bad rating '{}'", i, &record[14]))?;
+            let name = record[13].to_string();
+            let region = record[15].to_string();
+
+            // Play-in seeds are written "11a"/"11b"; both halves are the same seed.
+            let seed_text = record[16].trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            let seed: i32 = seed_text
+                .parse()
+                .map_err(|_| format!("row {}: bad seed '{}'", i, &record[16]))?;
+
+            teams.push(Arc::new(Team::with_index(
+                name,
+                seed,
+                region,
+                rating as f32,
+                i as u8,
+            )));
+        }
+
+        TournamentInfo::from_teams(teams)
+    }
+
+    /// Build the tournament from a bracket listing, rating each team with ELO
+    /// computed from game results.
+    ///
+    /// Every name must resolve to exactly one rated team. A team that cannot be
+    /// resolved is an error rather than a default rating: a silent 75.0 turns a
+    /// contender into a coin flip and nothing downstream can tell.
+    pub fn from_elo_ratings(
+        elo_system: &EloSystem,
+        bracket_teams: Vec<BracketTeam>,
+    ) -> Result<TournamentInfo, String> {
+        let mut teams: Vec<RcTeam> = Vec::with_capacity(bracket_teams.len());
+        let mut unresolved: Vec<String> = Vec::new();
+
+        for (idx, bracket_team) in bracket_teams.iter().enumerate() {
+            let rating = match elo_system.find_team_by_name(&bracket_team.team_name) {
+                Ok(elo_rating) => elo_system.to_538_scale(&elo_rating.team_id),
+                Err(e) => {
+                    unresolved.push(format!("  {}: {}", bracket_team.team_name, e));
+                    0.0
+                }
             };
 
-            let team = Arc::new(Team::with_index(
+            teams.push(Arc::new(Team::with_index(
                 bracket_team.team_name.clone(),
                 bracket_team.seed,
                 bracket_team.region.clone(),
                 rating,
-                idx as u8,  // team_index
+                idx as u8,
+            )));
+        }
+
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "{} bracket team(s) could not be matched to a rating:\n{}",
+                unresolved.len(),
+                unresolved.join("\n")
             ));
-            team_lookup.insert((bracket_team.region.clone(), bracket_team.seed), Arc::clone(&team));
-            teams.push(team);
         }
 
-        assert!(teams.len() == 64, "There must be exactly 64 teams in the tournament");
-
-        // Create probability cache from teams
-        let prob_cache = ProbabilityCache::new(&teams);
-
-        // Organize teams by region using Arc::clone (cheap atomic reference counting)
-        let east: Vec<RcTeam> = teams.iter().filter(|x| x.region == "East").map(Arc::clone).collect();
-        let west: Vec<RcTeam> = teams.iter().filter(|x| x.region == "West").map(Arc::clone).collect();
-        let south: Vec<RcTeam> = teams.iter().filter(|x| x.region == "South").map(Arc::clone).collect();
-        let midwest: Vec<RcTeam> = teams.iter().filter(|x| x.region == "Midwest").map(Arc::clone).collect();
-
-        let regions = vec![east, west, south, midwest];
-
-        TournamentInfo {
-            teams,
-            round1,
-            round2,
-            round3,
-            round4,
-            regions,
-            team_lookup,
-            prob_cache,
-        }
+        TournamentInfo::from_teams(teams)
     }
 
-    /// Create a sample bracket team list for testing
-    /// In production, this would come from the NCAA bracket announcement
+    /// A sample field, used when no bracket source is available.
+    /// Mirrors the 2024 tournament.
     pub fn sample_bracket_teams() -> Vec<BracketTeam> {
-        // This is a sample based on 2024 tournament structure
-        // Would need to be updated each year when brackets are announced
-        let regions = ["East", "West", "South", "Midwest"];
-        let mut teams = Vec::new();
-
-        // Sample teams - in reality, these would come from the official bracket
         let sample_teams_by_region = [
-            // East (sample teams)
-            vec![
-                ("Connecticut", 1), ("Iowa State", 2), ("Illinois", 3), ("Auburn", 4),
-                ("San Diego State", 5), ("BYU", 6), ("Texas", 7), ("Florida Atlantic", 8),
-                ("Northwestern", 9), ("Drake", 10), ("Duquesne", 11), ("UAB", 12),
-                ("Yale", 13), ("Morehead State", 14), ("Long Beach State", 15), ("Stetson", 16),
-            ],
-            // West
-            vec![
-                ("North Carolina", 1), ("Arizona", 2), ("Baylor", 3), ("Alabama", 4),
-                ("Saint Mary's", 5), ("Clemson", 6), ("Dayton", 7), ("Mississippi State", 8),
-                ("Michigan State", 9), ("Nevada", 10), ("New Mexico", 11), ("Grand Canyon", 12),
-                ("Charleston", 13), ("Colgate", 14), ("Long Island", 15), ("Wagner", 16),
-            ],
-            // South
-            vec![
-                ("Houston", 1), ("Marquette", 2), ("Kentucky", 3), ("Duke", 4),
-                ("Wisconsin", 5), ("Texas Tech", 6), ("Florida", 7), ("Nebraska", 8),
-                ("Texas A&M", 9), ("Colorado", 10), ("NC State", 11), ("James Madison", 12),
-                ("Vermont", 13), ("Oakland", 14), ("Western Kentucky", 15), ("Longwood", 16),
-            ],
-            // Midwest
-            vec![
-                ("Purdue", 1), ("Tennessee", 2), ("Creighton", 3), ("Kansas", 4),
-                ("Gonzaga", 5), ("South Carolina", 6), ("Texas", 7), ("Utah State", 8),
-                ("TCU", 9), ("Colorado State", 10), ("Oregon", 11), ("McNeese", 12),
-                ("Samford", 13), ("Akron", 14), ("Grambling State", 15), ("Montana State", 16),
-            ],
+            (
+                "East",
+                [
+                    ("Connecticut", 1),
+                    ("Iowa State", 2),
+                    ("Illinois", 3),
+                    ("Auburn", 4),
+                    ("San Diego State", 5),
+                    ("BYU", 6),
+                    ("Washington State", 7),
+                    ("Florida Atlantic", 8),
+                    ("Northwestern", 9),
+                    ("Drake", 10),
+                    ("Duquesne", 11),
+                    ("UAB", 12),
+                    ("Yale", 13),
+                    ("Morehead State", 14),
+                    ("Long Beach State", 15),
+                    ("Stetson", 16),
+                ],
+            ),
+            (
+                "West",
+                [
+                    ("North Carolina", 1),
+                    ("Arizona", 2),
+                    ("Baylor", 3),
+                    ("Alabama", 4),
+                    ("Saint Mary's", 5),
+                    ("Clemson", 6),
+                    ("Dayton", 7),
+                    ("Mississippi State", 8),
+                    ("Michigan State", 9),
+                    ("Nevada", 10),
+                    ("New Mexico", 11),
+                    ("Grand Canyon", 12),
+                    ("Charleston", 13),
+                    ("Colgate", 14),
+                    ("Long Island", 15),
+                    ("Wagner", 16),
+                ],
+            ),
+            (
+                "South",
+                [
+                    ("Houston", 1),
+                    ("Marquette", 2),
+                    ("Kentucky", 3),
+                    ("Duke", 4),
+                    ("Wisconsin", 5),
+                    ("Texas Tech", 6),
+                    ("Florida", 7),
+                    ("Nebraska", 8),
+                    ("Texas A&M", 9),
+                    ("Colorado", 10),
+                    ("NC State", 11),
+                    ("James Madison", 12),
+                    ("Vermont", 13),
+                    ("Oakland", 14),
+                    ("Western Kentucky", 15),
+                    ("Longwood", 16),
+                ],
+            ),
+            (
+                "Midwest",
+                [
+                    ("Purdue", 1),
+                    ("Tennessee", 2),
+                    ("Creighton", 3),
+                    ("Kansas", 4),
+                    ("Gonzaga", 5),
+                    ("South Carolina", 6),
+                    ("Texas", 7),
+                    ("Utah State", 8),
+                    ("TCU", 9),
+                    ("Colorado State", 10),
+                    ("Oregon", 11),
+                    ("McNeese", 12),
+                    ("Samford", 13),
+                    ("Akron", 14),
+                    ("Grambling State", 15),
+                    ("Montana State", 16),
+                ],
+            ),
         ];
 
-        for (region_idx, region_teams) in sample_teams_by_region.iter().enumerate() {
+        let mut teams = Vec::with_capacity(NUM_TEAMS);
+        for (region, region_teams) in &sample_teams_by_region {
             for (name, seed) in region_teams {
                 teams.push(BracketTeam::new(
                     name.to_lowercase().replace(' ', "-"),
                     name.to_string(),
                     *seed,
-                    regions[region_idx].to_string(),
+                    region.to_string(),
                 ));
             }
         }
-
         teams
+    }
+}
+
+/// Reject a field that would silently misbehave downstream.
+fn validate_field(teams: &[RcTeam]) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+
+    let mut seen_slots: HashMap<(&str, i32), &str> = HashMap::new();
+    let mut seen_names: HashMap<String, &str> = HashMap::new();
+    let mut region_counts: HashMap<&str, usize> = HashMap::new();
+
+    for team in teams {
+        if !REGION_ORDER.contains(&team.region.as_str()) {
+            problems.push(format!(
+                "{}: unknown region '{}' (expected one of {:?})",
+                team.name, team.region, REGION_ORDER
+            ));
+            continue;
+        }
+        *region_counts.entry(team.region.as_str()).or_insert(0) += 1;
+
+        if !(1..=16).contains(&team.seed) {
+            problems.push(format!("{}: seed {} is outside 1-16", team.name, team.seed));
+        }
+
+        if let Some(other) = seen_slots.insert((team.region.as_str(), team.seed), &team.name) {
+            problems.push(format!(
+                "{} and {} are both the {} seed in the {}",
+                other, team.name, team.seed, team.region
+            ));
+        }
+
+        let normalized = names::normalize(&team.name);
+        if let Some(other) = seen_names.insert(normalized, &team.name) {
+            problems.push(format!(
+                "duplicate team name: '{}' and '{}'",
+                other, team.name
+            ));
+        }
+
+        if !team.rating.is_finite() {
+            problems.push(format!("{}: rating is not a finite number", team.name));
+        }
+    }
+
+    for region in REGION_ORDER {
+        let count = region_counts.get(region).copied().unwrap_or(0);
+        if count != 16 {
+            problems.push(format!("{} region has {} teams, expected 16", region, count));
+        }
+    }
+
+    let indices: HashSet<u8> = teams.iter().map(|t| t.team_index).collect();
+    if indices.len() != teams.len() {
+        problems.push("team indices are not unique".to_string());
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid tournament field:\n  {}",
+            problems.join("\n  ")
+        ))
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    fn field() -> Vec<RcTeam> {
+        let mut teams = Vec::new();
+        for (r, region) in REGION_ORDER.iter().enumerate() {
+            for seed in 1..=16 {
+                let idx = (r * 16 + seed as usize - 1) as u8;
+                teams.push(Arc::new(Team::with_index(
+                    format!("{} {}", region, seed),
+                    seed,
+                    region.to_string(),
+                    // Strictly decreasing in seed so the favourite is unambiguous.
+                    100.0 - seed as f32,
+                    idx,
+                )));
+            }
+        }
+        teams
+    }
+
+    pub fn tournament() -> TournamentInfo {
+        TournamentInfo::from_teams(field()).expect("valid field")
+    }
+
+    #[test]
+    fn duplicate_seeds_in_a_region_are_rejected() {
+        let mut teams = field();
+        let clash = Team::with_index("East 1 again".into(), 1, "East".into(), 90.0, 5);
+        teams[5] = Arc::new(clash);
+        let err = TournamentInfo::from_teams(teams).unwrap_err();
+        assert!(err.contains("1 seed in the East"), "{}", err);
+    }
+
+    #[test]
+    fn duplicate_names_are_rejected() {
+        let mut teams = field();
+        let dup = Team::with_index("East 1".into(), 7, "West".into(), 90.0, 22);
+        teams[22] = Arc::new(dup);
+        let err = TournamentInfo::from_teams(teams).unwrap_err();
+        assert!(err.contains("duplicate team name"), "{}", err);
+    }
+
+    #[test]
+    fn the_shipped_sample_field_is_valid() {
+        // It previously listed "Texas" in two different regions.
+        let sample = TournamentInfo::sample_bracket_teams();
+        let teams: Vec<RcTeam> = sample
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                Arc::new(Team::with_index(
+                    t.team_name.clone(),
+                    t.seed,
+                    t.region.clone(),
+                    80.0 - t.seed as f32,
+                    i as u8,
+                ))
+            })
+            .collect();
+        TournamentInfo::from_teams(teams).expect("sample field should be valid");
+    }
+
+    #[test]
+    fn every_team_appears_in_exactly_one_round1_game() {
+        let t = tournament();
+        let mut seen = [0usize; NUM_TEAMS];
+        for game in &t.r1_teams {
+            for &team in game {
+                seen[team as usize] += 1;
+            }
+        }
+        assert!(seen.iter().all(|&c| c == 1));
+        assert!(t.r1_game_of_team.iter().all(|&g| g < 32));
+    }
+
+    #[test]
+    fn round1_games_pair_seeds_that_sum_to_seventeen() {
+        let t = tournament();
+        for game in &t.r1_teams {
+            let (a, b) = (game[0], game[1]);
+            assert_eq!(t.seed_of[a as usize] + t.seed_of[b as usize], 17);
+            assert_eq!(t.region_rank[a as usize], t.region_rank[b as usize]);
+        }
+    }
+
+    #[test]
+    fn decoding_and_encoding_a_bracket_round_trips() {
+        let t = tournament();
+        let mut rng_state = 0x243f6a8885a308d3u64;
+        for _ in 0..200 {
+            let binary: Vec<bool> = (0..NUM_GAMES)
+                .map(|_| {
+                    rng_state = rng_state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    rng_state >> 63 == 1
+                })
+                .collect();
+            let winners = t.decode_winners(&binary);
+            assert_eq!(t.binary_from_winners(&winners), binary);
+        }
+    }
+
+    #[test]
+    fn decoded_winners_are_always_participants() {
+        let t = tournament();
+        let binary = vec![true; NUM_GAMES];
+        let winners = t.decode_winners(&binary);
+        for game in 0..NUM_GAMES {
+            let (a, b) = t.participants(game, &winners);
+            assert!(winners[game] == a || winners[game] == b);
+        }
+        // All-true means the favourite by seed wins every intra-region game, so
+        // the four 1-seeds reach the Elite 8.
+        for region in 0..4 {
+            assert_eq!(t.seed_of[winners[56 + region] as usize], 1);
+        }
     }
 }
