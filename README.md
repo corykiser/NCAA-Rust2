@@ -65,19 +65,95 @@ form.
 
 ### Portfolio Modes (`--portfolio-strategy`)
 
-1. **Whole Portfolio GA** (`--portfolio-strategy ga-whole`)
+1. **Exact basis + coordinate ascent** (`--portfolio-strategy exact-basis`, default)
+   - Maximizes either expected best-ball score or, with `--objective
+     first-place`, `P(one of my entries finishes first)` against the rest of
+     the pool — see [Objectives](#objectives)
+   - Builds every bracket that is exactly optimal subject to one extra
+     advancement requirement — 384 constrained solves, a few milliseconds — and
+     greedily selects the entries that add most to best-ball
+   - Then sweeps entries one at a time, replacing each with the best alternative
+     the neighbourhood offers, until nothing improves
+   - Deterministic, and the strongest of these by held-out best-ball score
+   - Also reports a held-out score on an independently drawn scenario pool, so
+     you can see how much of the gain is real rather than fitted to the sample
+
+2. **Whole Portfolio GA** (`--portfolio-strategy ga-whole`)
    - Evolves entire portfolios as individuals
    - Each portfolio contains N brackets
    - Fitness = best-ball score against Monte Carlo scenarios
 
-2. **Sequential Portfolio** (`--portfolio-strategy ga-sequential`)
+3. **Sequential Portfolio** (`--portfolio-strategy ga-sequential`)
    - Optimizes brackets one at a time
    - Each new bracket is optimized for marginal contribution to the frozen portfolio
    - Often finds better solutions than whole portfolio evolution
 
-3. **Simulated Annealing** (`--portfolio-strategy annealing`)
+4. **Simulated Annealing** (`--portfolio-strategy annealing`)
    - Classic SA optimization on portfolio
    - Uses Team-Round mutations
+
+### Objectives
+
+Maximizing expected *score* is only correct if your payout is linear in points.
+Most pools pay the top finisher, and then what you want is
+`P(one of my entries finishes first)` — which depends on what everyone else
+entered, not just on the tournament.
+
+That distinction is not cosmetic. The expected-score-optimal bracket is
+favourite-heavy, and so is the public consensus bracket, so maximizing expected
+score steers you toward the bracket most likely to be duplicated by a large
+slice of the field. In 2023, 18.9% of ESPN's 18.9 million entries picked Alabama
+to win it all: being right about Alabama meant splitting first place with three
+and a half million people.
+
+`--objective first-place` optimizes the thing you actually care about. It needs
+a model of the competition, which comes from published pick rates:
+
+```bash
+# Fetch ESPN's pick rates and optimize for winning a 200-person pool
+cargo run --release -- --portfolio 3 --objective first-place \
+    --fetch-picks 2024 --pool-entries 200
+```
+
+Against the real 2023 ESPN field, scoring each portfolio by how often it
+actually finishes first (`cargo run --release --bin bench -- contrarian`):
+
+| Pool size | Entries | EV-optimal | Best-ball | First-place | vs EV |
+|---:|---:|---:|---:|---:|---:|
+| 20 | 1 | 15.900% | 15.743% | **16.912%** | 1.06x |
+| 100 | 1 | 4.518% | 4.392% | **5.162%** | 1.14x |
+| 100 | 3 | 4.560% | 10.920% | **12.794%** | 2.81x |
+| 1,000 | 3 | 0.851% | 1.565% | **2.495%** | 2.93x |
+| 10,000 | 3 | 0.125% | 0.212% | **0.534%** | 4.28x |
+
+Two things to read off it. **Pool size decides how contrarian to be**: in a
+20-person pool the expected-score bracket is nearly optimal, and by 10,000
+entrants optimizing for first place wins over four times as often. And the
+**expected score you give up is trivial** — the winning entries above sacrifice
+2 to 12 points of expected score out of ~233 to multiply their win rate.
+
+At one entry in a 100-person pool the objective already changes the champion,
+from Houston (the expected-score optimum, and a popular pick) to Gonzaga.
+
+**Where the opponent model comes from.** ESPN's Tournament Challenge publishes,
+for every round and all 64 teams, the share of entries picking that team to
+survive — `--fetch-picks <year>` pulls it and caches it under `./data/`. Those
+are marginals, not whole brackets, so `field.rs` reconstructs a joint
+distribution: walking the bracket, an entry advances a team with probability
+proportional to its *conditional* advance rate, which reproduces the published
+marginals while producing legal brackets. Supply your own numbers with
+`--pick-popularity <file.json>` (same schema as the cache), or, with no data at
+all, fall back to `--chalk-tilt` — a model of a public that picks chalkier than
+the ratings justify. The fallback is a shape, not data; fetch the real numbers
+if you can, because how concentrated the public is on the favourite is the
+single biggest input to this objective.
+
+**Limits.** The competition is simulated directly — `--pool-entries` opposing
+brackets, drawn `--field-replicates` times so the answer does not depend on one
+arbitrary guess at who you are playing. That is exact for realistic pools and
+gets slow for pools of more than a few tens of thousands. Optimizing for first
+place also leans much harder on the rating model being right than maximizing
+expected score does.
 
 ## Installation
 
@@ -92,7 +168,7 @@ cargo build --release
 ### Basic Usage (ESPN API)
 
 ```bash
-# Generate a 5-bracket portfolio using whole portfolio GA
+# Generate a 5-bracket portfolio (exact basis + coordinate ascent, the default)
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-whole --generations 200 --pool-size 10000
 
 # Generate using sequential optimization
@@ -191,6 +267,10 @@ src/
 ├── advancement.rs   # Exact per-game advancement probabilities
 ├── exact.rs         # Exact optimal bracket (dynamic program) and EV scoring
 ├── bracket.rs       # Bracket representation and scoring
+├── picks.rs         # Compact bracket the optimizers work on: 63 winners + 63 bits
+├── score.rs         # Scenario pool and the branchless SIMD scoring kernels
+├── optimize.rs      # Portfolio construction: exact basis, greedy, coordinate ascent
+├── field.rs         # The rest of the pool: public pick rates and opponent sampling
 ├── ga.rs            # Genetic algorithm (MonteCarloScenarios, TeamRoundMutator, LockSet)
 ├── ingest.rs        # Data loading, field validation, team ratings
 ├── names.rs         # Deterministic team-name resolution
@@ -215,9 +295,59 @@ leaves the config file's value in place; a flag you do pass wins.
 
 Single bracket, exact mode: ~3 ms including CSV parsing, and deterministic.
 
-Portfolio and heuristic modes are parallelized with Rayon (scenario generation,
-fitness evaluation, bracket scoring). On four cores, 10k scenarios and 200
-generations takes roughly 10-15 seconds.
+Portfolio mode is where the work goes, and it is dominated by one kernel:
+scoring a candidate bracket against a pool of sampled tournaments. Three changes
+account for most of the speedup over the original implementation.
+
+**The scoring loop is branchless.** Written the obvious way — `if the winners
+match { score += points }` — it compiles to a branch per game, and whether a
+pick matches a sampled tournament is close to a coin flip, so one scenario costs
+sixty branch mispredictions. `score.rs` compares sixteen games at a time with
+SSE2 and masks the payouts instead.
+
+**The scenario pool is bytes.** A scenario is 64 bytes of winner indices, not a
+`Bracket` with three reference-counted team handles per game. A 10,000-scenario
+pool went from ~75 MB and two million atomic refcount operations to 640 KB.
+
+**Frozen work is not recomputed.** When a portfolio is fixed except for one
+entry, the rest of it has a constant per-scenario best; evaluating a replacement
+costs one bracket's scoring rather than the whole portfolio's.
+
+Measured on four cores against the shipped 2023 field (`cargo run --release
+--bin bench`):
+
+| Benchmark | Before | After | |
+|---|---:|---:|---:|
+| Build a 10,000-scenario pool | 71.2 ms | 2.1 ms | 33x |
+| Score one bracket vs 10k scenarios | 854 µs | 77 µs | 11x |
+| Best-ball, 5 brackets vs 10k | 3.70 ms | 0.72 ms | 5.1x |
+| Marginal contribution vs 10k | 4.32 ms | 0.13 ms | 34x |
+| Force a team to a round | 354 ns | 23 ns | 15x |
+| GA, single bracket, 100 pop x 20 gen | 1.63 s | 55 ms | 30x |
+| GA, 5-bracket portfolio, 50 pop x 10 gen | 1.97 s | 86 ms | 23x |
+
+Those are the same operations doing the same thing — `cargo test` checks the new
+kernel against the original scorer pick for pick.
+
+### Does it find better portfolios?
+
+Speed only matters if the answers improve. Optimizing against a finite sample of
+tournaments will always flatter itself, so the comparison below scores each
+result on a *held-out* pool of 200,000 scenarios it was never optimized
+against. Training pool 50,000 scenarios; GAs at 100 population by 200
+generations.
+
+| Entries | `exact-basis` | `ga-whole` | `ga-sequential` |
+|---:|---:|---:|---:|
+| 1 | **233.31** (0.1 s) | 231.94 (3.4 s) | 232.27 (2.4 s) |
+| 3 | **276.70** (2.8 s) | 276.56 (8.7 s) | 274.52 (7.4 s) |
+| 5 | **296.56** (5.0 s) | 295.34 (13.9 s) | 292.76 (12.4 s) |
+| 10 | **323.23** (10.2 s) | 319.93 (26.7 s) | 321.26 (24.8 s) |
+
+Reproduce with `cargo run --release --bin bench -- quality`.
+
+The single-entry row is the tell: `exact-basis` returns the provably optimal
+bracket there, and the GAs do not reach it even with 200 generations.
 
 ## Tests
 

@@ -1,71 +1,82 @@
 // Genetic Algorithm module for NCAA Bracket Optimization
 // Implements proper population-based GA with smart mutation and best-ball scoring
 
-use crate::bracket::{Bracket, FastBracket, ScoreTable, ScoringConfig};
+use crate::bracket::{Bracket, ScoreTable, ScoringConfig};
 use crate::config::{Config, GaSettings};
 use crate::exact::TeamLock;
 use crate::ingest::{RcTeam, TournamentInfo};
-use crate::tree::{NO_GAME, NUM_ROUNDS, PARENT};
-use rand::Rng;
+use crate::picks::Picks;
+use crate::score::{ScenarioPool, ScoredPicks};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
-use std::sync::Arc;
 
-/// Pre-generated pool of random brackets for scoring
-/// These represent possible tournament outcomes
-/// Uses FastBracket internally for high-performance scoring in the hot path
-#[derive(Clone)]
+/// Fixed sample of tournament outcomes used to score candidates.
+///
+/// A thin, `Bracket`-shaped facade over [`ScenarioPool`], which holds the
+/// scenarios as raw winner bytes. The pool used to keep 10,000 full `Bracket`
+/// objects *and* a parallel array of `FastBracket` copies — around 75 MB and
+/// two million atomic refcount operations to build something the scorer only
+/// ever reads 63 bytes of.
+///
+/// New code should reach for [`MonteCarloScenarios::pool`] and work in
+/// [`Picks`]; the `&Bracket` methods here exist for the callers that still hold
+/// full brackets.
 pub struct MonteCarloScenarios {
-    /// Full bracket objects (kept for debugging/inspection)
-    pub brackets: Vec<Bracket>,
-    /// FastBracket versions for high-performance scoring (u8 winner indices)
-    pub fast_brackets: Vec<FastBracket>,
+    pub pool: ScenarioPool,
     pub size: usize,
-    /// Pre-computed score lookup table for fast scoring
+    /// Pre-computed score lookup table for fast scoring.
     pub score_table: ScoreTable,
 }
 
+/// Default scenario-pool seed. Fixed so that two runs of the program with the
+/// same settings score candidates against the same tournaments and can be
+/// compared directly; pass an explicit seed to vary it.
+pub const DEFAULT_POOL_SEED: u64 = 0x4E_43_41_41_32_30_32_35;
+
 impl MonteCarloScenarios {
-    /// Generate a new simulation pool with random brackets
+    /// Generate a new simulation pool with random brackets.
     pub fn new(tournament: &TournamentInfo, size: usize, scoring_config: &ScoringConfig) -> Self {
-        println!("Generating simulation pool of {} brackets...", size);
+        Self::with_seed(tournament, size, scoring_config, DEFAULT_POOL_SEED)
+    }
 
-        let brackets: Vec<Bracket> = (0..size)
-            .into_par_iter()
-            .map(|_| Bracket::new(tournament, Some(scoring_config)))
-            .collect();
+    pub fn with_seed(
+        tournament: &TournamentInfo,
+        size: usize,
+        scoring_config: &ScoringConfig,
+        seed: u64,
+    ) -> Self {
+        MonteCarloScenarios {
+            pool: ScenarioPool::new(tournament, size, scoring_config, seed),
+            size,
+            score_table: ScoreTable::new(scoring_config),
+        }
+    }
 
-        // Convert to FastBrackets for high-performance scoring
-        let fast_brackets: Vec<FastBracket> = brackets
-            .par_iter()
-            .map(|b| FastBracket::from_bracket(b))
-            .collect();
-
-        // Pre-compute score lookup table
-        let score_table = ScoreTable::new(scoring_config);
-
+    /// Silent constructor plus a one-line note, so the progress chatter lives
+    /// with the caller that wanted it rather than inside the data structure.
+    pub fn announced(
+        tournament: &TournamentInfo,
+        size: usize,
+        scoring_config: &ScoringConfig,
+    ) -> Self {
+        println!("Generating simulation pool of {} scenarios...", size);
+        let pool = Self::new(tournament, size, scoring_config);
         println!("Simulation pool generated.");
-
-        MonteCarloScenarios { brackets, fast_brackets, size, score_table }
+        pool
     }
 
-    /// Score a single bracket against all simulations using FastBracket
-    /// Returns the average score
+    fn prepare(&self, bracket: &Bracket) -> ScoredPicks {
+        ScoredPicks::from_winners(&bracket.winner_indices(), self.pool.points())
+    }
+
+    /// Mean score of a single bracket across the pool.
     pub fn score_bracket(&self, bracket: &Bracket, _scoring_config: &ScoringConfig) -> f64 {
-        let table = &self.score_table;
-        // Convert input bracket to FastBracket once
-        let fast_bracket = FastBracket::from_bracket(bracket);
-
-        let total: f64 = self.fast_brackets
-            .par_iter()
-            .map(|sim| fast_bracket.score_against(sim, table))
-            .sum();
-
-        total / self.size as f64
+        self.pool.par_mean_score(&self.prepare(bracket))
     }
 
-    /// Score a portfolio using best-ball metric with FastBracket
-    /// For each simulation, take the max score among all portfolio brackets
-    /// Return the average of these max scores
+    /// Best-ball score of a portfolio: the mean over scenarios of the best
+    /// entry's score in that scenario.
     pub fn score_portfolio_best_ball(
         &self,
         portfolio: &[Bracket],
@@ -74,68 +85,10 @@ impl MonteCarloScenarios {
         if portfolio.is_empty() {
             return 0.0;
         }
-
-        let table = &self.score_table;
-
-        // Convert portfolio to FastBrackets once
-        let fast_portfolio: Vec<FastBracket> = portfolio
-            .iter()
-            .map(|b| FastBracket::from_bracket(b))
-            .collect();
-
-        let total: f64 = self.fast_brackets
-            .par_iter()
-            .map(|sim| {
-                fast_portfolio
-                    .iter()
-                    .map(|b| b.score_against(sim, table))
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap_or(0.0)
-            })
-            .sum();
-
-        total / self.size as f64
+        let prepared: Vec<ScoredPicks> = portfolio.iter().map(|b| self.prepare(b)).collect();
+        self.pool.par_best_ball_mean(&prepared)
     }
 
-    /// Score a bracket's marginal contribution to an existing portfolio using FastBracket
-    /// This is the increase in best-ball score when adding this bracket
-    pub fn combined_best_ball(
-        &self,
-        bracket: &Bracket,
-        existing_portfolio: &[Bracket],
-        _scoring_config: &ScoringConfig,
-    ) -> f64 {
-        if existing_portfolio.is_empty() {
-            return self.score_bracket(bracket, &ScoringConfig::default());
-        }
-
-        let table = &self.score_table;
-
-        // Convert to FastBrackets once
-        let fast_bracket = FastBracket::from_bracket(bracket);
-        let fast_portfolio: Vec<FastBracket> = existing_portfolio
-            .iter()
-            .map(|b| FastBracket::from_bracket(b))
-            .collect();
-
-        let total: f64 = self.fast_brackets
-            .par_iter()
-            .map(|sim| {
-                let existing_max = fast_portfolio
-                    .iter()
-                    .map(|b| b.score_against(sim, table))
-                    .max_by(|a, b| a.partial_cmp(b).unwrap())
-                    .unwrap_or(0.0);
-
-                let new_score = fast_bracket.score_against(sim, table);
-
-                // Marginal contribution is how much better we do with this bracket
-                new_score.max(existing_max)
-            })
-            .sum();
-
-        total / self.size as f64
-    }
 }
 
 /// Directed mutation: pick a team, pick a round, and make that team reach it.
@@ -151,18 +104,13 @@ impl MonteCarloScenarios {
 pub struct TeamRoundMutator;
 
 impl TeamRoundMutator {
-    /// Pick a random team and force it to win a random number of games.
-    /// Earlier rounds are weighted more heavily because they move more picks.
-    pub fn mutate(
-        bracket: &Bracket,
-        tournament: &TournamentInfo,
-        scoring_config: &ScoringConfig,
-    ) -> Bracket {
-        let mut rng = rand::thread_rng();
-
-        let team_idx = rng.gen_range(0..tournament.teams.len());
-        let team = &tournament.teams[team_idx];
-
+    /// Draw a mutation: a team, and how far up the bracket to push it.
+    ///
+    /// Earlier rounds are weighted more heavily because they move more picks —
+    /// forcing a team into the round of 32 rewrites one game, forcing it to the
+    /// title rewrites six.
+    pub fn random_move(tournament: &TournamentInfo, rng: &mut impl Rng) -> (u8, usize) {
+        let team = rng.gen_range(0..tournament.teams.len()) as u8;
         let r: f64 = rng.gen();
         let wins: usize = if r < 0.40 {
             1
@@ -177,9 +125,25 @@ impl TeamRoundMutator {
         } else {
             6
         };
+        (team, wins)
+    }
 
-        let new_binary = Self::force_team_to_round(&bracket.binary, tournament, team, wins);
-        Bracket::new_from_binary(tournament, &new_binary, Some(scoring_config))
+    /// Apply a random team-round move to `picks`, in place.
+    pub fn mutate_picks(picks: &mut Picks, tournament: &TournamentInfo, rng: &mut impl Rng) {
+        let (team, wins) = Self::random_move(tournament, rng);
+        picks.force_to_round(tournament, team, wins);
+    }
+
+    /// Pick a random team and force it to win a random number of games.
+    pub fn mutate(
+        bracket: &Bracket,
+        tournament: &TournamentInfo,
+        scoring_config: &ScoringConfig,
+    ) -> Bracket {
+        let mut rng = rand::thread_rng();
+        let mut picks = bracket.picks(tournament);
+        Self::mutate_picks(&mut picks, tournament, &mut rng);
+        Bracket::from_picks(tournament, &picks, Some(scoring_config))
     }
 
     /// Rewrite `binary` so that `team` wins its first `wins` games.
@@ -194,46 +158,24 @@ impl TeamRoundMutator {
 
     /// As `force_team_to_round`, addressing the team by index.
     ///
-    /// Walks up the single path from the team's round-1 game, setting each bit
-    /// against the opponent that the already-rewritten bits below actually
-    /// deliver. Games above `wins` keep their bits and are re-decoded by the
-    /// caller, so the result is always a legal bracket.
+    /// Kept for callers that still hold a `Vec<bool>`; the work happens in
+    /// [`Picks::force_to_round`], which walks the twelve games the move can
+    /// reach instead of re-decoding all sixty-three.
     pub fn force_index_to_round(
         binary: &[bool],
         tournament: &TournamentInfo,
         team_index: u8,
         wins: usize,
     ) -> Vec<bool> {
-        let mut new_binary = binary.to_vec();
-        let mut winners = tournament.decode_winners(&new_binary);
-
-        let mut game = tournament.r1_game_of_team[team_index as usize];
-
-        for _ in 0..wins.min(NUM_ROUNDS) {
-            let (a, b) = tournament.participants(game, &winners);
-            let opponent = if a == team_index {
-                b
-            } else if b == team_index {
-                a
-            } else {
-                debug_assert!(
-                    false,
-                    "team {} is not a participant of game {}",
-                    team_index, game
-                );
-                break;
-            };
-
-            new_binary[game] = tournament.winner_bit(team_index, opponent);
-            winners[game] = team_index;
-
-            game = PARENT[game];
-            if game == NO_GAME {
-                break;
+        let mut bits = 0u64;
+        for (game, &bit) in binary.iter().enumerate() {
+            if bit {
+                bits |= 1u64 << game;
             }
         }
-
-        new_binary
+        let mut picks = Picks::from_bits(tournament, bits);
+        picks.force_to_round(tournament, team_index, wins);
+        (0..binary.len()).map(|g| picks.bit(g)).collect()
     }
 }
 
@@ -271,6 +213,28 @@ impl LockSet {
         binary
     }
 
+    /// Force every lock back into a candidate, in place.
+    ///
+    /// This runs on every candidate the optimizers produce, so it checks first
+    /// and rewrites only when something has actually drifted.
+    #[inline]
+    pub fn repair_picks(&self, picks: &mut Picks, tournament: &TournamentInfo) {
+        if self.locks.is_empty() || self.holds(picks) {
+            return;
+        }
+        for lock in &self.locks {
+            picks.force_to_round(tournament, lock.team_index, lock.wins_required);
+        }
+    }
+
+    /// Whether every lock already holds in `picks`.
+    #[inline]
+    pub fn holds(&self, picks: &Picks) -> bool {
+        self.locks
+            .iter()
+            .all(|lock| picks.wins_for(lock.team_index) >= lock.wins_required)
+    }
+
     /// Force every lock back into a bracket, rebuilding only if something moved.
     pub fn repair(
         &self,
@@ -293,25 +257,81 @@ impl LockSet {
     }
 }
 
-/// Individual in the GA population
-#[derive(Clone)]
+/// Individual in the GA population.
+///
+/// Carries the compact [`Picks`] rather than a full `Bracket`: a generation of
+/// 100 individuals used to mean 6,300 `Game` structs and ~19,000 atomic
+/// refcount operations per generation, all of it thrown away at the next.
+#[derive(Clone, Copy)]
 pub struct Individual {
-    pub bracket: Bracket,
+    pub picks: Picks,
     pub fitness: f64,
+    /// Cleared when the candidate changes; lets the evaluator skip elites and
+    /// straight clones, which are typically a quarter of every generation.
+    evaluated: bool,
 }
 
 impl Individual {
-    pub fn new(bracket: Bracket) -> Self {
+    pub fn new(picks: Picks) -> Self {
         Individual {
-            bracket,
-            fitness: 0.0,
+            picks,
+            fitness: f64::NEG_INFINITY,
+            evaluated: false,
         }
     }
 
-    pub fn with_fitness(bracket: Bracket, fitness: f64) -> Self {
-        Individual { bracket, fitness }
+    pub fn bracket(&self, tournament: &TournamentInfo, scoring: &ScoringConfig) -> Bracket {
+        Bracket::from_picks(tournament, &self.picks, Some(scoring))
     }
 }
+
+/// Seed a population of random brackets.
+fn random_population(
+    tournament: &TournamentInfo,
+    size: usize,
+    seed: u64,
+) -> Vec<Picks> {
+    // Chunked so the work parallelizes while staying reproducible for a seed.
+    const CHUNK: usize = 64;
+    let chunks = size.div_ceil(CHUNK);
+    let mut out: Vec<Vec<Picks>> = (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            let mut rng = SmallRng::seed_from_u64(seed ^ (c as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let n = CHUNK.min(size - c * CHUNK);
+            (0..n).map(|_| Picks::sample(tournament, &mut rng)).collect()
+        })
+        .collect();
+    let mut flat = Vec::with_capacity(size);
+    for chunk in out.drain(..) {
+        flat.extend(chunk);
+    }
+    flat
+}
+
+/// Team-round crossover: take the base parent's bracket and inject a handful of
+/// (team, round) outcomes drawn from the donor.
+///
+/// The genes are advancement facts — "this team reached the Sweet 16" — rather
+/// than raw bits, because a bit's meaning depends on who reaches its game.
+fn team_round_crossover(
+    base: &Picks,
+    donor: &Picks,
+    tournament: &TournamentInfo,
+    rng: &mut impl Rng,
+) -> Picks {
+    let mut child = *base;
+    for _ in 0..rng.gen_range(1..=4) {
+        let round = rng.gen_range(1..=6usize);
+        let (start, count) = ROUND_SLOTS[round - 1];
+        let team = donor.winner(start + rng.gen_range(0..count));
+        child.force_to_round(tournament, team, round);
+    }
+    child
+}
+
+/// (first game index, game count) of each round, indexed by round - 1.
+const ROUND_SLOTS: [(usize, usize); 6] = [(0, 32), (32, 16), (48, 8), (56, 4), (60, 2), (62, 1)];
 
 /// Genetic Algorithm for bracket optimization
 pub struct GeneticAlgorithm {
@@ -320,9 +340,10 @@ pub struct GeneticAlgorithm {
     pub scoring_config: ScoringConfig,
     pub generation: usize,
     pub best_fitness: f64,
-    pub best_bracket: Option<Bracket>,
+    pub best_picks: Option<Picks>,
     /// Re-applied to every candidate; see `LockSet`.
     pub locks: LockSet,
+    rng: SmallRng,
 }
 
 impl GeneticAlgorithm {
@@ -332,9 +353,19 @@ impl GeneticAlgorithm {
         settings: GaSettings,
         scoring_config: ScoringConfig,
     ) -> Self {
-        let population: Vec<Individual> = (0..settings.population_size)
-            .into_par_iter()
-            .map(|_| Individual::new(Bracket::new(tournament, Some(&scoring_config))))
+        Self::with_seed(tournament, settings, scoring_config, rand::random())
+    }
+
+    /// As `new`, from a fixed seed — the whole search becomes reproducible.
+    pub fn with_seed(
+        tournament: &TournamentInfo,
+        settings: GaSettings,
+        scoring_config: ScoringConfig,
+        seed: u64,
+    ) -> Self {
+        let population = random_population(tournament, settings.population_size, seed)
+            .into_iter()
+            .map(Individual::new)
             .collect();
 
         GeneticAlgorithm {
@@ -342,198 +373,137 @@ impl GeneticAlgorithm {
             settings,
             scoring_config,
             generation: 0,
-            best_fitness: 0.0,
-            best_bracket: None,
+            best_fitness: f64::NEG_INFINITY,
+            best_picks: None,
             locks: LockSet::default(),
+            rng: SmallRng::seed_from_u64(seed ^ 0x5DEE_CE66_D000_0000),
         }
     }
 
     /// Constrain the search: every candidate, starting with the initial
     /// population, is repaired to satisfy these locks.
     pub fn with_locks(mut self, locks: LockSet, tournament: &TournamentInfo) -> Self {
-        if !locks.is_empty() {
-            let scoring = self.scoring_config;
-            self.population = self
-                .population
-                .drain(..)
-                .map(|ind| Individual::new(locks.repair(ind.bracket, tournament, &scoring)))
-                .collect();
+        for ind in self.population.iter_mut() {
+            locks.repair_picks(&mut ind.picks, tournament);
         }
         self.locks = locks;
         self
     }
 
-    /// Evaluate fitness for all individuals using simulation pool
-    pub fn evaluate_fitness(&mut self, pool: &MonteCarloScenarios) {
-        // Parallel fitness evaluation
-        let fitnesses: Vec<f64> = self.population
-            .par_iter()
-            .map(|ind| pool.score_bracket(&ind.bracket, &self.scoring_config))
-            .collect();
-
-        // Update fitness values
-        for (ind, fitness) in self.population.iter_mut().zip(fitnesses.into_iter()) {
-            ind.fitness = fitness;
-        }
-
-        // Track best
-        if let Some(best) = self.population.iter().max_by(|a, b| {
-            a.fitness.partial_cmp(&b.fitness).unwrap()
-        }) {
-            if best.fitness > self.best_fitness {
-                self.best_fitness = best.fitness;
-                self.best_bracket = Some(best.bracket.clone());
-            }
-        }
+    /// The best bracket found so far, materialised for display.
+    pub fn best_bracket(&self, tournament: &TournamentInfo) -> Option<Bracket> {
+        self.best_picks
+            .map(|p| Bracket::from_picks(tournament, &p, Some(&self.scoring_config)))
     }
 
-    /// Evaluate fitness for portfolio mode (marginal contribution)
-    pub fn evaluate_fitness_portfolio(
-        &mut self,
-        pool: &MonteCarloScenarios,
-        existing_portfolio: &[Bracket],
-    ) {
-        let fitnesses: Vec<f64> = self.population
+    /// Score every candidate against `baseline`, the per-scenario best of the
+    /// already-frozen part of the portfolio.
+    ///
+    /// An empty baseline (all zeros) makes this plain expected score, so the
+    /// single-bracket and portfolio cases run the same code. Parallelism is one
+    /// level only — across the population, with the scenario loop serial inside
+    /// — because rayon nested in rayon spent more time splitting jobs than
+    /// scoring: it was a quarter of total run time in the profile.
+    fn evaluate(&mut self, pool: &ScenarioPool, baseline: Option<&[f32]>) {
+        let points = pool.points();
+        let updates: Vec<(usize, f64)> = self
+            .population
             .par_iter()
-            .map(|ind| {
-                pool.combined_best_ball(&ind.bracket, existing_portfolio, &self.scoring_config)
+            .enumerate()
+            .filter(|(_, ind)| !ind.evaluated)
+            .map(|(i, ind)| {
+                let prepared = ScoredPicks::new(&ind.picks, points);
+                let fitness = match baseline {
+                    Some(base) => pool.mean_max_with(&prepared, base),
+                    None => pool.mean_score(&prepared),
+                };
+                (i, fitness)
             })
             .collect();
 
-        for (ind, fitness) in self.population.iter_mut().zip(fitnesses.into_iter()) {
-            ind.fitness = fitness;
+        for (i, fitness) in updates {
+            self.population[i].fitness = fitness;
+            self.population[i].evaluated = true;
         }
 
-        if let Some(best) = self.population.iter().max_by(|a, b| {
-            a.fitness.partial_cmp(&b.fitness).unwrap()
-        }) {
+        if let Some(best) = self
+            .population
+            .iter()
+            .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+        {
             if best.fitness > self.best_fitness {
                 self.best_fitness = best.fitness;
-                self.best_bracket = Some(best.bracket.clone());
+                self.best_picks = Some(best.picks);
             }
         }
+    }
+
+    /// Evaluate fitness for all individuals using the simulation pool.
+    pub fn evaluate_fitness(&mut self, pool: &MonteCarloScenarios) {
+        self.evaluate(&pool.pool, None);
     }
 
     /// Tournament selection - pick best from random subset
-    fn tournament_select(&self, rng: &mut impl Rng) -> &Individual {
-        let mut best: Option<&Individual> = None;
-
-        for _ in 0..self.settings.tournament_size {
-            let idx = rng.gen_range(0..self.population.len());
-            let candidate = &self.population[idx];
-
-            if best.is_none() || candidate.fitness > best.unwrap().fitness {
-                best = Some(candidate);
+    fn select(&self, rng: &mut impl Rng) -> usize {
+        let mut best = rng.gen_range(0..self.population.len());
+        for _ in 1..self.settings.tournament_size {
+            let challenger = rng.gen_range(0..self.population.len());
+            if self.population[challenger].fitness > self.population[best].fitness {
+                best = challenger;
             }
         }
-
-        best.unwrap()
-    }
-
-    /// Team-Round crossover - the genes are Team-Round pairs
-    /// 1. Start with one parent as the base
-    /// 2. Pick N Team-Round pairs that EXIST in the donor bracket
-    /// 3. Apply those Team-Round pairs to the child (force those teams to reach those rounds)
-    fn crossover(parent1: &Bracket, parent2: &Bracket, tournament: &TournamentInfo, scoring_config: &ScoringConfig, rng: &mut impl Rng) -> Bracket {
-        // Pick which parent is the base (50/50)
-        let (base, donor) = if rng.gen::<bool>() {
-            (parent1, parent2)
-        } else {
-            (parent2, parent1)
-        };
-
-        // Start with base parent's binary
-        let mut child_binary = base.binary.clone();
-
-        // Pick N Team-Round pairs from donor to inject (N = 1 to 4)
-        let num_injections = rng.gen_range(1..=4);
-
-        for _ in 0..num_injections {
-            // Pick a random round (1-6, but later rounds have fewer teams)
-            let round: usize = rng.gen_range(1..=6);
-
-            // Find a team that actually reached this round in the donor bracket
-            // by looking at the game winners
-            if let Some(team) = Self::get_team_at_round(donor, round, rng) {
-                // Apply this Team-Round pair to the child
-                child_binary = TeamRoundMutator::force_team_to_round(
-                    &child_binary,
-                    tournament,
-                    &team,
-                    round,
-                );
-            }
-        }
-
-        Bracket::new_from_binary(tournament, &child_binary, Some(scoring_config))
-    }
-
-    /// Get a random team that reached a specific round in the bracket
-    fn get_team_at_round(bracket: &Bracket, round: usize, rng: &mut impl Rng) -> Option<RcTeam> {
-        // Game indices by round:
-        // Round 1: games 0-31 (32 winners)
-        // Round 2: games 32-47 (16 winners)
-        // Round 3: games 48-55 (8 winners - Sweet 16)
-        // Round 4: games 56-59 (4 winners - Elite 8)
-        // Round 5: games 60-61 (2 winners - Final Four)
-        // Round 6: game 62 (1 winner - Champion)
-        let (start, count) = match round {
-            1 => (0, 32),
-            2 => (32, 16),
-            3 => (48, 8),
-            4 => (56, 4),
-            5 => (60, 2),
-            6 => (62, 1),
-            _ => return None,
-        };
-
-        if count == 0 {
-            return None;
-        }
-
-        let game_idx = start + rng.gen_range(0..count);
-        Some(Arc::clone(&bracket.games[game_idx].winner))
+        best
     }
 
     /// Run one generation of evolution
     pub fn evolve_generation(&mut self, tournament: &TournamentInfo) {
-        let mut rng = rand::thread_rng();
-        let mut new_population: Vec<Individual> = Vec::with_capacity(self.settings.population_size);
+        let mut rng = std::mem::replace(&mut self.rng, SmallRng::seed_from_u64(0));
+        let elites = self.settings.elitism_count.min(self.population.len());
 
-        // Elitism: keep top individuals
-        let mut sorted_pop = self.population.clone();
-        sorted_pop.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+        // Partial sort: only the elite prefix has to be in order, and the
+        // survivors are moved rather than cloned.
+        self.population
+            .sort_unstable_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
 
-        for i in 0..self.settings.elitism_count.min(self.population.len()) {
-            new_population.push(sorted_pop[i].clone());
-        }
+        let mut next: Vec<Individual> = Vec::with_capacity(self.settings.population_size);
+        next.extend_from_slice(&self.population[..elites]);
 
-        // Generate rest of population
-        while new_population.len() < self.settings.population_size {
-            // Selection
-            let parent1 = self.tournament_select(&mut rng);
-            let parent2 = self.tournament_select(&mut rng);
+        while next.len() < self.settings.population_size {
+            let p1 = self.select(&mut rng);
+            let p2 = self.select(&mut rng);
 
-            // Crossover
-            let mut child = if rng.gen::<f64>() < self.settings.crossover_rate {
-                Self::crossover(&parent1.bracket, &parent2.bracket, tournament, &self.scoring_config, &mut rng)
+            let crossed = rng.gen::<f64>() < self.settings.crossover_rate;
+            let mutated = rng.gen::<f64>() < self.settings.mutation_rate;
+
+            let mut child = if crossed {
+                let (base, donor) = if rng.gen::<bool>() { (p1, p2) } else { (p2, p1) };
+                team_round_crossover(
+                    &self.population[base].picks,
+                    &self.population[donor].picks,
+                    tournament,
+                    &mut rng,
+                )
             } else {
-                parent1.bracket.clone()
+                self.population[p1].picks
             };
 
-            // Mutation: Always use Team-Round mutation (TeamRoundMutator)
-            // Bit-flip mutation is semantically broken for brackets because
-            // flipping an early round bit cascades unpredictably to later rounds
-            if rng.gen::<f64>() < self.settings.mutation_rate {
-                child = TeamRoundMutator::mutate(&child, tournament, &self.scoring_config);
+            if mutated {
+                TeamRoundMutator::mutate_picks(&mut child, tournament, &mut rng);
             }
+            self.locks.repair_picks(&mut child, tournament);
 
-            let child = self.locks.repair(child, tournament, &self.scoring_config);
-            new_population.push(Individual::new(child));
+            let mut individual = Individual::new(child);
+            // An untouched clone of an already-scored parent keeps its fitness.
+            if !crossed && !mutated && child == self.population[p1].picks {
+                individual.fitness = self.population[p1].fitness;
+                individual.evaluated = self.population[p1].evaluated;
+            }
+            next.push(individual);
         }
 
-        self.population = new_population;
+        self.population = next;
         self.generation += 1;
+        self.rng = rng;
     }
 
     /// Run the full GA optimization
@@ -543,80 +513,57 @@ impl GeneticAlgorithm {
         pool: &MonteCarloScenarios,
         verbose: bool,
     ) -> Bracket {
-        for gen in 0..self.settings.generations {
-            self.evaluate_fitness(pool);
-
-            if verbose && gen % 20 == 0 {
-                println!(
-                    "Generation {}: Best fitness = {:.2}, Avg fitness = {:.2}",
-                    gen,
-                    self.best_fitness,
-                    self.population.iter().map(|i| i.fitness).sum::<f64>() / self.population.len() as f64
-                );
-            }
-
-            self.evolve_generation(tournament);
-        }
-
-        // Final evaluation
-        self.evaluate_fitness(pool);
-
-        if verbose {
-            println!(
-                "Final: Best fitness = {:.2}",
-                self.best_fitness
-            );
-        }
-
-        self.best_bracket.clone().unwrap_or_else(|| {
-            self.population[0].bracket.clone()
-        })
+        self.run_against(tournament, &pool.pool, None, verbose, "Best fitness");
+        self.result(tournament)
     }
 
-    /// Run GA for portfolio mode (optimizing best-ball contribution)
-    /// For empty portfolio: fitness = average score (EV)
-    /// For non-empty portfolio: fitness = marginal contribution to best-ball score
+    /// Run GA for portfolio mode, maximizing best-ball score once this bracket
+    /// joins the portfolio whose per-scenario best is `baseline`.
     pub fn run_for_portfolio(
         &mut self,
         tournament: &TournamentInfo,
         pool: &MonteCarloScenarios,
-        existing_portfolio: &[Bracket],
+        baseline: Option<&[f32]>,
         verbose: bool,
     ) -> Bracket {
-        let fitness_label = if existing_portfolio.is_empty() {
-            "Best-ball score"
+        let label = if baseline.is_some() {
+            "Portfolio best-ball"
         } else {
-            "Marginal contribution"
+            "Expected score"
         };
+        self.run_against(tournament, &pool.pool, baseline, verbose, label);
+        self.result(tournament)
+    }
 
+    fn run_against(
+        &mut self,
+        tournament: &TournamentInfo,
+        pool: &ScenarioPool,
+        baseline: Option<&[f32]>,
+        verbose: bool,
+        label: &str,
+    ) {
         for gen in 0..self.settings.generations {
-            self.evaluate_fitness_portfolio(pool, existing_portfolio);
-
+            self.evaluate(pool, baseline);
             if verbose && gen % 20 == 0 {
+                let avg = self.population.iter().map(|i| i.fitness).sum::<f64>()
+                    / self.population.len() as f64;
                 println!(
-                    "Generation {}: {} = {:.2}",
-                    gen,
-                    fitness_label,
-                    self.best_fitness
+                    "Generation {}: {} = {:.2}, Avg = {:.2}",
+                    gen, label, self.best_fitness, avg
                 );
             }
-
             self.evolve_generation(tournament);
         }
-
-        self.evaluate_fitness_portfolio(pool, existing_portfolio);
-
+        self.evaluate(pool, baseline);
         if verbose {
-            println!(
-                "Final: {} = {:.2}",
-                fitness_label,
-                self.best_fitness
-            );
+            println!("Final: {} = {:.2}", label, self.best_fitness);
         }
+    }
 
-        self.best_bracket.clone().unwrap_or_else(|| {
-            self.population[0].bracket.clone()
-        })
+    fn result(&self, tournament: &TournamentInfo) -> Bracket {
+        let picks = self.best_picks.unwrap_or(self.population[0].picks);
+        Bracket::from_picks(tournament, &picks, Some(&self.scoring_config))
     }
 }
 
@@ -632,23 +579,18 @@ pub struct SequentialPortfolioOptimizer {
 /// Portfolio Individual - represents an entire portfolio of N brackets
 #[derive(Clone)]
 pub struct PortfolioIndividual {
-    pub brackets: Vec<Bracket>,
+    pub picks: Vec<Picks>,
     pub fitness: f64,
+    evaluated: bool,
 }
 
 impl PortfolioIndividual {
-    pub fn new(brackets: Vec<Bracket>) -> Self {
+    pub fn new(picks: Vec<Picks>) -> Self {
         PortfolioIndividual {
-            brackets,
-            fitness: 0.0,
+            picks,
+            fitness: f64::NEG_INFINITY,
+            evaluated: false,
         }
-    }
-
-    pub fn random(tournament: &TournamentInfo, num_brackets: usize, scoring_config: &ScoringConfig) -> Self {
-        let brackets: Vec<Bracket> = (0..num_brackets)
-            .map(|_| Bracket::new(tournament, Some(scoring_config)))
-            .collect();
-        PortfolioIndividual::new(brackets)
     }
 }
 
@@ -662,9 +604,10 @@ pub struct WholePortfolioGA {
     pub num_brackets: usize,
     pub generation: usize,
     pub best_fitness: f64,
-    pub best_portfolio: Option<Vec<Bracket>>,
+    pub best_portfolio: Option<Vec<Picks>>,
     /// Applied to every bracket of every portfolio.
     pub locks: LockSet,
+    rng: SmallRng,
 }
 
 impl WholePortfolioGA {
@@ -674,10 +617,30 @@ impl WholePortfolioGA {
         settings: GaSettings,
         scoring_config: ScoringConfig,
     ) -> Self {
-        // Initialize population of portfolios
-        let population: Vec<PortfolioIndividual> = (0..settings.population_size)
-            .into_par_iter()
-            .map(|_| PortfolioIndividual::random(tournament, num_brackets, &scoring_config))
+        Self::with_seed(
+            tournament,
+            num_brackets,
+            settings,
+            scoring_config,
+            rand::random(),
+        )
+    }
+
+    pub fn with_seed(
+        tournament: &TournamentInfo,
+        num_brackets: usize,
+        settings: GaSettings,
+        scoring_config: ScoringConfig,
+        seed: u64,
+    ) -> Self {
+        let flat = random_population(
+            tournament,
+            settings.population_size * num_brackets.max(1),
+            seed,
+        );
+        let population = flat
+            .chunks(num_brackets.max(1))
+            .map(|c: &[Picks]| PortfolioIndividual::new(c.to_vec()))
             .collect();
 
         WholePortfolioGA {
@@ -686,28 +649,19 @@ impl WholePortfolioGA {
             scoring_config,
             num_brackets,
             generation: 0,
-            best_fitness: 0.0,
+            best_fitness: f64::NEG_INFINITY,
             best_portfolio: None,
             locks: LockSet::default(),
+            rng: SmallRng::seed_from_u64(seed ^ 0x1234_5678_9ABC_DEF0),
         }
     }
 
     /// Constrain every bracket in every portfolio to satisfy these locks.
     pub fn with_locks(mut self, locks: LockSet, tournament: &TournamentInfo) -> Self {
-        if !locks.is_empty() {
-            let scoring = self.scoring_config;
-            self.population = self
-                .population
-                .drain(..)
-                .map(|ind| {
-                    PortfolioIndividual::new(
-                        ind.brackets
-                            .into_iter()
-                            .map(|b| locks.repair(b, tournament, &scoring))
-                            .collect(),
-                    )
-                })
-                .collect();
+        for ind in self.population.iter_mut() {
+            for picks in ind.picks.iter_mut() {
+                locks.repair_picks(picks, tournament);
+            }
         }
         self.locks = locks;
         self
@@ -715,189 +669,107 @@ impl WholePortfolioGA {
 
     /// Evaluate fitness for all portfolios using best-ball scoring
     pub fn evaluate_fitness(&mut self, pool: &MonteCarloScenarios) {
-        let fitnesses: Vec<f64> = self.population
+        let scenarios = &pool.pool;
+        let points = scenarios.points();
+        let updates: Vec<(usize, f64)> = self
+            .population
             .par_iter()
-            .map(|ind| pool.score_portfolio_best_ball(&ind.brackets, &self.scoring_config))
+            .enumerate()
+            .filter(|(_, ind)| !ind.evaluated)
+            .map(|(i, ind)| {
+                let prepared: Vec<ScoredPicks> = ind
+                    .picks
+                    .iter()
+                    .map(|p| ScoredPicks::new(p, points))
+                    .collect();
+                (i, scenarios.best_ball_mean(&prepared))
+            })
             .collect();
 
-        for (ind, fitness) in self.population.iter_mut().zip(fitnesses.into_iter()) {
-            ind.fitness = fitness;
+        for (i, fitness) in updates {
+            self.population[i].fitness = fitness;
+            self.population[i].evaluated = true;
         }
 
-        // Track best
-        if let Some(best) = self.population.iter().max_by(|a, b| {
-            a.fitness.partial_cmp(&b.fitness).unwrap()
-        }) {
+        if let Some(best) = self
+            .population
+            .iter()
+            .max_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap())
+        {
             if best.fitness > self.best_fitness {
                 self.best_fitness = best.fitness;
-                self.best_portfolio = Some(best.brackets.clone());
+                self.best_portfolio = Some(best.picks.clone());
             }
         }
     }
 
-    /// Tournament selection for portfolios
-    fn tournament_select(&self, rng: &mut impl Rng) -> &PortfolioIndividual {
-        let mut best: Option<&PortfolioIndividual> = None;
-
-        for _ in 0..self.settings.tournament_size {
-            let idx = rng.gen_range(0..self.population.len());
-            let candidate = &self.population[idx];
-
-            if best.is_none() || candidate.fitness > best.unwrap().fitness {
-                best = Some(candidate);
+    fn select(&self, rng: &mut impl Rng) -> usize {
+        let mut best = rng.gen_range(0..self.population.len());
+        for _ in 1..self.settings.tournament_size {
+            let challenger = rng.gen_range(0..self.population.len());
+            if self.population[challenger].fitness > self.population[best].fitness {
+                best = challenger;
             }
         }
-
-        best.unwrap()
-    }
-
-    /// Crossover two portfolios using Team-Round crossover on each bracket
-    /// For each bracket position, do Team-Round crossover of the two parent brackets
-    fn crossover(
-        parent1: &PortfolioIndividual,
-        parent2: &PortfolioIndividual,
-        tournament: &TournamentInfo,
-        scoring_config: &ScoringConfig,
-        rng: &mut impl Rng,
-    ) -> PortfolioIndividual {
-        let mut child_brackets = Vec::with_capacity(parent1.brackets.len());
-
-        for i in 0..parent1.brackets.len() {
-            // Team-Round crossover for each bracket position
-            let child_bracket = Self::team_round_crossover_bracket(
-                &parent1.brackets[i],
-                &parent2.brackets[i],
-                tournament,
-                scoring_config,
-                rng,
-            );
-            child_brackets.push(child_bracket);
-        }
-
-        PortfolioIndividual::new(child_brackets)
-    }
-
-    /// Team-Round crossover for a single bracket
-    /// Takes Team-Round pairs from donor and applies them to base
-    fn team_round_crossover_bracket(
-        parent1: &Bracket,
-        parent2: &Bracket,
-        tournament: &TournamentInfo,
-        scoring_config: &ScoringConfig,
-        rng: &mut impl Rng,
-    ) -> Bracket {
-        // Pick which parent is the base (50/50)
-        let (base, donor) = if rng.gen::<bool>() {
-            (parent1, parent2)
-        } else {
-            (parent2, parent1)
-        };
-
-        let mut child_binary = base.binary.clone();
-
-        // Pick N Team-Round pairs from donor to inject (N = 1 to 4)
-        let num_injections = rng.gen_range(1..=4);
-
-        for _ in 0..num_injections {
-            let round: usize = rng.gen_range(1..=6);
-
-            if let Some(team) = Self::get_team_at_round(donor, round, rng) {
-                child_binary = TeamRoundMutator::force_team_to_round(
-                    &child_binary,
-                    tournament,
-                    &team,
-                    round,
-                );
-            }
-        }
-
-        Bracket::new_from_binary(tournament, &child_binary, Some(scoring_config))
-    }
-
-    /// Get a random team that reached a specific round in the bracket
-    fn get_team_at_round(bracket: &Bracket, round: usize, rng: &mut impl Rng) -> Option<RcTeam> {
-        let (start, count) = match round {
-            1 => (0, 32),
-            2 => (32, 16),
-            3 => (48, 8),
-            4 => (56, 4),
-            5 => (60, 2),
-            6 => (62, 1),
-            _ => return None,
-        };
-
-        if count == 0 {
-            return None;
-        }
-
-        let game_idx = start + rng.gen_range(0..count);
-        Some(Arc::clone(&bracket.games[game_idx].winner))
-    }
-
-    /// Mutate a portfolio - apply smart mutation to one random bracket
-    fn mutate(
-        portfolio: &PortfolioIndividual,
-        tournament: &TournamentInfo,
-        scoring_config: &ScoringConfig,
-        rng: &mut impl Rng,
-    ) -> PortfolioIndividual {
-        let mut new_brackets = portfolio.brackets.clone();
-
-        // Pick a random bracket to mutate
-        let idx = rng.gen_range(0..new_brackets.len());
-
-        // Apply smart mutation
-        new_brackets[idx] = TeamRoundMutator::mutate(&new_brackets[idx], tournament, scoring_config);
-
-        PortfolioIndividual::new(new_brackets)
+        best
     }
 
     /// Run one generation of evolution
     pub fn evolve_generation(&mut self, tournament: &TournamentInfo) {
-        let mut rng = rand::thread_rng();
-        let mut new_population: Vec<PortfolioIndividual> = Vec::with_capacity(self.settings.population_size);
+        let mut rng = std::mem::replace(&mut self.rng, SmallRng::seed_from_u64(0));
+        let elites = self.settings.elitism_count.min(self.population.len());
 
-        // Elitism: keep top portfolios
-        let mut sorted_pop = self.population.clone();
-        sorted_pop.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
+        self.population
+            .sort_unstable_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap());
 
-        for i in 0..self.settings.elitism_count.min(self.population.len()) {
-            new_population.push(sorted_pop[i].clone());
-        }
+        let mut next: Vec<PortfolioIndividual> =
+            Vec::with_capacity(self.settings.population_size);
+        next.extend_from_slice(&self.population[..elites]);
 
-        // Generate rest of population
-        while new_population.len() < self.settings.population_size {
-            let parent1 = self.tournament_select(&mut rng);
-            let parent2 = self.tournament_select(&mut rng);
+        while next.len() < self.settings.population_size {
+            let p1 = self.select(&mut rng);
+            let p2 = self.select(&mut rng);
 
-            // Crossover using region-based bracket crossover
-            let mut child = if rng.gen::<f64>() < self.settings.crossover_rate {
-                Self::crossover(parent1, parent2, tournament, &self.scoring_config, &mut rng)
+            let crossed = rng.gen::<f64>() < self.settings.crossover_rate;
+            let mutated = rng.gen::<f64>() < self.settings.mutation_rate;
+
+            let mut child: Vec<Picks> = if crossed {
+                (0..self.population[p1].picks.len())
+                    .map(|i| {
+                        let (base, donor) =
+                            if rng.gen::<bool>() { (p1, p2) } else { (p2, p1) };
+                        team_round_crossover(
+                            &self.population[base].picks[i],
+                            &self.population[donor].picks[i],
+                            tournament,
+                            &mut rng,
+                        )
+                    })
+                    .collect()
             } else {
-                parent1.clone()
+                self.population[p1].picks.clone()
             };
 
-            // Mutation: always use Team-Round mutation (TeamRoundMutator)
-            if rng.gen::<f64>() < self.settings.mutation_rate {
-                child = Self::mutate(&child, tournament, &self.scoring_config, &mut rng);
+            if mutated && !child.is_empty() {
+                let idx = rng.gen_range(0..child.len());
+                TeamRoundMutator::mutate_picks(&mut child[idx], tournament, &mut rng);
+            }
+            for picks in child.iter_mut() {
+                self.locks.repair_picks(picks, tournament);
             }
 
-            let child = if self.locks.is_empty() {
-                child
-            } else {
-                PortfolioIndividual::new(
-                    child
-                        .brackets
-                        .into_iter()
-                        .map(|b| self.locks.repair(b, tournament, &self.scoring_config))
-                        .collect(),
-                )
-            };
-            new_population.push(child);
+            let unchanged = !crossed && !mutated && child == self.population[p1].picks;
+            let mut individual = PortfolioIndividual::new(child);
+            if unchanged {
+                individual.fitness = self.population[p1].fitness;
+                individual.evaluated = self.population[p1].evaluated;
+            }
+            next.push(individual);
         }
 
-        self.population = new_population;
+        self.population = next;
         self.generation += 1;
+        self.rng = rng;
     }
 
     /// Run the full GA optimization
@@ -922,18 +794,23 @@ impl WholePortfolioGA {
             self.evolve_generation(tournament);
         }
 
-        // Final evaluation
         self.evaluate_fitness(pool);
 
         if verbose {
             println!("Final: Best fitness = {:.2}", self.best_fitness);
         }
 
-        self.best_portfolio.clone().unwrap_or_else(|| {
-            self.population[0].brackets.clone()
-        })
+        let picks = self
+            .best_portfolio
+            .clone()
+            .unwrap_or_else(|| self.population[0].picks.clone());
+        picks
+            .iter()
+            .map(|p| Bracket::from_picks(tournament, p, Some(&self.scoring_config)))
+            .collect()
     }
 }
+
 
 impl SequentialPortfolioOptimizer {
     /// `scoring_config` is passed in rather than re-derived from `config`.
@@ -948,26 +825,33 @@ impl SequentialPortfolioOptimizer {
         }
     }
 
-    /// Optimize a portfolio of brackets sequentially
+    /// Optimize a portfolio of brackets sequentially.
+    ///
+    /// Each frozen bracket is folded into a running per-scenario best, so the
+    /// `n`-th bracket is still evaluated with one bracket's worth of scoring
+    /// rather than `n`. That baseline used to be rebuilt from scratch for every
+    /// candidate of every generation — for a five-bracket portfolio, four
+    /// fifths of the work was recomputing something that had not changed.
     pub fn optimize(
         &self,
         tournament: &TournamentInfo,
         num_brackets: usize,
         verbose: bool,
     ) -> Vec<Bracket> {
-        // Generate simulation pool once
-        let pool = MonteCarloScenarios::new(
+        let scenarios = MonteCarloScenarios::announced(
             tournament,
             self.config.simulation.pool_size,
             &self.scoring_config,
         );
+        let pool = &scenarios.pool;
 
-        let mut portfolio: Vec<Bracket> = Vec::with_capacity(num_brackets);
+        let mut portfolio: Vec<Picks> = Vec::with_capacity(num_brackets);
+        // Per-scenario best over everything frozen so far.
+        let mut baseline = vec![0.0f32; pool.size()];
 
         for i in 0..num_brackets {
             println!("\n=== Optimizing Bracket {} of {} ===", i + 1, num_brackets);
 
-            // Create new GA instance
             let mut ga = GeneticAlgorithm::new(
                 tournament,
                 self.config.ga.clone(),
@@ -975,19 +859,14 @@ impl SequentialPortfolioOptimizer {
             )
             .with_locks(self.locks.clone(), tournament);
 
-            // Always optimize for best-ball contribution to portfolio
-            // For first bracket, this is equivalent to EV, but keeps the fitness semantics consistent
-            // For subsequent brackets, this is marginal contribution to existing portfolio
-            let bracket = ga.run_for_portfolio(tournament, &pool, &portfolio, verbose);
+            let carry = if i == 0 { None } else { Some(&baseline[..]) };
+            ga.run_for_portfolio(tournament, &scenarios, carry, verbose);
 
-            // Calculate and display best-ball score
-            let portfolio_with_new: Vec<Bracket> = portfolio.iter()
-                .chain(std::iter::once(&bracket))
-                .cloned()
-                .collect();
+            let picks = ga.best_picks.unwrap_or(ga.population[0].picks);
+            let prepared = pool.prepare(&picks);
+            pool.absorb_into(&prepared, &mut baseline);
 
-            let best_ball_score = pool.score_portfolio_best_ball(&portfolio_with_new, &self.scoring_config);
-
+            let bracket = Bracket::from_picks(tournament, &picks, Some(&self.scoring_config));
             println!(
                 "Bracket {}: Champion = {} (seed {}), EV = {:.2}",
                 i + 1,
@@ -995,31 +874,40 @@ impl SequentialPortfolioOptimizer {
                 bracket.winner.seed,
                 bracket.expected_value
             );
-            println!("Portfolio best-ball score after bracket {}: {:.2}", i + 1, best_ball_score);
+            println!(
+                "Portfolio best-ball score after bracket {}: {:.2}",
+                i + 1,
+                mean(&baseline)
+            );
 
-            portfolio.push(bracket);
+            portfolio.push(picks);
         }
 
-        // Final summary
         println!("\n=== Portfolio Optimization Complete ===");
-        let final_score = pool.score_portfolio_best_ball(&portfolio, &self.scoring_config);
-        println!("Final portfolio best-ball score: {:.2}", final_score);
+        println!("Final portfolio best-ball score: {:.2}", mean(&baseline));
 
-        // Show individual bracket scores for comparison
         println!("\nIndividual bracket scores:");
-        for (i, bracket) in portfolio.iter().enumerate() {
-            let individual_score = pool.score_bracket(bracket, &self.scoring_config);
+        let brackets: Vec<Bracket> = portfolio
+            .iter()
+            .map(|p| Bracket::from_picks(tournament, p, Some(&self.scoring_config)))
+            .collect();
+        for (i, (picks, bracket)) in portfolio.iter().zip(brackets.iter()).enumerate() {
             println!(
                 "  Bracket {}: {} - Score: {:.2}, EV: {:.2}",
                 i + 1,
                 bracket.winner.name,
-                individual_score,
+                pool.mean_score(&pool.prepare(picks)),
                 bracket.expected_value
             );
         }
 
-        portfolio
+        brackets
     }
+}
+
+/// Mean of a per-scenario profile.
+fn mean(profile: &[f32]) -> f64 {
+    profile.iter().map(|&v| v as f64).sum::<f64>() / profile.len() as f64
 }
 
 /// Hybrid Simulated Annealing + GA for single bracket optimization
@@ -1041,54 +929,41 @@ impl HybridOptimizer {
 
     /// Run hybrid SA+GA optimization on a single bracket
     /// Uses SA acceptance criterion with GA-style operators
-    pub fn optimize_single(
-        &self,
-        tournament: &TournamentInfo,
-        verbose: bool,
-    ) -> Bracket {
-        let pool = MonteCarloScenarios::new(
+    pub fn optimize_single(&self, tournament: &TournamentInfo, verbose: bool) -> Bracket {
+        let scenarios = MonteCarloScenarios::announced(
             tournament,
             self.config.simulation.pool_size,
             &self.scoring_config,
         );
+        let pool = &scenarios.pool;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = SmallRng::from_entropy();
 
-        // Start with a random bracket
-        let mut current = self.locks.repair(
-            Bracket::new(tournament, Some(&self.scoring_config)),
-            tournament,
-            &self.scoring_config,
-        );
-        let mut current_score = pool.score_bracket(&current, &self.scoring_config);
+        let mut current = Picks::sample(tournament, &mut rng);
+        self.locks.repair_picks(&mut current, tournament);
+        let mut current_score = pool.par_mean_score(&pool.prepare(&current));
 
-        let mut best = current.clone();
+        let mut best = current;
         let mut best_score = current_score;
 
-        // SA parameters
         let initial_temp: f64 = 10.0;
         let final_temp: f64 = 0.1;
-        let cooling_rate = (final_temp / initial_temp).powf(1.0 / self.config.ga.generations as f64);
+        let cooling_rate =
+            (final_temp / initial_temp).powf(1.0 / self.config.ga.generations as f64);
         let mut temperature = initial_temp;
 
         for gen in 0..self.config.ga.generations {
-            // Generate neighbor using Team-Round mutation (TeamRoundMutator)
-            // Bit-flip mutation is semantically broken for brackets
-            let neighbor = self.locks.repair(
-                TeamRoundMutator::mutate(&current, tournament, &self.scoring_config),
-                tournament,
-                &self.scoring_config,
-            );
+            let mut neighbor = current;
+            TeamRoundMutator::mutate_picks(&mut neighbor, tournament, &mut rng);
+            self.locks.repair_picks(&mut neighbor, tournament);
 
-            let neighbor_score = pool.score_bracket(&neighbor, &self.scoring_config);
+            let neighbor_score = pool.par_mean_score(&pool.prepare(&neighbor));
 
-            // SA acceptance criterion
             let accept = if neighbor_score > current_score {
                 true
             } else {
                 let delta = neighbor_score - current_score;
-                let accept_prob = (delta / temperature).exp();
-                rng.gen::<f64>() < accept_prob
+                rng.gen::<f64>() < (delta / temperature).exp()
             };
 
             if accept {
@@ -1096,7 +971,7 @@ impl HybridOptimizer {
                 current_score = neighbor_score;
 
                 if current_score > best_score {
-                    best = current.clone();
+                    best = current;
                     best_score = current_score;
                 }
             }
@@ -1115,7 +990,7 @@ impl HybridOptimizer {
             println!("Final best score: {:.2}", best_score);
         }
 
-        best
+        Bracket::from_picks(tournament, &best, Some(&self.scoring_config))
     }
 }
 
@@ -1124,6 +999,7 @@ mod tests {
     use super::*;
     use crate::bracket::tests::assert_legal;
     use crate::ingest::tests::tournament;
+    use crate::tree::NO_GAME;
 
     #[test]
     fn forcing_a_team_to_a_round_actually_gets_it_there() {
@@ -1263,7 +1139,13 @@ mod tests {
         for _ in 0..100 {
             let a = Bracket::new(&t, Some(&scoring));
             let b = Bracket::new(&t, Some(&scoring));
-            assert_legal(&GeneticAlgorithm::crossover(&a, &b, &t, &scoring, &mut rng));
+            let child = team_round_crossover(
+                &a.picks(&t),
+                &b.picks(&t),
+                &t,
+                &mut rng,
+            );
+            assert_legal(&Bracket::from_picks(&t, &child, Some(&scoring)));
         }
     }
 }

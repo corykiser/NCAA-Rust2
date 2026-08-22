@@ -89,6 +89,28 @@ impl ProbabilityCache {
     pub fn get(&self, team_a_idx: u8, team_b_idx: u8) -> f64 {
         self.probs[team_a_idx as usize][team_b_idx as usize]
     }
+
+    /// The same matchups with every probability pushed toward the favourite.
+    ///
+    /// `tilt > 1` makes the stronger team win more often than the model says.
+    /// Used to stand in for a public that picks more chalk than the ratings
+    /// justify: running the advancement recurrence over a tilted cache gives
+    /// marginals that are automatically consistent, which renormalizing a set
+    /// of tilted marginals is not.
+    pub fn tilted(&self, tilt: f64) -> ProbabilityCache {
+        let mut probs = [[0.5f64; NUM_TEAMS]; NUM_TEAMS];
+        for a in 0..NUM_TEAMS {
+            for b in 0..NUM_TEAMS {
+                if a == b {
+                    continue;
+                }
+                let p = self.probs[a][b];
+                let (hi, lo) = (p.powf(tilt), (1.0 - p).powf(tilt));
+                probs[a][b] = if hi + lo > 0.0 { hi / (hi + lo) } else { p };
+            }
+        }
+        ProbabilityCache { probs }
+    }
 }
 
 #[derive(Debug)]
@@ -110,6 +132,16 @@ pub struct TournamentInfo {
     pub r1_teams: [[u8; 2]; 32],
     /// The round-1 game each team plays in, indexed by `team_index`.
     pub r1_game_of_team: [usize; NUM_TEAMS],
+    /// `bit_true_beats[w]` has bit `l` set iff a `true` encoding bit in a
+    /// matchup between `w` and `l` means `w` advances. Encoding and decoding
+    /// run once per game per candidate bracket in the optimizers' inner loops,
+    /// so the seed/region comparison is precomputed into a single shift-and-test
+    /// against 512 bytes rather than four array loads and a branch chain.
+    bit_true_beats: [u64; NUM_TEAMS],
+    /// Sampling thresholds over `u32`: `win_threshold[a][b]` is
+    /// `P(a beats b) * 2^32`, so drawing an outcome is one integer compare
+    /// against a `u32` from the RNG instead of a float conversion and compare.
+    pub win_threshold: [[u32; NUM_TEAMS]; NUM_TEAMS],
 }
 
 impl TournamentInfo {
@@ -173,6 +205,30 @@ impl TournamentInfo {
         let prob_cache = ProbabilityCache::new(&teams);
         let advancement = AdvancementModel::new(&r1_teams, &prob_cache);
 
+        let mut bit_true_beats = [0u64; NUM_TEAMS];
+        for w in 0..NUM_TEAMS {
+            for l in 0..NUM_TEAMS {
+                let same_region = region_rank[w] == region_rank[l];
+                let w_is_true = if same_region {
+                    seed_of[w] < seed_of[l]
+                } else {
+                    region_rank[w] < region_rank[l]
+                };
+                if w_is_true {
+                    bit_true_beats[w] |= 1u64 << l;
+                }
+            }
+        }
+
+        let mut win_threshold = [[0u32; NUM_TEAMS]; NUM_TEAMS];
+        for a in 0..NUM_TEAMS {
+            for b in 0..NUM_TEAMS {
+                let p = prob_cache.get(a as u8, b as u8).clamp(0.0, 1.0);
+                // `p * 2^32` saturated to `u32::MAX`, so p == 1.0 always wins.
+                win_threshold[a][b] = (p * 4_294_967_296.0).min(u32::MAX as f64) as u32;
+            }
+        }
+
         Ok(TournamentInfo {
             teams,
             team_lookup,
@@ -182,6 +238,8 @@ impl TournamentInfo {
             region_rank,
             r1_teams,
             r1_game_of_team,
+            bit_true_beats,
+            win_threshold,
         })
     }
 
@@ -208,16 +266,9 @@ impl TournamentInfo {
     /// Final Four and the final) it is the alphabetically earlier region. This
     /// is the single definition of the encoding — everything that reads or
     /// writes a bracket bit goes through here or through `winner_bit`.
-    #[inline]
+    #[inline(always)]
     pub fn bit_true_winner(&self, a: u8, b: u8) -> u8 {
-        let (ra, rb) = (self.region_rank[a as usize], self.region_rank[b as usize]);
-        if ra == rb {
-            if self.seed_of[a as usize] < self.seed_of[b as usize] {
-                a
-            } else {
-                b
-            }
-        } else if ra < rb {
+        if self.winner_bit(a, b) {
             a
         } else {
             b
@@ -225,9 +276,9 @@ impl TournamentInfo {
     }
 
     /// The bit value that makes `winner` beat `loser`.
-    #[inline]
+    #[inline(always)]
     pub fn winner_bit(&self, winner: u8, loser: u8) -> bool {
-        self.bit_true_winner(winner, loser) == winner
+        self.bit_true_beats[winner as usize] >> loser & 1 != 0
     }
 
     /// Decode a 63-bit bracket into the winning team index of each game.
