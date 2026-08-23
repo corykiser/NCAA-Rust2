@@ -282,21 +282,69 @@ that the model is cheap enough to re-fit from any source of scores, which is why
 the margin form (E) is the one to build rather than the possession form (F) — the
 possession form would strand you on Torvik specifically.
 
-## What I would actually do
+## What was built
 
-1. Add `src/ratings.rs`: accumulate the ridge normal equations over the game log
-   the ingest layer already produces, solve once, expose adjusted offence,
-   defence and tempo per team. Feed `Team.rating` with
-   `75 + 0.802 · adjEM_points`. `ProbabilityCache` does not change.
-2. Set the home term from the fit rather than the constant, and keep the neutral
-   handling as it is.
-3. Keep the Elo path behind `--ratings elo` so the two can be raced on the same
-   field, the way the heuristic optimizers still print their gap to the exact DP.
-4. Add the carryover prior only if you want December ratings.
-5. Port the backtest itself — `analysis/win-probability/` is Python, and the
-   comparison it does (walk-forward, leave-one-season-out calibration, log loss
-   and Brier on three populations) belongs in `bench` so a rating change can be
+Items 1 and 2 are implemented, in `src/ratings.rs`, behind `--ratings`:
+
+- **`adjusted` (the default)** — the ridge fit on margin, with the home term
+  estimated rather than assumed and the link scale fitted. `ProbabilityCache`
+  is untouched: `RATING_538_PER_POINT` is derived so that the cache's existing
+  `10^(-diff * 30.464/400)` reproduces the fitted logistic exactly.
+- **`elo`** — the old model, kept so the change can be re-measured on any field
+  rather than taken from this document.
+- **`seed`** — the backup. Sixteen numbers, no game data, and it engages
+  automatically with a loud banner whenever the chosen model cannot be produced:
+  a dead feed, an unplayed season, a degenerate fit. Picking it explicitly skips
+  the game fetch entirely.
+
+Sanity check on real data, 2025-26: the fit's top three are Michigan, Duke,
+Arizona and its home edge is +2.96 points. Torvik's published T-Rank for the same
+season has the same top three, and nine seasons of fitted home edges average
+3.09. The 2026 Final Four the three models pick from the same bracket is a fair
+picture of the difference between them — `adjusted` takes Duke, Illinois,
+Gonzaga, Michigan; `elo` takes an 11-seed and a 5-seed; `seed` takes all four
+1-seeds.
+
+One trap worth naming: **expected-score numbers are not comparable across rating
+models.** Elo reports a *higher* expected score on the same bracket, because it
+is flatter and more confident about upsets, not because it is more right. Only
+out-of-sample log loss orders the models.
+
+### Performance
+
+The rating fit runs once per invocation, before any optimization, so its cost is
+amortized over the whole portfolio search. Keeping it that way is what
+`bench ratings` is for.
+
+| | |
+|---|---|
+| Fit, 360 teams / 5,562 games | **10.8 ms** |
+| Seed rating lookup | 11 ns |
+| Whole run: 5-bracket portfolio, `exact-basis`, cached game log | ~1.1 s |
+
+The design matrix is never formed. Each game touches exactly three columns, so
+accumulating the normal equations is O(games) rather than O(games x teams); the
+cost is one Cholesky over the resulting 366x366 system. Splitting that
+factorization's dot product across four accumulators took it from 17.7 ms to
+10.8 ms — a single-accumulator reduction is a serial dependency chain that LLVM
+will not reassociate on its own, and the fixed summation order keeps the fit
+bit-for-bit reproducible.
+
+Below that there is nothing worth chasing. The fit is ~1% of a portfolio run,
+and the structures that actually matter for bracket generation were already
+memoized before this change: `ProbabilityCache` is a precomputed 64x64 table of
+`f64` that fits in L2, and `AdvancementModel` derives from it once. Ratings enter
+that table and then never appear in a hot loop again. Caching the fit to disk
+would trade a real invalidation bug for eleven milliseconds.
+
+## What is left
+
+3. Add the carryover prior if you want December ratings — 0.04 of log loss in
+   the first six weeks, 0.0004 by March.
+4. Port the backtest into `bench`. `analysis/win-probability/` is Python, and the
+   comparison it does — walk-forward, leave-one-season-out calibration, log loss
+   and Brier on three populations — belongs where a rating change can be
    evaluated the way an optimizer change already is.
 
-Steps 1-2 are the whole win. Everything after them is inside the noise of 600
-tournament games, which is all the tournament games that exist.
+Everything else in this document is inside the noise of 600 tournament games,
+which is all the tournament games that exist.

@@ -113,6 +113,55 @@ impl ProbabilityCache {
     }
 }
 
+/// Where a field's ratings come from.
+///
+/// One field, three interchangeable rating models, so `--ratings` can race them
+/// against each other without duplicating the construction path.
+pub enum RatingSource<'a> {
+    /// Opponent-adjusted least squares over the season game log. The default,
+    /// and 0.065 of tournament log loss better than Elo.
+    Adjusted(&'a crate::ratings::RidgeRatings),
+    /// Elo, kept so the change can be measured rather than asserted.
+    Elo(&'a EloSystem),
+    /// Seed alone. The backup when no usable game log can be had — degraded
+    /// (0.562 against 0.544) but still better than the Elo path it replaces.
+    Seed,
+}
+
+impl RatingSource<'_> {
+    /// The team's rating on the 538 scale, or why it could not be found.
+    fn rating_for(&self, team: &BracketTeam) -> Result<f32, String> {
+        match self {
+            RatingSource::Adjusted(r) => r
+                .rating_538_for_name(&team.team_name)
+                .map_err(|e| e.to_string()),
+            RatingSource::Elo(elo) => elo
+                .find_team_by_name(&team.team_name)
+                .map(|rated| elo.to_538_scale(&rated.team_id))
+                .map_err(|e| e.to_string()),
+            RatingSource::Seed => crate::ratings::seed_rating_538(team.seed),
+        }
+    }
+
+    pub fn describe(&self) -> &'static str {
+        match self {
+            RatingSource::Adjusted(_) => "opponent-adjusted least squares",
+            RatingSource::Elo(_) => "ELO",
+            RatingSource::Seed => "seed only (no game data)",
+        }
+    }
+}
+
+/// A rated field, plus the teams that had to fall back to their seed.
+#[derive(Debug)]
+pub struct RatedField {
+    pub info: TournamentInfo,
+    /// Formatted lines, one per team rated from its seed. Empty on a clean run;
+    /// printed loudly when it is not, because a silent fallback is the failure
+    /// mode this codebase most wants to avoid.
+    pub fell_back: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct TournamentInfo {
     pub teams: Vec<RcTeam>,
@@ -419,15 +468,53 @@ impl TournamentInfo {
         bracket_teams: Vec<BracketTeam>,
         region_layout: &[String; 4],
     ) -> Result<TournamentInfo, String> {
+        TournamentInfo::from_rating_source_with_layout(
+            &RatingSource::Elo(elo_system),
+            bracket_teams,
+            region_layout,
+            0,
+        )
+        .map(|rated| rated.info)
+    }
+
+    /// Attach ratings from any source to a field.
+    ///
+    /// `max_seed_fallbacks` is how many individual teams may be rated from their
+    /// seed when their name will not resolve against the rating source. A
+    /// handful is a spelling the alias table has not seen; a field full of them
+    /// means the two feeds disagree systematically, and rating the whole
+    /// tournament off seed numbers while claiming to have used a season of games
+    /// is exactly the kind of quiet wrongness this codebase is built to refuse.
+    pub fn from_rating_source_with_layout(
+        source: &RatingSource,
+        bracket_teams: Vec<BracketTeam>,
+        region_layout: &[String; 4],
+        max_seed_fallbacks: usize,
+    ) -> Result<RatedField, String> {
         let mut teams: Vec<RcTeam> = Vec::with_capacity(bracket_teams.len());
         let mut unresolved: Vec<String> = Vec::new();
+        let mut fell_back: Vec<String> = Vec::new();
 
         for (idx, bracket_team) in bracket_teams.iter().enumerate() {
-            let rating = match elo_system.find_team_by_name(&bracket_team.team_name) {
-                Ok(elo_rating) => elo_system.to_538_scale(&elo_rating.team_id),
-                Err(e) => {
-                    unresolved.push(format!("  {}: {}", bracket_team.team_name, e));
-                    0.0
+            let rating = match source.rating_for(bracket_team) {
+                Ok(rating) => rating,
+                Err(why) => {
+                    // Seeds are always available — they come from the same
+                    // bracket listing as the name — so the per-team fallback
+                    // never fails for a reason the field itself can fix.
+                    match crate::ratings::seed_rating_538(bracket_team.seed) {
+                        Ok(rating) if fell_back.len() < max_seed_fallbacks => {
+                            fell_back.push(format!(
+                                "  {} ({} seed): {}",
+                                bracket_team.team_name, bracket_team.seed, why
+                            ));
+                            rating
+                        }
+                        _ => {
+                            unresolved.push(format!("  {}: {}", bracket_team.team_name, why));
+                            0.0
+                        }
+                    }
                 }
             };
 
@@ -442,13 +529,20 @@ impl TournamentInfo {
 
         if !unresolved.is_empty() {
             return Err(format!(
-                "{} bracket team(s) could not be matched to a rating:\n{}",
+                "{} bracket team(s) could not be matched to a rating:\n{}\n\n\
+                 Up to {} of these can be rated from their seed instead; past \
+                 that the two feeds disagree systematically and the ratings \
+                 would be wrong in a way nothing downstream could detect.",
                 unresolved.len(),
-                unresolved.join("\n")
+                unresolved.join("\n"),
+                max_seed_fallbacks,
             ));
         }
 
-        TournamentInfo::from_teams_with_layout(teams, region_layout)
+        Ok(RatedField {
+            info: TournamentInfo::from_teams_with_layout(teams, region_layout)?,
+            fell_back,
+        })
     }
 
     /// A sample field, used when no bracket source is available.
@@ -640,6 +734,111 @@ pub mod tests {
             }
         }
         teams
+    }
+
+    fn bracket_field() -> Vec<BracketTeam> {
+        let mut teams = Vec::new();
+        for region in REGION_ORDER.iter() {
+            for seed in 1..=16 {
+                // Zero-padded on purpose: "East 1" is a prefix of "East 10",
+                // and `names::resolve` matches on prefixes, so unpadded names
+                // would make this test measure the resolver rather than the
+                // fallback cap.
+                teams.push(BracketTeam::new(
+                    format!("{}-{}", region, seed),
+                    format!("{} {:02}", region, seed),
+                    seed,
+                    region.to_string(),
+                ));
+            }
+        }
+        teams
+    }
+
+    /// The whole point of the seed source: a field with no game data behind it
+    /// still produces a legal tournament with the favourite favoured.
+    #[test]
+    fn the_seed_source_rates_a_field_with_no_game_data() {
+        let layout = REGION_ORDER.map(|r| r.to_string());
+        let rated = TournamentInfo::from_rating_source_with_layout(
+            &RatingSource::Seed,
+            bracket_field(),
+            &layout,
+            0,
+        )
+        .expect("seeds are always available");
+        assert!(rated.fell_back.is_empty(), "seeds never fall back");
+
+        let one = rated.info.team_lookup[&("East".to_string(), 1)].clone();
+        let sixteen = rated.info.team_lookup[&("East".to_string(), 16)].clone();
+        let p = rated
+            .info
+            .prob_cache
+            .get(one.team_index, sixteen.team_index);
+        assert!(p > 0.9 && p < 0.995, "1 over 16: {}", p);
+    }
+
+    /// A name the rating source has never heard of falls back to its seed, up to
+    /// the cap — and past the cap the whole field is refused rather than quietly
+    /// rated off seed numbers while claiming a season of games.
+    #[test]
+    fn unresolvable_names_fall_back_to_seed_only_up_to_the_cap() {
+        let layout = REGION_ORDER.map(|r| r.to_string());
+        let empty = crate::ratings::fit(&[], crate::ratings::RIDGE_LAMBDA);
+        assert!(empty.is_err(), "an empty log cannot be fitted");
+
+        // A fit that knows exactly one team: every other name is unresolvable.
+        let games = vec![crate::game_result::GameResult {
+            game_id: "g".into(),
+            date: chrono::NaiveDate::from_ymd_opt(2025, 11, 3).unwrap(),
+            home_team_id: "east01".into(),
+            home_team_name: "East 01".into(),
+            away_team_id: "west01".into(),
+            away_team_name: "West 01".into(),
+            home_score: 80,
+            away_score: 70,
+            is_neutral_site: true,
+            is_conference_game: false,
+            is_completed: true,
+        }];
+        let fit = crate::ratings::fit(&games, crate::ratings::RIDGE_LAMBDA).expect("fits");
+
+        let capped = TournamentInfo::from_rating_source_with_layout(
+            &RatingSource::Adjusted(&fit),
+            bracket_field(),
+            &layout,
+            4,
+        );
+        let err = capped.expect_err("62 unresolvable names is a systematic failure");
+        assert!(err.contains("could not be matched"), "{}", err);
+
+        // With room for all of them, every unresolved team is reported by name.
+        let permissive = TournamentInfo::from_rating_source_with_layout(
+            &RatingSource::Adjusted(&fit),
+            bracket_field(),
+            &layout,
+            64,
+        )
+        .expect("everything falls back");
+        // Not an exact count: `names::resolve` also matches on substrings, so
+        // "Midwest 01" resolves to the rated "West 01" too. What matters is that
+        // the overwhelming majority fell back and that a team the fit actually
+        // knows kept its rating.
+        assert!(
+            permissive.fell_back.len() >= 60,
+            "nearly the whole field should fall back, got {}",
+            permissive.fell_back.len()
+        );
+        assert!(
+            !permissive
+                .fell_back
+                .iter()
+                // The prefix, not a `contains`: every other line names "East 01"
+                // as a suggestion.
+                .any(|line| line.trim_start().starts_with("East 01 ")),
+            "a team the fit knows keeps its rating: {:?}",
+            permissive.fell_back
+        );
     }
 
     /// The Final Four pairing decides which regions can meet, so the layout
