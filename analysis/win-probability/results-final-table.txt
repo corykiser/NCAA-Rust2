@@ -51,3 +51,23 @@ F. Ridge adjusted efficiency      +0.0000  [+0.0000, +0.0000]
 G. F + preseason carryover        +0.0004  [-0.0059, +0.0064]
 H. LightGBM on 19 features        -0.0028  [-0.0179, +0.0124]
 I. Torvik's published T-Rank      -0.0037  [-0.0128, +0.0062]
+F: real per-game tempo done
+F: constant tempo 68 done
+E: ridge on margin only done
+E: ridge on margin, no cap done
+
+== late ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+F: real per-game tempo              32571   0.56359  0.19202  0.7022
+F: constant tempo 68                32571   0.56375  0.19214  0.7026
+E: ridge on margin only             32571   0.56522  0.19261  0.7019
+E: ridge on margin, no cap          32571   0.56372  0.19213  0.7023
+
+== tourney ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+F: real per-game tempo                600   0.54363  0.18497  0.7083
+F: constant tempo 68                  600   0.54473  0.18555  0.7100
+E: ridge on margin only               600   0.54774  0.18555  0.7117
+E: ridge on margin, no cap            600   0.54400  0.18521  0.7100

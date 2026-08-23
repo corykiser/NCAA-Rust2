@@ -58,21 +58,40 @@ from A to F is fifteen times the distance from F to a tuned LightGBM.
 
 ## The ranking
 
-### 1. Replace the rating with opponent-adjusted efficiency (F)
+### 1. Replace the rating with an opponent-adjusted least-squares fit (E/F)
 
-Two ratings per team — offence and defence, in points per possession — plus one
-home term, fitted by ridge least squares over the season's games:
+Two forms of the same idea, and the cheaper one is the one to build.
+
+**Build this (E).** One rating per team in points, plus one home term, fitted by
+ridge least squares on game margin:
+
+```
+margin(game) = R[a] - R[b] + home·h
+```
+
+0.5440 on tournament games with no margin cap. It needs **date, teams, site and
+score** — a strict subset of the columns `torvik.rs` already parses. No new feed,
+no new column, no possession estimate.
+
+**The efficiency split (F) is a display feature, not an accuracy feature.**
+
+Splitting each team into offence and defence in points per possession —
 
 ```
 points_for(team, game) / possessions = mean + off[team] + def[opponent] + home·h
 ```
 
-Solve `(X'X + λI)β = X'y` once (λ ≈ 1, and the result is flat between 0.5 and 2;
-λ ≥ 8 is where it starts to hurt), then
+— scores 0.5432, which is 0.0008 better than E and nowhere near significant. It
+is worth building if you want to *print* adjO/adjD/tempo the way T-Rank does; it
+is not worth building for the probabilities. It also does not need the tempo
+column to work: substituting a constant 68 possessions for the real per-game
+tempo costs 0.0011 (0.5447 vs 0.5436), so the extra column buys nothing either.
+
+Either way, solve `(X'X + λI)β = X'y` once — λ ≈ 1, flat between 0.5 and 2, and
+λ ≥ 8 is where it starts to hurt — then
 
 ```
-E[margin] = ((off_a - def_a) - (off_b - def_b)) · expected_possessions
-P(a wins)  = 1 / (1 + exp(-E[margin] / 7.11))
+P(a wins) = 1 / (1 + exp(-E[margin] / 7.11))
 ```
 
 The design matrix is 2·N+1 columns for N teams, the normal equations accumulate
@@ -162,20 +181,23 @@ FiveThirtyEight *packaging* of margin is not what is doing the work.
 
 ### 5. Consuming Torvik's published ratings instead of computing your own
 
-`trank.php?year=YYYY&begin=…&end=…&csv=1` returns adjOE, adjDE, barthag and
-tempo for every team as of any date, and it is the best single number in the
-table (0.5397). It is free but not quite keyless: the endpoint sits behind a JS
-challenge that a `POST js_test_submitted=1` satisfies, after which the cookie
-lets a normal `GET` through. `getgamestats.php`, which the repo already uses, has
-no such gate.
+Torvik's ratings are the best single number in the table (0.5397), and there are
+two ways to get them. `trank.php?year=YYYY&begin=…&end=…&csv=1` takes an
+arbitrary date range — which is what made the backtest possible — but sits behind
+a JS challenge that a `POST js_test_submitted=1` satisfies before a normal `GET`
+gets through. `barttorvik.com/YYYY_team_results.csv` is a plain static file with
+no gate at all (verified 200, 215 KB, header row, `adjoe`/`adjde`/`barthag`/`adjt`
+for 365 teams); it carries whatever games have been played when you fetch it,
+which for live use on Selection Sunday is exactly what you want.
 
-So this is a trade: 0.0035 of log loss (not significant) in exchange for a
-fragile handshake, a second failure mode, and no control over the model. Compute
-your own. It is worth knowing the endpoint exists as a cross-check.
+So this is a trade: 0.0035 of log loss (not significant) in exchange for a second
+endpoint, a second name-resolution problem, and no control over the model.
+Compute your own; keep `YYYY_team_results.csv` in your pocket as a cross-check
+and as a fallback if the game log ever breaks.
 
-Also worth knowing: `barttorvik.com/YYYY_super_sked.csv` is a static, ungated CSV
-carrying Torvik's own pregame predictions for every game — a ready-made oracle to
-score any future model against.
+Also worth knowing: `barttorvik.com/YYYY_super_sked.csv` is another static,
+ungated CSV, carrying Torvik's own pregame predictions for every game — a
+ready-made oracle to score any future model against.
 
 ### 6. Gradient-boosted trees — measurable, but not worth it here
 
@@ -223,6 +245,42 @@ Reporting these because each is a plausible idea that costs real code.
   Blending with the Elo signal made things worse. The components are not
   independent — they are three renderings of the same game log.
 - **Probit instead of logistic.** 0.5431 vs 0.5432. Pick either.
+
+## Will the data be there for the 2027 tournament?
+
+The recommended model needs **date, teams, site (H/A/N) and score** — nothing the
+repo does not already fetch and parse for Elo. Adopting it adds no new feed, no
+new endpoint and no new column, so its availability risk is exactly the
+availability risk the repo already carries.
+
+Checked rather than assumed, on the day this was written:
+
+- `getgamestats.php?year=YYYY&csv=1` answers **200 with no key, no cookie and no
+  JS challenge**, 4.9 MB for a full season. The JS gate is on `trank.php`, not
+  here.
+- The layout has been **31 columns in all eleven seasons from 2016 through 2026**,
+  with tempo pinned at column 23 the whole way. The model reads columns 0, 2, 4,
+  5 and 6, all of which `torvik.rs` already reads.
+- `year=2027` currently returns 200 with **zero bytes**, because the season has
+  not started. `parse_game_log` already turns that into a "no parsable games"
+  error rather than an empty season, which is the right behaviour.
+- The log is populated live through the season, so by Selection Sunday 2027 it
+  will hold the full regular season and the conference tournaments.
+
+What could actually go wrong, and what happens if it does:
+
+| failure | likelihood | what it costs |
+|---|---|---|
+| Torvik puts `getgamestats.php` behind the same JS gate as `trank.php` | plausible — the site demonstrably does this elsewhere | a `POST js_test_submitted=1` then `GET` with the cookie gets through; that is how the backtest read `trank.php` |
+| Column layout moves | low — stable 11 seasons | `parse_game_log`'s "more than 10% of rows unparsable" guard already fails loudly instead of producing quietly wrong ratings |
+| Torvik stops publishing entirely | low, but it is one person's website with no SLA | fall back to the NCAA or ESPN feed already in `api.rs`. The margin fit needs only scores, so it survives the switch — but neither scoreboard marks neutral-site games, so ~12% of games would lose their home term |
+| Ratings needed without the game log at all | — | `barttorvik.com/YYYY_team_results.csv`, static and ungated, carries adjOE/adjDE/barthag/tempo directly |
+
+The one honest caveat: this is a single volunteer-run site, and every free
+alternative for college basketball is in the same position. The mitigation is
+that the model is cheap enough to re-fit from any source of scores, which is why
+the margin form (E) is the one to build rather than the possession form (F) — the
+possession form would strand you on Torvik specifically.
 
 ## What I would actually do
 
