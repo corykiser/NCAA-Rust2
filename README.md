@@ -7,7 +7,7 @@ portfolios.
 ## Features
 
 - **Exact single-bracket solver**: the highest-expected-value bracket, proven optimal, in milliseconds
-- **Multiple Data Sources**: ESPN API, NCAA API, or FiveThirtyEight CSV files
+- **Free data sources, no API keys**: BartTorvik season game logs, the NCAA's own API, or ESPN
 - **Genetic Algorithm Optimization**: Population-based evolution with Team-Round mutation and crossover
 - **Portfolio Optimization**: Generate diverse bracket portfolios optimized for best-ball scoring
 - **Monte Carlo Simulation**: Score brackets against thousands of simulated tournament outcomes
@@ -165,7 +165,7 @@ cargo build --release
 
 ## Usage
 
-### Basic Usage (ESPN API)
+### Basic Usage
 
 ```bash
 # Generate a 5-bracket portfolio (exact basis + coordinate ascent, the default)
@@ -175,11 +175,52 @@ cargo run --release -- --portfolio 5 --portfolio-strategy ga-whole --generations
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-sequential --generations 200 --pool-size 10000
 ```
 
-### Using CSV Data
+### Data Sources
+
+Everything the optimizer needs is free and needs no key or account.
+
+| `--source` | Where it comes from | How it fetches | Notes |
+|---|---|---|---|
+| `torvik` (default) | `barttorvik.com` season game log | One CSV request for the whole season | Marks neutral-site games |
+| `ncaa` | `ncaa-api.henrygd.me` scoreboard | One request per day, ~158 per season | Official results; no neutral-site flag |
+| `espn` | `site.api.espn.com` scoreboard | One request per day | Frequently answers `403` to cloud and datacenter IPs |
+| `csv` | Bundled `fivethirtyeight_ncaa_forecasts.csv` | Local file | **Frozen 2023 data.** FiveThirtyEight shut down in 2025 |
+
+`--source` only decides where *ratings* come from. Two other feeds are used
+regardless, and both are also free:
+
+- **The field**: `ncaa-api.henrygd.me/brackets/basketball-men/d1/{year}` — the
+  NCAA's published bracket, with every seed, the region names, and the Final
+  Four pairing. Fetched automatically for `--tournament-year`.
+- **The opposing pool**: ESPN Tournament Challenge pick rates, via
+  `--fetch-picks {year}` (see [Objectives](#objectives)).
+
+The 2023 CSV is kept because the tests and `bench` run against a real, fixed
+field. It is not a data source for a current bracket — 538's endpoints now
+redirect to abcnews.com.
 
 ```bash
-cargo run --release -- --source csv --csv-path fivethirtyeight_ncaa_forecasts.csv --portfolio 5
+# Ratings from the NCAA's own API instead of Torvik
+cargo run --release -- --source ncaa --portfolio 5
 ```
+
+### A Season Start to Finish
+
+```bash
+# November through Selection Sunday: ratings only, refreshed as games are played
+cargo run --release -- --elo-only
+
+# Selection Sunday onward: the real field, once the NCAA publishes it
+cargo run --release -- --tournament-year 2027
+
+# With the public's picks, optimizing for actually winning your pool
+cargo run --release -- --tournament-year 2027 --portfolio 3 \
+    --objective first-place --fetch-picks 2027 --pool-entries 200
+```
+
+The season string defaults to the current one (`2026-2027` from July 2026
+onward), and the tournament year is derived from it. Before November the game
+log is empty and the tool says so rather than producing ratings from nothing.
 
 ### Key Options
 
@@ -191,7 +232,7 @@ cargo run --release -- --source csv --csv-path fivethirtyeight_ncaa_forecasts.cs
 | `--lock-team` | Pin a team to a round, e.g. `"Duke:FinalFour"` (repeatable) | - |
 | `--generations N` | GA generations per optimization | 200 |
 | `--pool-size N` | Number of Monte Carlo scenarios | 10000 |
-| `--source` | Data source: `espn`, `ncaa`, or `csv` | `espn` |
+| `--source` | Ratings source: `torvik`, `ncaa`, `espn`, or `csv` | `torvik` |
 | `--allow-partial-data` | Proceed despite missing game data (see below) | false |
 | `--verbose` | Show detailed progress | false |
 
@@ -275,7 +316,9 @@ src/
 ├── ingest.rs        # Data loading, field validation, team ratings
 ├── names.rs         # Deterministic team-name resolution
 ├── elo.rs           # ELO rating calculations
-├── api.rs           # ESPN/NCAA API clients
+├── api.rs           # HTTP clients, caching, and the per-day scoreboard sources
+├── torvik.rs        # BartTorvik season game log (the default ratings source)
+├── ncaa_bracket.rs  # The NCAA's published bracket: field, seeds, regions, FF pairing
 ├── portfolio.rs     # Portfolio management and constrained brackets
 ├── anneal.rs        # Simulated annealing optimizer
 └── config.rs        # YAML configuration

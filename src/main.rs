@@ -9,12 +9,14 @@ mod field;
 mod ga;
 mod game_result;
 mod ingest;
+mod ncaa_bracket;
 mod names;
 mod optimize;
 mod picks;
 mod pool;
 mod portfolio;
 mod score;
+mod torvik;
 mod tree;
 
 use bracket::{ScoringConfig, SeedScoring};
@@ -31,11 +33,13 @@ use std::process::ExitCode;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum DataSourceArg {
-    /// Use ESPN API for live game data
-    Espn,
-    /// Use NCAA API (henrygd) for live game data
+    /// BartTorvik season game log — one request, free, no key (default)
+    Torvik,
+    /// NCAA API (henrygd) scoreboard, fetched day by day
     Ncaa,
-    /// Use FiveThirtyEight CSV file (legacy)
+    /// ESPN API scoreboard, fetched day by day
+    Espn,
+    /// Frozen FiveThirtyEight CSV — 2023 only; 538 shut down in 2025
     Csv,
 }
 
@@ -83,7 +87,7 @@ enum OptimizationMode {
 #[command(about = "Optimizes March Madness brackets using ELO ratings and genetic algorithms")]
 struct Args {
     /// Data source for team ratings
-    #[arg(short, long, value_enum, default_value = "espn")]
+    #[arg(short, long, value_enum, default_value = "torvik")]
     source: DataSourceArg,
 
     /// Season to analyze (e.g., 2024-2025)
@@ -100,7 +104,7 @@ struct Args {
     #[arg(long)]
     bracket_file: Option<String>,
 
-    /// Path to FiveThirtyEight CSV file (only used with --source csv)
+    /// Path to the frozen FiveThirtyEight CSV (only used with --source csv)
     #[arg(long, default_value = "fivethirtyeight_ncaa_forecasts.csv")]
     csv_path: String,
 
@@ -434,12 +438,18 @@ fn load_tournament(args: &Args) -> Result<Option<ingest::TournamentInfo>, String
     match args.source {
         DataSourceArg::Csv => {
             println!("Loading data from CSV file: {}", args.csv_path);
+            println!(
+                "Note: FiveThirtyEight shut down in 2025 and this file is a \
+                 frozen 2023 snapshot. It is here for tests and benchmarks, \
+                 not for picking a 2027 bracket."
+            );
             Ok(Some(ingest::TournamentInfo::initialize(&args.csv_path)?))
         }
-        DataSourceArg::Espn | DataSourceArg::Ncaa => {
+        DataSourceArg::Espn | DataSourceArg::Ncaa | DataSourceArg::Torvik => {
             let source = match args.source {
                 DataSourceArg::Espn => api::DataSource::ESPN,
                 DataSourceArg::Ncaa => api::DataSource::NCAA,
+                DataSourceArg::Torvik => api::DataSource::Torvik,
                 DataSourceArg::Csv => unreachable!(),
             };
 
@@ -457,8 +467,8 @@ fn load_tournament(args: &Args) -> Result<Option<ingest::TournamentInfo>, String
             let mut games = client.fetch_season(&args.season).map_err(|e| {
                 format!(
                     "could not fetch game data: {}\n\
-                     Ratings cannot be computed without games. Retry, or run \
-                     `--source csv` to use the bundled FiveThirtyEight ratings.",
+                     Ratings cannot be computed without games. Retry, or try \
+                     another free source: `--source torvik`, `--source ncaa`.",
                     e
                 )
             })?;
@@ -486,25 +496,37 @@ fn load_tournament(args: &Args) -> Result<Option<ingest::TournamentInfo>, String
             }
 
             println!();
-            let bracket_teams = load_bracket_teams(args, &client)?;
+            let field = load_bracket_teams(args, &client)?;
 
-            Ok(Some(ingest::TournamentInfo::from_elo_ratings(
+            Ok(Some(ingest::TournamentInfo::from_elo_ratings_with_layout(
                 &elo_system,
-                bracket_teams,
+                field.teams,
+                &field.region_layout,
             )?))
         }
     }
 }
 
+/// The four regions in the order `TournamentInfo` places them when the real
+/// pairing is unknown — a bracket file or the sample field.
+fn default_region_layout() -> [String; 4] {
+    tree::REGION_ORDER.map(|r| r.to_string())
+}
+
 fn load_bracket_teams(
     args: &Args,
     client: &api::ApiClient,
-) -> Result<Vec<game_result::BracketTeam>, String> {
+) -> Result<ncaa_bracket::BracketField, String> {
     if let Some(ref bracket_path) = args.bracket_file {
         println!("Loading bracket from file: {}", bracket_path);
         let teams = api::load_bracket_from_file(bracket_path)?;
         println!("Loaded {} teams from bracket file", teams.len());
-        return Ok(teams);
+        // A bracket file carries no Final Four pairing, so the regions are
+        // paired in the order they are listed.
+        return Ok(ncaa_bracket::BracketField {
+            teams,
+            region_layout: default_region_layout(),
+        });
     }
 
     // An explicit --tournament-year is a request for that specific bracket, so
@@ -525,17 +547,23 @@ fn load_bracket_teams(
         Some(year) => {
             println!("Fetching {} tournament bracket (derived from season)...", year);
             match client.fetch_tournament_bracket(year) {
-                Ok(teams) => Ok(teams),
+                Ok(field) => Ok(field),
                 Err(e) => {
                     eprintln!("Note: {}", e);
                     println!("Using sample bracket teams");
-                    Ok(ingest::TournamentInfo::sample_bracket_teams())
+                    Ok(ncaa_bracket::BracketField {
+                        teams: ingest::TournamentInfo::sample_bracket_teams(),
+                        region_layout: default_region_layout(),
+                    })
                 }
             }
         }
         None => {
             println!("Using sample bracket teams");
-            Ok(ingest::TournamentInfo::sample_bracket_teams())
+            Ok(ncaa_bracket::BracketField {
+                teams: ingest::TournamentInfo::sample_bracket_teams(),
+                region_layout: default_region_layout(),
+            })
         }
     }
 }

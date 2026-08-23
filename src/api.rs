@@ -2,6 +2,8 @@
 // to calculate ELO ratings for NCAA basketball teams
 
 use crate::game_result::{BracketTeam, GameCache, GameResult, TeamInfo};
+use crate::ncaa_bracket::{self, BracketField};
+use crate::torvik;
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,14 +19,22 @@ pub struct BracketCache {
     pub tournament_year: i32,
     pub last_updated: chrono::DateTime<chrono::Utc>,
     pub teams: Vec<BracketTeam>,
+    /// Absent in caches written before the Final Four pairing was recorded.
+    #[serde(default)]
+    pub region_layout: Option<[String; 4]>,
 }
 
 impl BracketCache {
-    pub fn new(tournament_year: i32, teams: Vec<BracketTeam>) -> Self {
+    pub fn new(
+        tournament_year: i32,
+        teams: Vec<BracketTeam>,
+        region_layout: [String; 4],
+    ) -> Self {
         BracketCache {
             tournament_year,
             last_updated: chrono::Utc::now(),
             teams,
+            region_layout: Some(region_layout),
         }
     }
 }
@@ -34,6 +44,8 @@ impl BracketCache {
 pub enum DataSource {
     ESPN,
     NCAA,
+    /// BartTorvik's season game log — one request for the whole season.
+    Torvik,
 }
 
 /// ESPN API base URL
@@ -41,6 +53,13 @@ const ESPN_BASE_URL: &str = "http://site.api.espn.com/apis/site/v2/sports/basket
 
 /// NCAA API base URL (henrygd)
 const NCAA_BASE_URL: &str = "https://ncaa-api.henrygd.me";
+
+/// Consecutive failed days from the very start of a season that mean the
+/// source is unavailable rather than the schedule being empty.
+const GIVE_UP_AFTER_CONSECUTIVE_FAILURES: usize = 8;
+
+/// Number of times a transient fetch is retried before the day is failed.
+const FETCH_ATTEMPTS: u32 = 3;
 
 /// Rate limit delay in milliseconds (for NCAA API: 5 req/sec max)
 const RATE_LIMIT_DELAY_MS: u64 = 250;
@@ -79,6 +98,13 @@ impl ApiClient {
         match self.source {
             DataSource::ESPN => self.fetch_espn_teams(),
             DataSource::NCAA => self.fetch_ncaa_teams(),
+            // Torvik's game log names every team it reports; there is no
+            // separate roster endpoint to ask.
+            DataSource::Torvik => Err(
+                "the barttorvik source has no team endpoint — team names come \
+                 from the game log"
+                    .to_string(),
+            ),
         }
     }
 
@@ -136,7 +162,97 @@ impl ApiClient {
         match self.source {
             DataSource::ESPN => self.fetch_espn_games_for_date(date),
             DataSource::NCAA => self.fetch_ncaa_games_for_date(date),
+            DataSource::Torvik => Err(
+                "the barttorvik source fetches a whole season at once; \
+                 there is no per-date endpoint"
+                    .to_string(),
+            ),
         }
+    }
+
+    /// GET a URL and parse it as JSON, retrying transient failures.
+    ///
+    /// A non-2xx response used to be handed straight to `.json()`, so an
+    /// upstream `403` surfaced as "expected value at line 1 column 1" — a
+    /// parse error for an HTML error page, 158 times over, with the actual
+    /// cause nowhere in the output.
+    fn get_json(&self, url: &str) -> Result<Value, String> {
+        let mut last_error = String::new();
+
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(500 * (1 << attempt)));
+            }
+
+            let response = match self.client.get(url).send() {
+                Ok(response) => response,
+                Err(e) => {
+                    last_error = e.to_string();
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                last_error = match status.as_u16() {
+                    403 => format!(
+                        "HTTP 403 from {} — the host is refusing this client. \
+                         Cloud and datacenter IPs are commonly blocked here; \
+                         try `--source torvik`",
+                        host_of(url)
+                    ),
+                    429 => format!("HTTP 429 from {} — rate limited", host_of(url)),
+                    _ => format!("HTTP {} from {}", status, host_of(url)),
+                };
+                // A refusal is not transient; retrying just multiplies it.
+                if status.as_u16() == 403 || status.as_u16() == 404 {
+                    return Err(last_error);
+                }
+                continue;
+            }
+
+            match response.json::<Value>() {
+                Ok(json) => return Ok(json),
+                Err(e) => last_error = format!("malformed JSON from {}: {}", host_of(url), e),
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// GET a URL as text, retrying transient failures.
+    fn get_text(&self, url: &str) -> Result<String, String> {
+        let mut last_error = String::new();
+
+        for attempt in 0..FETCH_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(500 * (1 << attempt)));
+            }
+
+            let response = match self.client.get(url).send() {
+                Ok(response) => response,
+                Err(e) => {
+                    last_error = e.to_string();
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                last_error = format!("HTTP {} from {}", status, host_of(url));
+                if status.as_u16() == 403 || status.as_u16() == 404 {
+                    return Err(last_error);
+                }
+                continue;
+            }
+
+            match response.text() {
+                Ok(text) => return Ok(text),
+                Err(e) => last_error = format!("could not read {}: {}", host_of(url), e),
+            }
+        }
+
+        Err(last_error)
     }
 
     /// Fetch games from ESPN for a specific date
@@ -147,8 +263,7 @@ impl ApiClient {
             ESPN_BASE_URL, date_str
         );
 
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let json: Value = response.json().map_err(|e| e.to_string())?;
+        let json = self.get_json(&url)?;
 
         let mut games = Vec::new();
 
@@ -246,38 +361,33 @@ impl ApiClient {
     }
 
     /// Fetch games from NCAA API for a specific date
+    ///
+    /// The path segments must be zero-padded: `/2026/03/19`, not `/2026/3/19`.
+    /// An unpadded path is not an error — it returns `200` with an empty game
+    /// list, so every day of the season "succeeded" with nothing in it and the
+    /// season came back as zero games with no failure to report.
     fn fetch_ncaa_games_for_date(&self, date: NaiveDate) -> Result<Vec<GameResult>, String> {
-        let year = date.year();
-        let month = date.month();
-        let day = date.day();
-
-        // NCAA API uses week format for scoreboard
-        // For now, we'll use the schedule endpoint
         let url = format!(
-            "{}/scoreboard/basketball-men/d1/{}/{}",
-            NCAA_BASE_URL, year, month
+            "{}/scoreboard/basketball-men/d1/{}",
+            NCAA_BASE_URL,
+            date.format("%Y/%m/%d")
         );
 
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let json: Value = response.json().map_err(|e| e.to_string())?;
+        let json = self.get_json(&url)?;
+
+        let game_arr = json
+            .get("games")
+            .and_then(|g| g.as_array())
+            .ok_or_else(|| format!("no 'games' array in the response for {}", date))?;
 
         let mut games = Vec::new();
-
-        if let Some(game_arr) = json.get("games").and_then(|g| g.as_array()) {
-            for game_data in game_arr {
-                if let Some(game_obj) = game_data.get("game") {
-                    // Parse game date
-                    if let Some(game_date_str) = game_obj.get("startDate").and_then(|d| d.as_str()) {
-                        // Check if this game is on the requested date
-                        if let Ok(game_date) = NaiveDate::parse_from_str(&game_date_str[..10], "%m-%d-%Y") {
-                            if game_date.day() == day {
-                                if let Some(game) = self.parse_ncaa_game(game_obj, game_date) {
-                                    games.push(game);
-                                }
-                            }
-                        }
-                    }
-                }
+        for game_data in game_arr {
+            let game_obj = match game_data.get("game") {
+                Some(game_obj) => game_obj,
+                None => continue,
+            };
+            if let Some(game) = self.parse_ncaa_game(game_obj, date) {
+                games.push(game);
             }
         }
 
@@ -289,39 +399,7 @@ impl ApiClient {
 
     /// Parse a single NCAA API game into a GameResult
     fn parse_ncaa_game(&self, game: &Value, date: NaiveDate) -> Option<GameResult> {
-        let game_id = game.get("gameID")?.as_str()?.to_string();
-
-        // Check if game is final
-        let state = game.get("gameState")?.as_str()?;
-        if state != "final" {
-            return None;
-        }
-
-        // Get home team info
-        let home = game.get("home")?;
-        let home_team_name = home.get("names")?.get("full")?.as_str()?.to_string();
-        let home_team_id = home.get("names")?.get("seo")?.as_str()?.to_string();
-        let home_score: u32 = home.get("score")?.as_str()?.parse().ok()?;
-
-        // Get away team info
-        let away = game.get("away")?;
-        let away_team_name = away.get("names")?.get("full")?.as_str()?.to_string();
-        let away_team_id = away.get("names")?.get("seo")?.as_str()?.to_string();
-        let away_score: u32 = away.get("score")?.as_str()?.parse().ok()?;
-
-        Some(GameResult {
-            game_id,
-            date,
-            home_team_id,
-            home_team_name,
-            away_team_id,
-            away_team_name,
-            home_score,
-            away_score,
-            is_neutral_site: false, // NCAA API doesn't provide this
-            is_conference_game: false, // Would need to check conference
-            is_completed: true,
-        })
+        parse_ncaa_game(game, date)
     }
 
     /// Fetch all games for a date range, reporting which days failed.
@@ -352,6 +430,21 @@ impl ApiClient {
                 Err(e) => failures.push((current_date, e)),
             }
 
+            // A source that is refusing us refuses every day the same way.
+            // Walking the whole season to say so costs minutes and buries the
+            // reason under 158 copies of itself.
+            if failures.len() >= GIVE_UP_AFTER_CONSECUTIVE_FAILURES
+                && failures.len() as i64 == days_processed + 1
+            {
+                println!();
+                eprintln!(
+                    "Giving up after {} days in a row failed — the source is not \
+                     answering, not just missing a day.",
+                    failures.len()
+                );
+                return (all_games, failures);
+            }
+
             days_processed += 1;
             if days_processed % 30 == 0 {
                 println!(" [{}/{}]", days_processed, total_days);
@@ -375,6 +468,10 @@ impl ApiClient {
 
         let start_year: i32 = parts[0].parse().map_err(|_| "Invalid start year")?;
         let end_year: i32 = parts[1].parse().map_err(|_| "Invalid end year")?;
+
+        if self.source == DataSource::Torvik {
+            return self.fetch_season_torvik(season, end_year);
+        }
 
         // College basketball season runs from early November to early April
         let start_date = NaiveDate::from_ymd_opt(start_year, 11, 4).unwrap();
@@ -437,6 +534,48 @@ impl ApiClient {
         Ok(games)
     }
 
+    /// Fetch a whole season from BartTorvik in one request.
+    ///
+    /// `end_year` is the season's ending calendar year — 2027 for 2026-27,
+    /// which is how Torvik labels a season.
+    fn fetch_season_torvik(&self, season: &str, end_year: i32) -> Result<Vec<GameResult>, String> {
+        let cache_path = format!("{}/games_{}.json", self.cache_dir, season);
+        if let Some(cache) = self.load_cache(&cache_path) {
+            if !cache.is_stale(6) {
+                println!(
+                    "Using cached data from {} ({} games)",
+                    cache.last_updated,
+                    cache.games.len()
+                );
+                return Ok(cache.games);
+            }
+            println!("Cache is stale, refreshing...");
+        }
+
+        let url = torvik::season_url(end_year);
+        println!("Fetching the {} season game log from barttorvik.com...", season);
+        let csv_text = self
+            .get_text(&url)
+            .map_err(|e| format!("barttorvik game log for {}: {}", season, e))?;
+
+        if csv_text.trim().is_empty() {
+            return Err(format!(
+                "barttorvik has no games for {} yet. The file fills in as the \
+                 season is played, so this is what an unplayed season looks \
+                 like rather than an outage.",
+                season
+            ));
+        }
+
+        let games = torvik::parse_game_log(&csv_text)?;
+        println!("Fetched {} games total", games.len());
+
+        // An in-progress season is complete by definition — there is no set of
+        // days that failed, only games that have not been played yet.
+        self.save_cache(&cache_path, season, &games)?;
+        Ok(games)
+    }
+
     /// Load cached games from file
     fn load_cache(&self, path: &str) -> Option<GameCache> {
         if Path::new(path).exists() {
@@ -485,175 +624,48 @@ impl ApiClient {
         teams
     }
 
-    /// Fetch tournament bracket for a specific year from ESPN
-    /// tournament_year is the year the tournament ends (e.g., 2024 for March Madness 2024)
-    pub fn fetch_tournament_bracket(&self, tournament_year: i32) -> Result<Vec<BracketTeam>, String> {
-        // Check cache first
+    /// Fetch the tournament field for a year from the NCAA's published bracket.
+    ///
+    /// `tournament_year` is the year the tournament ends: 2027 for March
+    /// Madness 2027. Independent of `--source`, which only decides where the
+    /// ratings come from.
+    pub fn fetch_tournament_bracket(&self, tournament_year: i32) -> Result<BracketField, String> {
         let cache_path = format!("{}/bracket_{}.json", self.cache_dir, tournament_year);
         if let Some(cache) = self.load_bracket_cache(&cache_path) {
-            println!("Using cached bracket from {} ({} teams)", cache.last_updated, cache.teams.len());
-            return Ok(cache.teams);
-        }
-
-        println!("Fetching {} tournament bracket from ESPN...", tournament_year);
-
-        // NCAA Tournament typically runs from mid-March (Selection Sunday ~March 17)
-        // First round games are usually March 21-22
-        // We'll fetch the first round games which have seed information
-        let first_round_start = NaiveDate::from_ymd_opt(tournament_year, 3, 19).unwrap();
-        let first_round_end = NaiveDate::from_ymd_opt(tournament_year, 3, 23).unwrap();
-
-        let mut bracket_teams: HashMap<String, BracketTeam> = HashMap::new();
-
-        // Fetch first round tournament games
-        let mut current_date = first_round_start;
-        while current_date <= first_round_end {
-            if let Ok(teams) = self.fetch_tournament_games_for_date(current_date) {
-                for team in teams {
-                    bracket_teams.insert(team.team_id.clone(), team);
-                }
+            if cache.teams.len() == 64 && cache.region_layout.is_some() {
+                println!(
+                    "Using cached bracket from {} ({} teams)",
+                    cache.last_updated,
+                    cache.teams.len()
+                );
+                return Ok(BracketField {
+                    teams: cache.teams,
+                    region_layout: cache.region_layout.expect("checked above"),
+                });
             }
-            current_date = current_date.succ_opt().unwrap();
-            thread::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS));
+            // A cache from before the bracket was complete, or from the old
+            // scoreboard-scraping path, which had no region layout in it.
+            println!("Cached bracket is incomplete, refetching...");
         }
 
-        // If we didn't get 64 teams from first round, try a wider date range
-        if bracket_teams.len() < 64 {
-            println!("Found {} teams, searching more dates...", bracket_teams.len());
-            let extended_start = NaiveDate::from_ymd_opt(tournament_year, 3, 14).unwrap();
-            let extended_end = NaiveDate::from_ymd_opt(tournament_year, 3, 25).unwrap();
+        println!(
+            "Fetching the {} bracket from the NCAA...",
+            tournament_year
+        );
+        let json = self.get_json(&ncaa_bracket::bracket_url(tournament_year))?;
+        let field = ncaa_bracket::parse_bracket(&json, tournament_year)?;
 
-            let mut current_date = extended_start;
-            while current_date <= extended_end {
-                if let Ok(teams) = self.fetch_tournament_games_for_date(current_date) {
-                    for team in teams {
-                        bracket_teams.insert(team.team_id.clone(), team);
-                    }
-                }
-                current_date = current_date.succ_opt().unwrap();
-                thread::sleep(Duration::from_millis(RATE_LIMIT_DELAY_MS));
-            }
-        }
-
-        let teams: Vec<BracketTeam> = bracket_teams.into_values().collect();
-
-        if teams.len() >= 64 {
-            println!("Found {} tournament teams", teams.len());
-            // Cache the results
-            self.save_bracket_cache(&cache_path, tournament_year, &teams)?;
-            Ok(teams)
-        } else if teams.is_empty() {
-            Err(format!(
-                "Could not fetch bracket for {}. Tournament data may not be available yet.",
-                tournament_year
-            ))
-        } else {
-            println!("Warning: Only found {} teams (expected 64)", teams.len());
-            self.save_bracket_cache(&cache_path, tournament_year, &teams)?;
-            Ok(teams)
-        }
-    }
-
-    /// Fetch tournament games for a specific date and extract bracket team info
-    fn fetch_tournament_games_for_date(&self, date: NaiveDate) -> Result<Vec<BracketTeam>, String> {
-        let date_str = date.format("%Y%m%d").to_string();
-        // Use groups=100 to specifically get NCAA tournament games
-        let url = format!(
-            "{}/scoreboard?dates={}&groups=100&limit=100",
-            ESPN_BASE_URL, date_str
+        println!(
+            "Found {} tournament teams; {} plays {} and {} plays {} in the Final Four",
+            field.teams.len(),
+            field.region_layout[0],
+            field.region_layout[1],
+            field.region_layout[2],
+            field.region_layout[3],
         );
 
-        let response = self.client.get(&url).send().map_err(|e| e.to_string())?;
-        let json: Value = response.json().map_err(|e| e.to_string())?;
-
-        let mut teams = Vec::new();
-
-        if let Some(events) = json.get("events").and_then(|e| e.as_array()) {
-            for event in events {
-                // Check if this is an NCAA Tournament game
-                let is_tournament = event
-                    .get("season")
-                    .and_then(|s| s.get("type"))
-                    .and_then(|t| t.as_i64())
-                    .map(|t| t == 3) // type 3 = postseason
-                    .unwrap_or(false);
-
-                if !is_tournament {
-                    continue;
-                }
-
-                if let Some(competitions) = event.get("competitions").and_then(|c| c.as_array()) {
-                    for competition in competitions {
-                        // Try to get the bracket region from notes
-                        let region = competition
-                            .get("notes")
-                            .and_then(|n| n.as_array())
-                            .and_then(|notes| {
-                                notes.iter().find_map(|note| {
-                                    let headline = note.get("headline")?.as_str()?;
-                                    // Notes often contain region info like "East Regional"
-                                    if headline.contains("East") {
-                                        Some("East".to_string())
-                                    } else if headline.contains("West") {
-                                        Some("West".to_string())
-                                    } else if headline.contains("South") {
-                                        Some("South".to_string())
-                                    } else if headline.contains("Midwest") {
-                                        Some("Midwest".to_string())
-                                    } else {
-                                        None
-                                    }
-                                })
-                            })
-                            .unwrap_or_else(|| "Unknown".to_string());
-
-                        if let Some(competitors) = competition.get("competitors").and_then(|c| c.as_array()) {
-                            for competitor in competitors {
-                                if let Some(bracket_team) = self.parse_tournament_competitor(competitor, &region) {
-                                    teams.push(bracket_team);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(teams)
-    }
-
-    /// Parse a tournament competitor into a BracketTeam
-    fn parse_tournament_competitor(&self, competitor: &Value, default_region: &str) -> Option<BracketTeam> {
-        let team = competitor.get("team")?;
-        let team_id = team.get("id")?.as_str()?.to_string();
-        let team_name = team.get("displayName")
-            .or(team.get("name"))?
-            .as_str()?
-            .to_string();
-
-        // Get seed - this is the key info for tournament teams
-        let seed: i32 = competitor
-            .get("curatedRank")
-            .and_then(|r| r.get("current"))
-            .and_then(|c| c.as_i64())
-            .or_else(|| {
-                // Try alternate location for seed
-                competitor.get("seed").and_then(|s| s.as_i64())
-            })
-            .map(|s| s as i32)
-            .unwrap_or(0);
-
-        // Skip if no valid seed (not a tournament team)
-        if seed < 1 || seed > 16 {
-            return None;
-        }
-
-        Some(BracketTeam::new(
-            team_id,
-            team_name,
-            seed,
-            default_region.to_string(),
-        ))
+        self.save_bracket_cache(&cache_path, tournament_year, &field)?;
+        Ok(field)
     }
 
     /// Load cached bracket from file
@@ -667,8 +679,8 @@ impl ApiClient {
     }
 
     /// Save bracket to cache file
-    fn save_bracket_cache(&self, path: &str, year: i32, teams: &[BracketTeam]) -> Result<(), String> {
-        let cache = BracketCache::new(year, teams.to_vec());
+    fn save_bracket_cache(&self, path: &str, year: i32, field: &BracketField) -> Result<(), String> {
+        let cache = BracketCache::new(year, field.teams.clone(), field.region_layout.clone());
         let json = serde_json::to_string_pretty(&cache).map_err(|e| e.to_string())?;
         fs::write(path, json).map_err(|e| e.to_string())?;
         Ok(())
@@ -697,6 +709,81 @@ pub fn load_bracket_from_file(path: &str) -> Result<Vec<BracketTeam>, String> {
     Err("Could not parse bracket file. Expected JSON array of teams with team_id, team_name, seed, region".to_string())
 }
 
+/// Pull a usable team name out of an NCAA API `names` object.
+///
+/// `names.full` is present on every game and **empty on most of them** — the
+/// feed only fills it in for a subset of schools. Reading it alone produced
+/// games between two teams named "", which ELO happily merged into a single
+/// phantom team with a few thousand games.
+fn ncaa_team_name(names_obj: &Value) -> Option<String> {
+    for key in ["short", "full", "seo", "char6"] {
+        if let Some(name) = names_obj.get(key).and_then(|v| v.as_str()) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse one NCAA API scoreboard game. Free-standing so it can be tested
+/// against a recorded payload without a client.
+fn parse_ncaa_game(game: &Value, date: NaiveDate) -> Option<GameResult> {
+    let game_id = game.get("gameID")?.as_str()?.to_string();
+
+    if game.get("gameState")?.as_str()? != "final" {
+        return None;
+    }
+
+    let home = game.get("home")?;
+    let away = game.get("away")?;
+    let home_team_name = ncaa_team_name(home.get("names")?)?;
+    let away_team_name = ncaa_team_name(away.get("names")?)?;
+    let home_score: u32 = home.get("score")?.as_str()?.trim().parse().ok()?;
+    let away_score: u32 = away.get("score")?.as_str()?.trim().parse().ok()?;
+
+    let conference_of = |side: &Value| -> Option<String> {
+        side.get("conferences")?
+            .as_array()?
+            .first()?
+            .get("conferenceSeo")?
+            .as_str()
+            .map(|c| c.to_string())
+    };
+    let is_conference_game = match (conference_of(home), conference_of(away)) {
+        (Some(a), Some(b)) if !a.is_empty() => a == b,
+        _ => false,
+    };
+
+    Some(GameResult {
+        game_id,
+        date,
+        // Normalized names as ids: the feed has no stable numeric team id, and
+        // `seo` disagrees with itself across seasons.
+        home_team_id: crate::names::normalize(&home_team_name),
+        home_team_name,
+        away_team_id: crate::names::normalize(&away_team_name),
+        away_team_name,
+        home_score,
+        away_score,
+        // The scoreboard feed does not mark neutral sites.
+        is_neutral_site: false,
+        is_conference_game,
+        is_completed: true,
+    })
+}
+
+/// Host portion of a URL, for error messages that name what refused us.
+fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
+
 /// Get the current college basketball season string
 pub fn current_season() -> String {
     let now = chrono::Local::now();
@@ -714,6 +801,55 @@ pub fn current_season() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scoreboard feed leaves `names.full` empty for most schools, so the
+    /// parser has to fall back to `short`. Reading `full` alone produced games
+    /// between two teams called "".
+    #[test]
+    fn ncaa_games_are_named_even_when_full_is_empty() {
+        let game = serde_json::json!({
+            "gameID": "6349566",
+            "gameState": "final",
+            "home": {
+                "score": "64",
+                "names": {"char6": "TENN", "short": "Tennessee", "seo": "tennessee", "full": ""},
+                "conferences": [{"conferenceName": "", "conferenceSeo": "sec"}]
+            },
+            "away": {
+                "score": "44",
+                "names": {"char6": "FLA", "short": "Florida", "seo": "florida", "full": ""},
+                "conferences": [{"conferenceName": "", "conferenceSeo": "sec"}]
+            }
+        });
+        let date = NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
+        let parsed = parse_ncaa_game(&game, date).expect("parses");
+
+        assert_eq!(parsed.home_team_name, "Tennessee");
+        assert_eq!(parsed.away_team_name, "Florida");
+        assert_eq!(parsed.home_score, 64);
+        assert!(parsed.is_conference_game, "both teams are in the SEC");
+        assert_ne!(parsed.home_team_id, parsed.away_team_id);
+    }
+
+    #[test]
+    fn ncaa_games_that_are_not_final_are_skipped() {
+        let game = serde_json::json!({
+            "gameID": "1",
+            "gameState": "live",
+            "home": {"score": "10", "names": {"short": "A"}},
+            "away": {"score": "8", "names": {"short": "B"}}
+        });
+        let date = NaiveDate::from_ymd_opt(2025, 2, 1).unwrap();
+        assert!(parse_ncaa_game(&game, date).is_none());
+    }
+
+    /// The path segments are zero-padded. An unpadded one returns 200 with no
+    /// games, which reads as a season in which nothing was played.
+    #[test]
+    fn ncaa_scoreboard_dates_are_zero_padded() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(date.format("%Y/%m/%d").to_string(), "2026/03/01");
+    }
 
     #[test]
     fn test_current_season() {
