@@ -63,7 +63,7 @@ cargo test test_expected_score
 
 ### Core Data Flow
 1. **Data Ingestion** (`api.rs`, `torvik.rs`, `ingest.rs`): Fetch game results from BartTorvik, the NCAA API, ESPN, or the frozen CSV, and parse into `GameResult` structs
-2. **ELO Calculation** (`elo.rs`): Process games chronologically to calculate team ratings with margin-of-victory adjustments
+2. **Rating Calculation** (`ratings.rs`, `elo.rs`): Solve every team's strength at once by ridge least squares on game margin (default), or process games chronologically with Elo (`--ratings elo`), or use seed alone (`--ratings seed`, the fallback)
 3. **Tournament Setup** (`ncaa_bracket.rs`, `ingest.rs`): Read the NCAA's published bracket, then create `TournamentInfo` with 64 teams organized by region and seed
 4. **Bracket Simulation** (`bracket.rs`): Generate brackets using Monte Carlo simulation with probability-weighted outcomes
 5. **Optimization** (`exact.rs`, `ga.rs`, `anneal.rs`, `pool.rs`): the single bracket is solved exactly; the heuristics remain for portfolios and for comparison
@@ -86,7 +86,8 @@ scanning. Parallelism is kept to **one level** — see `src/score.rs`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | torvik | Ratings source: torvik, ncaa, espn, csv |
+| `--ratings` | adjusted | Rating model: adjusted, elo, seed |
+| `--source` | torvik | Where game results come from: torvik, ncaa, espn, csv |
 | `--season` | auto | Season format: "2024-2025" |
 | `--tournament-year` | - | Year to fetch bracket teams |
 | `--bracket-file` | - | Local JSON file with bracket teams |
@@ -402,6 +403,64 @@ still serves pick rates for `--fetch-picks`. That host answers normally; it is
 IPs. A non-2xx response is reported as the status it was, and a source that
 refuses the first eight days in a row is abandoned rather than walked for all
 158.
+
+## Team Ratings (`ratings.rs`)
+
+`ProbabilityCache` turns one number per team into all 2,016 matchup
+probabilities, so that number is what every optimizer is downstream of. The
+default model fits it by ridge least squares over the season game log:
+
+```text
+margin(game) = rating[home] - rating[away] + home_edge * (not neutral)
+```
+
+Ratings are in **points of scoring margin against an average D-I team**. The
+design matrix is never formed — each game touches exactly three columns, so
+accumulating the normal equations is O(games) — and one Cholesky over the
+resulting ~366x366 system takes ~11 ms for a full season (`bench ratings`). That
+is once per invocation, before any optimization; nothing about the hot path
+changes.
+
+Why not Elo: Elo learns strength of schedule transitively, one game at a time,
+and with ~360 teams playing ~30 games each on near-disjoint schedules it never
+finishes propagating. Measured over nine seasons and 600 tournament games, Elo
+scores 0.608 log loss against 0.544 for the least-squares fit — and 0.573 for
+the seed numbers alone, which is to say Elo loses to the selection committee.
+The full comparison is `docs/WIN_PROBABILITY_METHODS.md`; the harness that
+produced it is `analysis/win-probability/`.
+
+Three things in here are load-bearing and were measured, not guessed:
+
+- **`POINTS_PER_LOGIT = 7.109`.** The link, fitted with the calibration held out
+  a season at a time. `RATING_538_PER_POINT` is derived from it so that the
+  existing `10^(-diff * 30.464/400)` in `ProbabilityCache` reproduces the fitted
+  logistic exactly — which is why adopting this model changed no code in the
+  scoring path.
+- **The home term is fitted, not assumed.** Nine seasons put it between 2.44 and
+  3.54 points, mean 3.09. `HOME_ADVANTAGE = 100.0` on the Elo path is 4.09
+  points, about 30% hot. A fitted edge far from 3.09 means the feed's site flags
+  are wrong — the NCAA and ESPN scoreboards do not mark neutral-site games at
+  all — and the run says so.
+- **`RIDGE_LAMBDA = 1.0`.** Flat between 0.5 and 2; above 8 it starts to hurt,
+  and at 32 the fit is worse than Elo, because over-shrinking compresses exactly
+  the strong teams a tournament field is made of.
+
+`SEED_POINTS` is the fallback: 16 numbers fitted to the same 600 tournament games
+and projected onto the monotone cone, because the unconstrained fit rates 9-seeds
+above 8-seeds on 600 games of noise. It engages automatically, with a loud
+banner, whenever the chosen model cannot be produced. `MAX_SEED_FALLBACKS` in
+`main.rs` caps how many *individual* teams may fall back for an unresolvable
+name — a handful is a spelling, a field full of them is two feeds that disagree
+systematically, and rating a whole tournament off seeds while claiming to have
+used a season of games is exactly the quiet wrongness this codebase refuses.
+
+Things that were tested and rejected, so they do not get re-proposed: an
+offence/defence split per possession (+0.0008, and it would tie the model to one
+feed's extra columns), recency weighting (slightly negative), blowout capping
+(+0.0004), seed as an extra feature on top of the ratings (actively harmful),
+ensembling (never beat its best component), and LightGBM on nineteen features
+(+0.003 on tournament games with an interval straddling zero, and *worse* on the
+32,571-game late-season sample).
 
 ## Rating Scales (`elo.rs`)
 

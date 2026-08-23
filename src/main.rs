@@ -15,6 +15,7 @@ mod optimize;
 mod picks;
 mod pool;
 mod portfolio;
+mod ratings;
 mod score;
 mod torvik;
 mod tree;
@@ -41,6 +42,17 @@ enum DataSourceArg {
     Espn,
     /// Frozen FiveThirtyEight CSV — 2023 only; 538 shut down in 2025
     Csv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+enum RatingModel {
+    /// Opponent-adjusted least squares over the season game log (default).
+    /// 0.544 log loss on nine seasons of tournament games.
+    Adjusted,
+    /// ELO, kept so the two can be raced on the same field. 0.608.
+    Elo,
+    /// Seed alone — needs no game data at all. 0.562. The backup.
+    Seed,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -120,12 +132,16 @@ struct Args {
     #[arg(short, long, default_value = "1000")]
     batch_size: i32,
 
-    /// Show top N teams by ELO rating
+    /// Which model turns game results into team ratings
+    #[arg(long, value_enum, default_value = "adjusted")]
+    ratings: RatingModel,
+
+    /// Show top N teams by rating
     #[arg(long, default_value = "25")]
     show_top: usize,
 
-    /// Only calculate and show ELO ratings (skip bracket optimization)
-    #[arg(long, default_value = "false")]
+    /// Only calculate and show ratings (skip bracket optimization)
+    #[arg(long, alias = "ratings-only", default_value = "false")]
     elo_only: bool,
 
     /// Generate a portfolio of N diverse brackets instead of a single optimized bracket
@@ -458,52 +474,178 @@ fn load_tournament(args: &Args) -> Result<Option<ingest::TournamentInfo>, String
             println!();
 
             let client = api::ApiClient::new(source, &args.cache_dir, args.allow_partial_data);
-
-            println!("Fetching game data...");
-            // A failed fetch used to fall back to an empty game list, which left
-            // every team at the default 1500 rating. Every matchup then became a
-            // coin flip and the optimizer produced confident-looking output from
-            // pure noise, indistinguishable from a real run.
-            let mut games = client.fetch_season(&args.season).map_err(|e| {
-                format!(
-                    "could not fetch game data: {}\n\
-                     Ratings cannot be computed without games. Retry, or try \
-                     another free source: `--source torvik`, `--source ncaa`.",
-                    e
-                )
-            })?;
-
-            println!();
-            println!("Calculating ELO ratings from {} games...", games.len());
-            let mut elo_system = elo::EloSystem::new(args.season.clone());
-            elo_system.process_games(&mut games);
-
-            if elo_system.games_processed == 0 && !args.allow_partial_data {
-                return Err(format!(
-                    "no completed games found for season {}. Ratings would all be \
-                     the 1500 default, making every matchup a coin flip.\n\
-                     Check the season string, or pass --allow-partial-data to proceed anyway.",
-                    args.season
-                ));
-            }
-
-            elo_system.print_top_teams(args.show_top);
+            let fitted = fit_ratings(args, &client)?;
+            fitted.print_top_teams(args.show_top);
 
             if args.elo_only {
                 println!();
-                println!("ELO-only mode: Skipping bracket optimization.");
+                println!("Ratings-only mode: Skipping bracket optimization.");
                 return Ok(None);
             }
 
             println!();
             let field = load_bracket_teams(args, &client)?;
 
-            Ok(Some(ingest::TournamentInfo::from_elo_ratings_with_layout(
-                &elo_system,
+            let rated = ingest::TournamentInfo::from_rating_source_with_layout(
+                &fitted.source(),
                 field.teams,
                 &field.region_layout,
-            )?))
+                MAX_SEED_FALLBACKS,
+            )?;
+
+            if !rated.fell_back.is_empty() {
+                println!();
+                println!(
+                    "WARNING: {} team(s) had no rating and were rated from their seed:",
+                    rated.fell_back.len()
+                );
+                for line in &rated.fell_back {
+                    println!("{}", line);
+                }
+                println!(
+                    "  A seed-only rating is a real model (0.562 tournament log loss), \n\
+                     but it knows nothing about this season. Check the spelling if this \n\
+                     is a team you care about."
+                );
+            }
+
+            Ok(Some(rated.info))
         }
+    }
+}
+
+/// How many individual teams may be rated from their seed before the field is
+/// treated as a systematic name-resolution failure rather than a few spellings.
+const MAX_SEED_FALLBACKS: usize = 4;
+
+/// A fitted rating model, owned so `RatingSource` can borrow from it.
+enum FittedRatings {
+    Adjusted(ratings::RidgeRatings),
+    Elo(elo::EloSystem),
+    /// The backup: no game data needed, or none that could be had.
+    Seed,
+}
+
+impl FittedRatings {
+    fn source(&self) -> ingest::RatingSource<'_> {
+        match self {
+            FittedRatings::Adjusted(r) => ingest::RatingSource::Adjusted(r),
+            FittedRatings::Elo(e) => ingest::RatingSource::Elo(e),
+            FittedRatings::Seed => ingest::RatingSource::Seed,
+        }
+    }
+
+    fn print_top_teams(&self, n: usize) {
+        match self {
+            FittedRatings::Adjusted(r) => r.print_top_teams(n),
+            FittedRatings::Elo(e) => e.print_top_teams(n),
+            FittedRatings::Seed => {
+                println!("\nRatings come from seed alone; there is nothing to rank.");
+            }
+        }
+    }
+}
+
+/// Print the banner that says the backup engaged.
+///
+/// Loud on purpose. Falling back to seeds is a legitimate answer to a dead feed
+/// and a bad thing to discover after entering a pool, so it is never silent.
+fn announce_fallback(why: &str) {
+    println!();
+    println!("{}", "!".repeat(72));
+    println!("FALLING BACK TO SEED-ONLY RATINGS");
+    println!("  {}", why);
+    println!(
+        "  Seed-only scores 0.562 log loss on nine seasons of tournament games,\n\
+         \x20 against 0.544 for the adjusted fit. The bracket below is worth\n\
+         \x20 entering; it just knows nothing about how this season went."
+    );
+    println!("{}", "!".repeat(72));
+}
+
+/// Fit whichever rating model was asked for, falling back to seeds if it cannot
+/// be produced.
+fn fit_ratings(args: &Args, client: &api::ApiClient) -> Result<FittedRatings, String> {
+    // Seeds need no game log at all, which is the whole point of the mode: it is
+    // the one that still works when every free feed is down.
+    if args.ratings == RatingModel::Seed {
+        println!("Ratings: seed only — no game data required.");
+        return Ok(FittedRatings::Seed);
+    }
+
+    println!("Fetching game data...");
+    // A failed fetch used to fall back to an empty game list, which left every
+    // team at the default 1500 rating. Every matchup then became a coin flip and
+    // the optimizer produced confident-looking output from pure noise,
+    // indistinguishable from a real run. Seeds are the honest answer instead.
+    let mut games = match client.fetch_season(&args.season) {
+        Ok(games) => games,
+        Err(e) => {
+            announce_fallback(&format!(
+                "could not fetch game data: {}\n  \
+                 Retry, or try another free source: `--source torvik`, `--source ncaa`.",
+                e
+            ));
+            return Ok(FittedRatings::Seed);
+        }
+    };
+
+    if games.iter().filter(|g| g.is_completed).count() == 0 && !args.allow_partial_data {
+        announce_fallback(&format!(
+            "no completed games found for season {}. Check the season string.",
+            args.season
+        ));
+        return Ok(FittedRatings::Seed);
+    }
+
+    println!();
+    match args.ratings {
+        RatingModel::Adjusted => {
+            println!(
+                "Fitting opponent-adjusted ratings from {} games...",
+                games.len()
+            );
+            match ratings::fit(&games, ratings::RIDGE_LAMBDA) {
+                Ok(fit) => {
+                    println!(
+                        "  {} teams, {} games, home edge {:+.2} points",
+                        fit.team_count(),
+                        fit.games_used,
+                        fit.home_edge
+                    );
+                    // Nine seasons put the home edge between 2.4 and 3.6 points.
+                    // A fitted edge far outside that says the feed's site flags
+                    // are wrong, not that the sport changed — the NCAA and ESPN
+                    // scoreboards do not mark neutral-site games at all, so every
+                    // neutral game there is scored as a home game and drags the
+                    // estimate down. Worth saying out loud; not worth refusing.
+                    if (fit.home_edge - ratings::DEFAULT_HOME_EDGE).abs() > 1.5 {
+                        println!(
+                            "  NOTE: that is a long way from the {:.2} points nine seasons \n\
+                             \x20       of Torvik data give. If this source does not mark \n\
+                             \x20       neutral-site games, `--source torvik` does.",
+                            ratings::DEFAULT_HOME_EDGE
+                        );
+                    }
+                    Ok(FittedRatings::Adjusted(fit))
+                }
+                Err(e) => {
+                    announce_fallback(&format!("the rating fit failed: {}", e));
+                    Ok(FittedRatings::Seed)
+                }
+            }
+        }
+        RatingModel::Elo => {
+            println!("Calculating ELO ratings from {} games...", games.len());
+            let mut elo_system = elo::EloSystem::new(args.season.clone());
+            elo_system.process_games(&mut games);
+            if elo_system.games_processed == 0 {
+                announce_fallback("ELO processed no games.");
+                return Ok(FittedRatings::Seed);
+            }
+            Ok(FittedRatings::Elo(elo_system))
+        }
+        RatingModel::Seed => unreachable!("handled above"),
     }
 }
 

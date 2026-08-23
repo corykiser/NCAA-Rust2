@@ -175,6 +175,46 @@ cargo run --release -- --portfolio 5 --portfolio-strategy ga-whole --generations
 cargo run --release -- --portfolio 5 --portfolio-strategy ga-sequential --generations 200 --pool-size 10000
 ```
 
+### Rating Models
+
+`--ratings` decides how game results become the one number per team that every
+optimizer is downstream of. Measured over nine seasons and 600 NCAA tournament
+games — the harness is in `analysis/win-probability/`, the full write-up in
+[docs/WIN_PROBABILITY_METHODS.md](docs/WIN_PROBABILITY_METHODS.md):
+
+| `--ratings` | What it is | Tournament log loss | Needs |
+|---|---|---|---|
+| `adjusted` (default) | Ridge least squares solving every team's strength at once | **0.544** | A season game log |
+| `elo` | The original streaming Elo, kept so the two can be raced | 0.608 | A season game log |
+| `seed` | Seed number alone, from a monotone fit to nine tournaments | 0.562 | Nothing but the bracket |
+
+For reference, a coin flip is 0.693. Elo learns strength of schedule
+transitively, one game at a time, and with ~360 teams playing ~30 games each it
+never finishes propagating — which is why it loses to the seed numbers the
+selection committee published. The adjusted fit solves for every team
+simultaneously and lands within noise of BartTorvik's own published T-Rank.
+
+`seed` is the backup. It is used automatically, with a loud banner, whenever the
+chosen model cannot be produced — no game log, an empty season, a degenerate
+fit — because a bracket built from seeds is worth entering and a bracket built
+from 1500-for-everyone is not. Pick it explicitly to skip the game fetch
+entirely.
+
+```bash
+# The default
+cargo run --release -- --tournament-year 2027
+
+# Race the old model against the new one on the same field
+cargo run --release -- --tournament-year 2027 --ratings elo
+
+# No game data needed at all
+cargo run --release -- --tournament-year 2027 --ratings seed
+```
+
+Expected-score numbers are **not comparable across rating models**. A model that
+is more confident reports a higher expected score whether or not it is more
+right; only out-of-sample log loss says which is better.
+
 ### Data Sources
 
 Everything the optimizer needs is free and needs no key or account.
@@ -208,7 +248,7 @@ cargo run --release -- --source ncaa --portfolio 5
 
 ```bash
 # November through Selection Sunday: ratings only, refreshed as games are played
-cargo run --release -- --elo-only
+cargo run --release -- --elo-only   # alias: --ratings-only
 
 # Selection Sunday onward: the real field, once the NCAA publishes it
 cargo run --release -- --tournament-year 2027
@@ -232,7 +272,8 @@ log is empty and the tool says so rather than producing ratings from nothing.
 | `--lock-team` | Pin a team to a round, e.g. `"Duke:FinalFour"` (repeatable) | - |
 | `--generations N` | GA generations per optimization | 200 |
 | `--pool-size N` | Number of Monte Carlo scenarios | 10000 |
-| `--source` | Ratings source: `torvik`, `ncaa`, `espn`, or `csv` | `torvik` |
+| `--ratings` | Rating model: `adjusted`, `elo`, or `seed` | `adjusted` |
+| `--source` | Where game results come from: `torvik`, `ncaa`, `espn`, or `csv` | `torvik` |
 | `--allow-partial-data` | Proceed despite missing game data (see below) | false |
 | `--verbose` | Show detailed progress | false |
 
@@ -315,6 +356,7 @@ src/
 ├── ga.rs            # Genetic algorithm (MonteCarloScenarios, TeamRoundMutator, LockSet)
 ├── ingest.rs        # Data loading, field validation, team ratings
 ├── names.rs         # Deterministic team-name resolution
+├── ratings.rs       # Opponent-adjusted ratings (default) and the seed fallback
 ├── elo.rs           # ELO rating calculations
 ├── api.rs           # HTTP clients, caching, and the per-day scoreboard sources
 ├── torvik.rs        # BartTorvik season game log (the default ratings source)

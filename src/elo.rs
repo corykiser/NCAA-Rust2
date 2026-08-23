@@ -24,7 +24,10 @@ pub const K_FACTOR_LATE: f64 = 20.0;
 pub const ELO_PER_538_POINT: f64 = 30.464;
 /// The two scales are anchored at the Elo starting rating: a 1500 is a 75.
 const SCALE_ANCHOR_ELO: f64 = 1500.0;
-const SCALE_ANCHOR_538: f64 = 75.0;
+/// The 538 rating of an average team. Public because `ratings.rs` anchors its
+/// own scale to the same point, which is what lets the two rating sources be
+/// raced against each other on one field.
+pub const SCALE_ANCHOR_538: f64 = 75.0;
 
 /// Represents a team's ELO rating and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]

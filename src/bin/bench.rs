@@ -27,6 +27,7 @@ use std::time::Instant;
 #[path = "../picks.rs"] mod picks;
 #[path = "../pool.rs"] mod pool;
 #[path = "../portfolio.rs"] mod portfolio;
+#[path = "../ratings.rs"] mod ratings;
 #[path = "../score.rs"] mod score;
 #[path = "../torvik.rs"] mod torvik;
 #[path = "../tree.rs"] mod tree;
@@ -82,6 +83,65 @@ impl Bench {
     }
 }
 
+/// A season-shaped game log: `teams` teams, `per_team` games each, with a real
+/// home edge and a strength spread wide enough that the normal equations are as
+/// dense and as well conditioned as a real season's.
+///
+/// Synthetic here rather than the shipped 2023 forecast, because the forecast is
+/// a table of ratings and this benchmark needs the thing ratings are computed
+/// *from*. Only the shape matters: the solve's cost is set by the team count.
+fn synthetic_season(teams: usize, per_team: usize) -> Vec<game_result::GameResult> {
+    use chrono::NaiveDate;
+    use rand::Rng;
+    let mut rng = SmallRng::seed_from_u64(0x5EA_50_1);
+    let strength: Vec<f64> = (0..teams)
+        .map(|i| 30.0 * (i as f64 / teams as f64 - 0.5))
+        .collect();
+    let mut games = Vec::with_capacity(teams * per_team / 2);
+    let start = NaiveDate::from_ymd_opt(2025, 11, 3).unwrap();
+    for round in 0..per_team {
+        for home in 0..teams {
+            // Each team hosts on half its game days, against a pseudo-random
+            // opponent, so the schedule graph is connected but far from complete.
+            let away = (home * 7 + round * 13 + 1) % teams;
+            if away == home || (home + round) % 2 == 1 {
+                continue;
+            }
+            let neutral = round % 11 == 0;
+            let edge = strength[home] - strength[away] + if neutral { 0.0 } else { 3.1 };
+            let noise: f64 = rng.gen_range(-11.0..11.0);
+            let margin = (edge + noise).round() as i64;
+            let (hs, aws) = if margin >= 0 {
+                (72 + margin as u32, 72)
+            } else {
+                (72, 72 + (-margin) as u32)
+            };
+            games.push(game_result::GameResult {
+                game_id: format!("{}-{}-{}", round, home, away),
+                date: start + chrono::Duration::days(round as i64 * 4),
+                home_team_id: format!("t{:04}", home),
+                home_team_name: format!("Team {:04}", home),
+                away_team_id: format!("t{:04}", away),
+                away_team_name: format!("Team {:04}", away),
+                home_score: hs,
+                away_score: aws,
+                is_neutral_site: neutral,
+                is_conference_game: false,
+                is_completed: true,
+            });
+        }
+    }
+    games
+}
+
+/// A cheap rotating counter so the seed-lookup benchmark cannot be folded to a
+/// constant by the optimizer.
+fn rng_seed_counter() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 fn ga_settings(population: usize, generations: usize) -> GaSettings {
     let mut s = GaSettings::default();
     s.population_size = population;
@@ -96,6 +156,30 @@ fn main() {
     let t = tournament();
     let scoring = ScoringConfig::default();
     let mut rng = SmallRng::seed_from_u64(0xBE_11_CE);
+
+    // ---- Ratings ----------------------------------------------------------
+    //
+    // The rating fit runs once per invocation, before any optimization, so its
+    // cost is amortized over the whole portfolio search. It is here to keep it
+    // that way: a fit that crept into the hundreds of milliseconds would be
+    // comparable to the exact solve itself.
+    let rating_games = synthetic_season(360, 31);
+    b.run("ratings/fit_ridge_360_teams", 20, || {
+        ratings::fit(&rating_games, ratings::RIDGE_LAMBDA).expect("fits")
+    });
+    if b.filter.is_none() || b.filter.as_deref() == Some("ratings") {
+        let fit = ratings::fit(&rating_games, ratings::RIDGE_LAMBDA).expect("fits");
+        println!(
+            "{:<44} {} teams, {} games, home edge {:+.2}",
+            "ratings/fit_ridge_360_teams (shape)",
+            fit.team_count(),
+            fit.games_used,
+            fit.home_edge
+        );
+    }
+    b.run("ratings/seed_rating_lookup", 1_000_000, || {
+        ratings::seed_rating_538(1 + (rng_seed_counter() % 16) as i32)
+    });
 
     // ---- Primitives -------------------------------------------------------
     let seed_picks = Picks::sample(&t, &mut rng);

@@ -1,0 +1,73 @@
+massey done
+prior done
+lgbm done
+
+== tourney ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+A. Elo, as shipped in this repo       600   0.60829  0.21148  0.6267
+B. Elo, wins only (no MOV)            600   0.69320  0.24843  0.5883
+C. Elo on margin, tuned               600   0.57593  0.19888  0.6833
+D. C + preseason carryover            600   0.54834  0.18695  0.7133
+E. Ridge margin (Massey)              600   0.54774  0.18555  0.7117
+F. Ridge adjusted efficiency          600   0.54323  0.18478  0.7067
+G. F + preseason carryover            600   0.54358  0.18506  0.7050
+H. LightGBM on 19 features            600   0.54047  0.18466  0.7083
+I. Torvik's published T-Rank          600   0.53972  0.18255  0.7117
+
+== late ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+A. Elo, as shipped in this repo     32571   0.57940  0.19827  0.6920
+B. Elo, wins only (no MOV)          32571   0.59582  0.20522  0.6774
+C. Elo on margin, tuned             32571   0.56863  0.19410  0.6978
+D. C + preseason carryover          32571   0.56134  0.19123  0.7033
+E. Ridge margin (Massey)            32571   0.56522  0.19261  0.7019
+F. Ridge adjusted efficiency        32571   0.56359  0.19201  0.7020
+G. F + preseason carryover          32571   0.56112  0.19104  0.7046
+H. LightGBM on 19 features          32571   0.56491  0.19259  0.7019
+I. Torvik's published T-Rank        32571   0.69536  0.25127  0.4113
+
+== early ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+A. Elo, as shipped in this repo     16482   0.55545  0.18669  0.7302
+B. Elo, wins only (no MOV)          16482   0.58553  0.19905  0.7091
+C. Elo on margin, tuned             16482   0.53900  0.18009  0.7412
+D. C + preseason carryover          16482   0.48606  0.16192  0.7548
+E. Ridge margin (Massey)            16482   0.52738  0.17590  0.7366
+F. Ridge adjusted efficiency        16482   0.52688  0.17531  0.7386
+G. F + preseason carryover          16482   0.49087  0.16385  0.7515
+H. LightGBM on 19 features          16482   0.51809  0.17321  0.7429
+I. Torvik's published T-Rank        16482   0.70272  0.25478  0.3060
+
+Δ tournament logloss vs F (bootstrap 95% CI, 2000 resamples)
+A. Elo, as shipped in this repo   +0.0648  [+0.0407, +0.0887]
+B. Elo, wins only (no MOV)        +0.1498  [+0.1108, +0.1890]
+C. Elo on margin, tuned           +0.0323  [+0.0142, +0.0506]
+D. C + preseason carryover        +0.0052  [-0.0058, +0.0161]
+E. Ridge margin (Massey)          +0.0045  [-0.0027, +0.0121]
+F. Ridge adjusted efficiency      +0.0000  [+0.0000, +0.0000]
+G. F + preseason carryover        +0.0004  [-0.0059, +0.0064]
+H. LightGBM on 19 features        -0.0028  [-0.0179, +0.0124]
+I. Torvik's published T-Rank      -0.0037  [-0.0128, +0.0062]
+F: real per-game tempo done
+F: constant tempo 68 done
+E: ridge on margin only done
+E: ridge on margin, no cap done
+
+== late ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+F: real per-game tempo              32571   0.56359  0.19202  0.7022
+F: constant tempo 68                32571   0.56375  0.19214  0.7026
+E: ridge on margin only             32571   0.56522  0.19261  0.7019
+E: ridge on margin, no cap          32571   0.56372  0.19213  0.7023
+
+== tourney ==
+model                                   n   logloss    brier     acc
+--------------------------------------------------------------------
+F: real per-game tempo                600   0.54363  0.18497  0.7083
+F: constant tempo 68                  600   0.54473  0.18555  0.7100
+E: ridge on margin only               600   0.54774  0.18555  0.7117
+E: ridge on margin, no cap            600   0.54400  0.18521  0.7100
