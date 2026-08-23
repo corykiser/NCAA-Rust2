@@ -21,12 +21,14 @@ use std::time::Instant;
 #[path = "../ga.rs"] mod ga;
 #[path = "../game_result.rs"] mod game_result;
 #[path = "../ingest.rs"] mod ingest;
+#[path = "../ncaa_bracket.rs"] mod ncaa_bracket;
 #[path = "../names.rs"] mod names;
 #[path = "../optimize.rs"] mod optimize;
 #[path = "../picks.rs"] mod picks;
 #[path = "../pool.rs"] mod pool;
 #[path = "../portfolio.rs"] mod portfolio;
 #[path = "../score.rs"] mod score;
+#[path = "../torvik.rs"] mod torvik;
 #[path = "../tree.rs"] mod tree;
 
 use bracket::{Bracket, ScoringConfig};

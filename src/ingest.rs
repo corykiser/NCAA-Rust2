@@ -150,7 +150,33 @@ impl TournamentInfo {
     /// The field is validated here rather than trusted: a duplicated
     /// `(region, seed)` pair silently overwrote an entry in the lookup map,
     /// and a duplicated team name made two distinct teams compare equal.
-    pub fn from_teams(mut teams: Vec<RcTeam>) -> Result<TournamentInfo, String> {
+    pub fn from_teams(teams: Vec<RcTeam>) -> Result<TournamentInfo, String> {
+        let default_layout = REGION_ORDER.map(|r| r.to_string());
+        TournamentInfo::from_teams_with_layout(teams, &default_layout)
+    }
+
+    /// Build the field with an explicit Final Four pairing.
+    ///
+    /// `region_layout[0]` meets `[1]` in one semifinal and `[2]` meets `[3]` in
+    /// the other. The NCAA rotates this every year, and it decides which teams
+    /// can ever play each other — so it comes from the published bracket when
+    /// there is one, rather than from the order the regions happen to be
+    /// listed in.
+    pub fn from_teams_with_layout(
+        mut teams: Vec<RcTeam>,
+        region_layout: &[String; 4],
+    ) -> Result<TournamentInfo, String> {
+        let mut named = region_layout.clone();
+        named.sort();
+        let mut expected: Vec<String> = REGION_ORDER.iter().map(|r| r.to_string()).collect();
+        expected.sort();
+        if named.to_vec() != expected {
+            return Err(format!(
+                "region layout {:?} is not a permutation of {:?}",
+                region_layout, REGION_ORDER
+            ));
+        }
+
         if teams.len() != NUM_TEAMS {
             return Err(format!(
                 "expected {} teams in the field, got {}",
@@ -189,12 +215,12 @@ impl TournamentInfo {
         let mut r1_teams = [[0u8; 2]; 32];
         let mut r1_game_of_team = [usize::MAX; NUM_TEAMS];
 
-        for (region_position, region) in REGION_ORDER.iter().enumerate() {
+        for (region_position, region) in region_layout.iter().enumerate() {
             for (slot, matchup) in R1_MATCHUPS.iter().enumerate() {
                 let game = region_position * 8 + slot;
                 for (side, &seed) in matchup.iter().enumerate() {
                     let team = team_lookup
-                        .get(&(region.to_string(), seed))
+                        .get(&(region.clone(), seed))
                         .ok_or_else(|| format!("no team for region {} seed {}", region, seed))?;
                     r1_teams[game][side] = team.team_index;
                     r1_game_of_team[team.team_index as usize] = game;
@@ -383,9 +409,15 @@ impl TournamentInfo {
     /// Every name must resolve to exactly one rated team. A team that cannot be
     /// resolved is an error rather than a default rating: a silent 75.0 turns a
     /// contender into a coin flip and nothing downstream can tell.
-    pub fn from_elo_ratings(
+    /// Attach ratings to a field, using the bracket's real Final Four pairing.
+    ///
+    /// The layout is not optional: defaulting it to the order the regions are
+    /// listed in is the assumption that got the 2026 semifinals wrong, and it
+    /// fails silently.
+    pub fn from_elo_ratings_with_layout(
         elo_system: &EloSystem,
         bracket_teams: Vec<BracketTeam>,
+        region_layout: &[String; 4],
     ) -> Result<TournamentInfo, String> {
         let mut teams: Vec<RcTeam> = Vec::with_capacity(bracket_teams.len());
         let mut unresolved: Vec<String> = Vec::new();
@@ -416,7 +448,7 @@ impl TournamentInfo {
             ));
         }
 
-        TournamentInfo::from_teams(teams)
+        TournamentInfo::from_teams_with_layout(teams, region_layout)
     }
 
     /// A sample field, used when no bracket source is available.
@@ -608,6 +640,42 @@ pub mod tests {
             }
         }
         teams
+    }
+
+    /// The Final Four pairing decides which regions can meet, so the layout
+    /// has to reach the round-1 placement tables.
+    #[test]
+    fn the_region_layout_places_regions_in_bracket_order() {
+        let layout = [
+            "East".to_string(),
+            "South".to_string(),
+            "West".to_string(),
+            "Midwest".to_string(),
+        ];
+        let info = TournamentInfo::from_teams_with_layout(field(), &layout).expect("valid field");
+
+        // Games 0-7 are the first region in the layout, 8-15 the second, and
+        // the two meet in a semifinal.
+        for (block, region) in layout.iter().enumerate() {
+            for game in block * 8..block * 8 + 8 {
+                for side in 0..2 {
+                    let team = &info.teams[info.r1_teams[game][side] as usize];
+                    assert_eq!(&team.region, region, "game {} side {}", game, side);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_layout_that_is_not_the_four_regions_is_rejected() {
+        let layout = [
+            "East".to_string(),
+            "East".to_string(),
+            "West".to_string(),
+            "Midwest".to_string(),
+        ];
+        let err = TournamentInfo::from_teams_with_layout(field(), &layout).unwrap_err();
+        assert!(err.contains("permutation"), "{}", err);
     }
 
     pub fn tournament() -> TournamentInfo {

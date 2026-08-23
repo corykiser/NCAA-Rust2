@@ -34,6 +34,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("pitt", "pittsburgh"),
     ("umass", "massachusetts"),
     ("smiss", "southern mississippi"),
+    ("liu", "long island"),
+    ("liubrooklyn", "long island"),
 ];
 
 /// Lowercase, expand the `St`/`St.` abbreviation by position, and strip

@@ -18,6 +18,14 @@ pub const K_FACTOR_EARLY: f64 = 32.0;
 /// K-factor for late season (after 10 games)
 pub const K_FACTOR_LATE: f64 = 20.0;
 
+/// Elo points per point of 538 rating. The tournament's win-probability model
+/// (`ingest::ProbabilityCache`) exponentiates `rating_diff * 30.464 / 400`,
+/// which is the standard Elo curve with 538's rating scale folded in.
+pub const ELO_PER_538_POINT: f64 = 30.464;
+/// The two scales are anchored at the Elo starting rating: a 1500 is a 75.
+const SCALE_ANCHOR_ELO: f64 = 1500.0;
+const SCALE_ANCHOR_538: f64 = 75.0;
+
 /// Represents a team's ELO rating and metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EloRating {
@@ -231,13 +239,23 @@ impl EloSystem {
 
     /// Convert ELO rating to the scale used by 538 (roughly 0-100)
     /// This helps with compatibility with existing bracket simulation
+    /// Convert an Elo rating to the 538 rating scale the tournament model uses.
+    ///
+    /// The two are the same logistic curve at different widths: `ProbabilityCache`
+    /// scales a 538 rating difference by `30.464/400` before exponentiating, so
+    /// one point of 538 rating is `ELO_PER_538_POINT` points of Elo. The
+    /// conversion is therefore linear, and every matchup keeps the win
+    /// probability the Elo ratings implied.
+    ///
+    /// This used to map 1200-1800 Elo onto 60-100 and clamp. Ratings from a
+    /// full season run well past 1800 — the 2025-26 field topped out above
+    /// 2000 — so nearly every tournament team clamped to exactly 100.0. Every
+    /// game became a coin flip, and with seed bonuses in the scoring rules the
+    /// "optimal" bracket was whichever one had the highest seeds in it: a 16
+    /// over a 1, and no 1-seed in the Final Four.
     pub fn to_538_scale(&self, team_id: &str) -> f32 {
         let elo = self.get_rating(team_id);
-        // 538 ratings roughly range from 60-100
-        // ELO roughly ranges from 1200-1800 for college basketball
-        // Map 1200-1800 ELO to 60-100 538 scale
-        let normalized = ((elo - 1200.0) / 600.0).clamp(0.0, 1.0);
-        (60.0 + normalized * 40.0) as f32
+        (SCALE_ANCHOR_538 + (elo - SCALE_ANCHOR_ELO) / ELO_PER_538_POINT) as f32
     }
 
     /// Find a rated team by name.
@@ -269,6 +287,46 @@ pub fn win_probability(rating_a: f32, rating_b: f32) -> f64 {
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+
+    /// The 538-scale conversion has to preserve win probabilities: converting
+    /// two Elo ratings and running them through the tournament's probability
+    /// model must give the same answer as the Elo curve itself.
+    #[test]
+    fn the_538_conversion_preserves_win_probability() {
+        let mut elo = EloSystem::new("test".to_string());
+        elo.ensure_team("strong", "Strong");
+        elo.ensure_team("weak", "Weak");
+        elo.ratings.get_mut("strong").unwrap().rating = 1996.8;
+        elo.ratings.get_mut("weak").unwrap().rating = 1550.0;
+
+        let elo_diff = 1996.8 - 1550.0;
+        let from_elo = 1.0 / (1.0 + 10f64.powf(-elo_diff / 400.0));
+
+        let diff_538 = (elo.to_538_scale("strong") - elo.to_538_scale("weak")) as f64;
+        let from_538 = 1.0 / (1.0 + 10f64.powf(-diff_538 * ELO_PER_538_POINT / 400.0));
+
+        assert!(
+            (from_elo - from_538).abs() < 1e-4,
+            "{} vs {}",
+            from_elo,
+            from_538
+        );
+    }
+
+    /// The whole 2025-26 tournament field sat above the old 1200-1800 window,
+    /// so every team converted to exactly 100.0 and every game to a coin flip.
+    #[test]
+    fn strong_teams_do_not_all_convert_to_the_same_rating() {
+        let mut elo = EloSystem::new("test".to_string());
+        for (id, rating) in [("a", 2035.2), ("b", 1996.8), ("c", 1850.0)] {
+            elo.ensure_team(id, id);
+            elo.ratings.get_mut(id).unwrap().rating = rating;
+        }
+        let a = elo.to_538_scale("a");
+        let b = elo.to_538_scale("b");
+        let c = elo.to_538_scale("c");
+        assert!(a > b && b > c, "{} {} {}", a, b, c);
+    }
 
     #[test]
     fn test_expected_score() {

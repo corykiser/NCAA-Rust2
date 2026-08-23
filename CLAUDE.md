@@ -4,7 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-NCAA March Madness bracket optimizer written in Rust. Uses ELO ratings calculated from live game data (ESPN/NCAA APIs) or historical FiveThirtyEight CSV data.
+NCAA March Madness bracket optimizer written in Rust. Uses ELO ratings
+calculated from live game data. Every feed it depends on is free and keyless:
+BartTorvik's season game log (default), the NCAA's API, or ESPN. The bundled
+FiveThirtyEight CSV is a frozen 2023 snapshot kept for tests and benchmarks —
+538 shut down in 2025 and its endpoints redirect to abcnews.com.
 
 The single-bracket problem is solved **exactly** (`src/exact.rs`) — maximizing expected score is a dynamic program over the bracket tree, not a search. Genetic algorithms and simulated annealing remain for multi-bracket portfolios, where best-ball scoring takes a maximum over brackets and has no closed form.
 
@@ -18,9 +22,10 @@ cargo build --release
 cargo run --release
 
 # Run with specific data source
-cargo run --release -- --source espn    # ESPN API (default)
-cargo run --release -- --source ncaa    # NCAA API
-cargo run --release -- --source csv     # FiveThirtyEight CSV
+cargo run --release -- --source torvik  # BartTorvik game log (default)
+cargo run --release -- --source ncaa    # NCAA API (henrygd), one request per day
+cargo run --release -- --source espn    # ESPN API; 403s from datacenter IPs
+cargo run --release -- --source csv     # Frozen 2023 FiveThirtyEight snapshot
 
 # Generate portfolio of diverse brackets
 cargo run --release -- --portfolio 5 --portfolio-strategy exact-basis
@@ -57,9 +62,9 @@ cargo test test_expected_score
 ## Architecture
 
 ### Core Data Flow
-1. **Data Ingestion** (`api.rs`, `ingest.rs`): Fetch game results from ESPN/NCAA APIs or CSV, parse into `GameResult` structs
+1. **Data Ingestion** (`api.rs`, `torvik.rs`, `ingest.rs`): Fetch game results from BartTorvik, the NCAA API, ESPN, or the frozen CSV, and parse into `GameResult` structs
 2. **ELO Calculation** (`elo.rs`): Process games chronologically to calculate team ratings with margin-of-victory adjustments
-3. **Tournament Setup** (`ingest.rs`): Create `TournamentInfo` with 64 teams organized by region and seed
+3. **Tournament Setup** (`ncaa_bracket.rs`, `ingest.rs`): Read the NCAA's published bracket, then create `TournamentInfo` with 64 teams organized by region and seed
 4. **Bracket Simulation** (`bracket.rs`): Generate brackets using Monte Carlo simulation with probability-weighted outcomes
 5. **Optimization** (`exact.rs`, `ga.rs`, `anneal.rs`, `pool.rs`): the single bracket is solved exactly; the heuristics remain for portfolios and for comparison
 6. **Portfolio Generation** (`optimize.rs`, `portfolio.rs`): build multi-entry portfolios that maximize expected best-ball payout
@@ -81,7 +86,7 @@ scanning. Parallelism is kept to **one level** — see `src/score.rs`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | espn | Data source: espn, ncaa, csv |
+| `--source` | torvik | Ratings source: torvik, ncaa, espn, csv |
 | `--season` | auto | Season format: "2024-2025" |
 | `--tournament-year` | - | Year to fetch bracket teams |
 | `--bracket-file` | - | Local JSON file with bracket teams |
@@ -368,9 +373,51 @@ Profile with callgrind (`valgrind --tool=callgrind --cache-sim=no`); `perf` is
 not available in the container. Set `RAYON_NUM_THREADS=1` so the profile is not
 buried in worker-thread spin.
 
+## Data Sources (`api.rs`, `torvik.rs`, `ncaa_bracket.rs`)
+
+Three separate feeds, all free and keyless. Which one supplies ratings is
+`--source`; the other two are used regardless.
+
+**Ratings.** `torvik` is the default because it is one request for the whole
+season instead of 158. A day-by-day source fails a season on any one bad day,
+and there is no partial credit: `--allow-partial-data` exists precisely because
+a season missing days produces ratings that look normal and are wrong. Torvik
+also marks neutral-site games, which the NCAA scoreboard does not.
+
+The game log is two rows per game, one from each team's point of view. Home
+rows carry the whole game and away rows are dropped; neutral games have two `N`
+rows and are deduplicated on the matchup. The winner's score is written first
+regardless of which team the row is about.
+
+**The field.** `ncaa-api.henrygd.me/brackets/basketball-men/d1/{year}` is the
+NCAA's own bracket: seeds, region names, and — read off the regional finals'
+`victorBracketPositionId` — which regions meet in which semifinal. That pairing
+rotates every year (2026 was East/South and West/Midwest, not the alphabetical
+East/West and South/Midwest) and it decides which teams can ever play, so it is
+read rather than assumed. `TournamentInfo::from_teams_with_layout` takes it.
+
+**The public.** ESPN's Tournament Challenge (`gambit-api.fantasy.espn.com`)
+still serves pick rates for `--fetch-picks`. That host answers normally; it is
+`site.api.espn.com`, the scoreboard, that returns `403` to cloud and datacenter
+IPs. A non-2xx response is reported as the status it was, and a source that
+refuses the first eight days in a row is abandoned rather than walked for all
+158.
+
+## Rating Scales (`elo.rs`)
+
+`to_538_scale` converts Elo to the 538 scale `ProbabilityCache` expects. The two
+are the same logistic curve at different widths — one 538 point is 30.464 Elo
+points — so the conversion is linear and preserves every win probability. It
+must not clamp: an earlier version mapped 1200-1800 onto 60-100 and clamped, and
+a full season's ratings run past 2000, so the entire tournament field converted
+to exactly 100.0. Every game became a coin flip, and since the default scoring
+multiplies by seed, the "optimal" bracket became whichever one had the highest
+seeds in it — a 16 over a 1, and no 1-seed in the Final Four.
+
 ## Data Caching
 
 API responses are cached in `./data/` directory:
 - `games_{season}.json`: Season game results (6-hour staleness)
-- `bracket_{year}.json`: Tournament bracket teams
+- `bracket_{year}.json`: Tournament field, including the Final Four pairing. A
+  cache without a `region_layout` predates that and is refetched.
 - `picks_{year}.json`: ESPN public pick rates (see `src/field.rs`)
